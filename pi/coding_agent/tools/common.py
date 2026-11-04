@@ -1,0 +1,44 @@
+"""Shared tool helpers: path resolution and the file mutation queue.
+
+Port of ``path-utils.ts`` and ``file-mutation-queue.ts``: write/edit serialize
+per absolute path so concurrent tool calls cannot interleave on one file.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from typing import Any, Awaitable, Callable, Dict
+
+IMAGE_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+
+
+def resolve_to_cwd(path: str, cwd: str) -> str:
+    """Resolve a tool path argument to an absolute path under ``cwd``."""
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(cwd, path))
+
+
+def detect_image_mime_type(path: str):
+    return IMAGE_MIME_TYPES.get(os.path.splitext(path)[1].lower())
+
+
+_MUTATION_LOCKS: Dict[str, asyncio.Lock] = {}
+_LOCKS_GUARD = asyncio.Lock()
+
+
+async def with_file_mutation_queue(absolute_path: str, fn: Callable[[], Awaitable[Any]]) -> Any:
+    """Run ``fn`` while holding the mutation lock for ``absolute_path``."""
+
+    async with _LOCKS_GUARD:
+        lock = _MUTATION_LOCKS.setdefault(absolute_path, asyncio.Lock())
+    async with lock:
+        return await fn()

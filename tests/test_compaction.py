@@ -1,0 +1,73 @@
+import asyncio
+
+import pytest
+
+from pi.agent.compaction import CompactionSettings, ContextCompactor
+from pi.ai.models import resolve_model
+from pi.ai.providers import SimpleStreamOptions
+from pi.ai.types import AssistantMessage, DoneEvent, StreamErrorEvent, TextContent, TranscriptContext, Usage, UserMessage
+
+
+def response(text="summary", reason="stop"):
+    return AssistantMessage(content=[TextContent(text=text)], api="faux", provider="faux",
+                            model="faux", usage=Usage(), stop_reason=reason, timestamp=0)
+
+
+def test_compaction_preserves_transcript_and_caches_summary():
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=50))
+        model = resolve_model("faux")
+        model.context_window = 3000
+        messages = [UserMessage(content="old" * 4000, timestamp=0), UserMessage(content="latest", timestamp=1)]
+        calls = []
+
+        async def stream(model, context, options):
+            calls.append(context)
+            yield DoneEvent(reason="stop", message=response())
+
+        projected = await compactor.project(messages, model, SimpleStreamOptions(), stream)
+        assert projected[-1] is messages[-1]
+        assert "summary" in projected[0].content
+        assert len(messages[0].content) == 12000
+        count = len(calls)
+        assert await compactor.project(messages, model, SimpleStreamOptions(), stream) == projected
+        assert len(calls) == count
+    asyncio.run(check())
+
+
+def test_overflow_retries_once():
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=1))
+        messages = [UserMessage(content="old" * 100, timestamp=0), UserMessage(content="latest", timestamp=1)]
+        requests = []
+
+        async def stream(model, context, options):
+            if context.messages[0].role == "system":
+                yield DoneEvent(reason="stop", message=response())
+            else:
+                requests.append(context)
+                error = response(reason="error")
+                error.error_message = "context_length_exceeded"
+                yield StreamErrorEvent(reason="error", error=error)
+
+        events = [e async for e in compactor.stream(resolve_model("faux"), TranscriptContext(messages), SimpleStreamOptions(), stream)]
+        assert len(requests) == 2
+        assert len(events) == 1
+        assert isinstance(events[0], StreamErrorEvent)
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("reason,text", [("length", "partial"), ("stop", "")])
+def test_failed_summary_keeps_previous_state(reason, text):
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=1))
+
+        async def stream(model, context, options):
+            yield DoneEvent(reason=reason, message=response(text, reason))
+
+        with pytest.raises(RuntimeError):
+            await compactor.project([UserMessage(content="x" * 1000, timestamp=0), UserMessage(content="latest", timestamp=1)],
+                                    resolve_model("faux"), SimpleStreamOptions(), stream, force=True)
+        assert compactor.prefix == []
+        assert compactor.summary == ""
+    asyncio.run(check())
