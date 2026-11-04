@@ -161,6 +161,8 @@ class AgentLoopConfig:
     max_tokens: Optional[int] = None
     reasoning: Optional[ThinkingLevel] = None
     telemetry_context: Any = None
+    # Prompt-caching breakpoint TTL ("5m"/"1h"); None disables cache markers.
+    cache_retention: Optional[str] = "5m"
 
 
 # ---------------------------------------------------------------------------

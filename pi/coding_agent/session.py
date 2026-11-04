@@ -190,8 +190,11 @@ class SessionManager:
         self.leaf_id = entry.id
         return entry.id
 
-    def append_compaction(self, summary: str, tokens_before: int = 0) -> str:
-        return self.append_custom("compaction", {"summary": summary, "tokens_before": tokens_before})
+    def append_compaction(self, summary: str, tokens_before: int = 0, checkpoint: Optional[dict] = None) -> str:
+        data: dict = {"summary": summary, "tokens_before": tokens_before}
+        if checkpoint is not None:
+            data["checkpoint"] = checkpoint
+        return self.append_custom("compaction", data)
 
     def append_model_change(self, provider: str, model_id: str) -> str:
         return self.append_custom("model_change", {"provider": provider, "modelId": model_id})
@@ -240,6 +243,8 @@ class SessionManager:
         pending = set()
         for entry in branch:
             message = entry.message
+            if message is None:
+                continue  # custom entries carry no tool protocol state
             if message.role == "assistant":
                 pending.update(block.id for block in message.content if isinstance(block, ToolCall))
             elif isinstance(message, ToolResultMessage):
@@ -302,7 +307,10 @@ class SessionManager:
         self._validate_branch(branch)
         self.start_new()
         for entry in branch:
-            self.append(entry.message)
+            if entry.message is not None:
+                self.append(entry.message)
+            elif entry.custom is not None:
+                self.append_custom(entry.custom["kind"], entry.custom["data"])
         return self.messages()
 
     def export(self, path: str) -> str:

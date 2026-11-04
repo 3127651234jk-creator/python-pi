@@ -90,6 +90,59 @@ def test_bedrock_stream_request_usage_and_cleanup(monkeypatch):
     assert stream.closed and client.closed
 
 
+def test_bedrock_cache_points_in_request():
+    model = Model(id="anthropic.claude-sonnet-4-5", name="t", api="bedrock-converse-stream",
+                  provider="amazon-bedrock", base_url="https://bedrock.us-east-1.amazonaws.com")
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(cache_retention="5m"))
+    assert body["system"] == [{"text": "system"}, {"cachePoint": {"type": "default"}}]
+    assert body["messages"][-1]["content"][-1] == {"cachePoint": {"type": "default"}}
+    long = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(cache_retention="1h"))
+    assert long["system"][-1] == {"cachePoint": {"type": "default", "ttl": "1h"}}
+
+
+def test_bedrock_cache_points_skipped_for_other_models():
+    model = Model(id="amazon.nova-pro-v1", name="t", api="bedrock-converse-stream",
+                  provider="amazon-bedrock", base_url="https://bedrock.us-east-1.amazonaws.com")
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(cache_retention="5m"))
+    assert "cachePoint" not in json.dumps(body)
+
+
+def test_openai_responses_params_passthrough():
+    model = Model(id="test", name="test", api="openai-responses", provider="test",
+                  base_url="https://example.test", api_key="key", params={"prompt_cache_key": "session-1"})
+    body = openai_responses.build_request(model, context(), SimpleStreamOptions())
+    assert body["prompt_cache_key"] == "session-1"
+
+
+def test_bedrock_cache_details_usage(monkeypatch):
+    class Stream:
+        closed = False
+        def __iter__(self):
+            return iter([
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Hello"}}},
+                {"messageStop": {"stopReason": "end_turn"}},
+                {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadInputTokens": 2,
+                                        "cacheWriteInputTokens": 6,
+                                        "cacheDetails": [{"ttl": "1h", "inputTokens": 4}]}}},
+            ])
+        def close(self): self.closed = True
+    class Client:
+        closed = False
+        def converse_stream(self, **kwargs):
+            self.request = kwargs
+            return {"stream": Stream()}
+        def close(self): self.closed = True
+    monkeypatch.setattr(amazon_bedrock, "boto3", SimpleNamespace(client=lambda *args, **kwargs: Client()))
+    async def check():
+        return [event async for event in amazon_bedrock.stream_bedrock(resolve_model("amazon-bedrock"), context())]
+    events = asyncio.run(check())
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.message.usage.cache_read == 2
+    # The flat cache write total includes the 1h tokens; they are split out.
+    assert done.message.usage.cache_write == 2
+    assert done.message.usage.cache_write_1h == 4
+
+
 def test_bedrock_optional_dependency_error(monkeypatch):
     monkeypatch.setattr(amazon_bedrock, "boto3", None)
     async def check():

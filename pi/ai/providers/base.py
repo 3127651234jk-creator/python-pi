@@ -33,6 +33,9 @@ class SimpleStreamOptions:
     max_tokens: Optional[int] = None
     reasoning: Optional[ThinkingLevel] = None
     telemetry_context: Optional[Any] = None  # pi.telemetry.TelemetryContext
+    # Prompt-caching breakpoint TTL: "5m" or "1h" enables provider cache
+    # markers (Anthropic cache_control, Bedrock cachePoint); None disables.
+    cache_retention: Optional[str] = None
 
 
 StreamFn = Callable[[Model, TranscriptContext, Optional[SimpleStreamOptions]], AsyncIterator[Any]]
@@ -289,6 +292,7 @@ class ProviderState:
     """Mutable in-progress assistant message shared by a provider stream."""
 
     def __init__(self, model: Model, timestamp: int) -> None:
+        self.model = model
         self._partial = make_partial(model, int(time.time() * 1000))
 
     @property
@@ -333,6 +337,7 @@ def usage_from_counts(
     cache_read: int = 0,
     cache_write: int = 0,
     reasoning: Optional[int] = None,
+    cache_write_1h: int = 0,
 ) -> Usage:
     return Usage(
         input=input_tokens,
@@ -340,4 +345,5 @@ def usage_from_counts(
         cache_read=cache_read,
         cache_write=cache_write,
         reasoning=reasoning,
+        cache_write_1h=cache_write_1h,
     )

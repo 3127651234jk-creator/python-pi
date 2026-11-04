@@ -15,6 +15,12 @@ pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不�
 | `pi.coding_agent.system_prompt` | `coding-agent/src/core/system-prompt.ts` | 分节系统提示词 + AGENTS.md 项目上下文 |
 | `pi.coding_agent.session` | `coding-agent/src/core/session-manager.ts` | JSONL 会话树、分支、切换、命名、导出、`--continue` 恢复 |
 | `pi.coding_agent.cli` | `coding-agent/src/cli` | 单次模式 + 交互 REPL + 斜杠命令 + Ctrl+C 中止 |
+| `pi.evals.harness` | `packages/evals/src/harness.ts` | 隔离评测 harness：临时工作区、凭据注入、会话录制、用量统计、POSIX 工具沙箱、文档变体 |
+| `pi.evals.plan` | `packages/evals/src/plan.ts` | 发现用例解析与 (case, variant, run) 任务计划 |
+| `pi.evals.report` | `packages/evals/src/report.ts` | 观察读取、成对配对、lift/标记/运营总量与文本报告 |
+| `pi.evals.docker` | `packages/evals/src/docker.ts` | 变体镜像构建、auth.json 校验、容器发现与单任务运行 |
+| `pi.evals.cli` | `packages/evals/src/cli.ts` | 评测编排 CLI：参数解析、发现对齐、协议落盘、报告产出 |
+| `pi.evals.framework` | `vitest-evals`（npm 依赖） | 本地替代：Harness 适配器、运行规范化、结构化输出裁判、用例发现与运行器 |
 
 ## 安装
 
@@ -169,7 +175,7 @@ def setup(api):
 
 扩展同时作用于文本、JSON 和 RPC 模式。RPC `get_commands` 列出扩展命令，空闲时可调用 `reload_extensions`；通过 `prompt` 发送 `/命令`，纯本地处理返回 `disposition=handled`，此时不产生新的 `agent_settled`。
 
-扩展是本机 Python 代码，以 Pi 进程权限运行，没有沙箱或项目授权界面。扩展 factory、回调和注册工具内的普通 `print` 重定向到 stderr，推荐使用 `api.log`；自行创建的后台任务仍须自行管理输出和生命周期。该 API 不兼容 TS 扩展，不包含 TUI、快捷键、自定义 provider、npm/git 包安装或自定义会话条目协议。
+扩展是本机 Python 代码，以 Pi 进程权限运行，没有沙箱或项目授权界面。扩展 factory、回调和注册工具内的普通 `print` 重定向到 stderr，推荐使用 `api.log`；自行创建的后台任务仍须自行管理输出和生命周期。TS/JS 扩展可通过 Node 桥接（`pi.coding_agent.ts_extension`，需 PATH 中的 Node 22.6+）加载：`registerTool/registerCommand/registerProvider/registerKeybinding/on/ui/appendEntry/sendMessage/log` 跨进程桥接，其余 TS 专用 API（TUI 渲染器、虚拟模型、MCP 注册、会话管理、`pi.events`、状态 getter 等）在调用时抛出明确错误而非静默缺失。Python `ExtensionAPI` 本身不包含 TUI 渲染器或 npm/git 包安装。
 
 ## JSON 输出与 RPC
 
@@ -294,7 +300,7 @@ Review the changes. Focus on ${1:-correctness and tests}.
 
 | 文件 | 内容 |
 | --- | --- |
-| `settings.json` | 默认 provider、model、thinking、session_dir、compaction |
+| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention |
 | `models.json` | 自定义 provider、模型元数据与覆盖 |
 | `auth.json` | API key、OAuth access/refresh token 和过期时间 |
 
@@ -307,6 +313,7 @@ Review the changes. Focus on ${1:-correctness and tests}.
   "provider": "openai",
   "model": "gpt-4o-mini",
   "thinking": "off",
+  "cache_retention": "5m",
   "compaction": {
     "enabled": true,
     "reserve_tokens": 16384,
@@ -315,6 +322,8 @@ Review the changes. Focus on ${1:-correctness and tests}.
   }
 }
 ```
+
+Prompt caching 默认开启（`cache_retention: "5m"`，设为 `"1h"` 或 `false` 可调整/关闭，仅影响支持显式缓存标记的 API）：`anthropic-messages` 在 system 提示、最后一个工具与最后一条消息上写 `cache_control` 断点（1h 需追加 `extended-cache-ttl-2025-04-11` beta 头）；Bedrock 在 system 与最后一条用户消息后插入 `cachePoint`（仅 Claude 模型，其他型号自动跳过）。OpenAI 系为自动缓存，无请求侧标记；`prompt_cache_key` 等参数可经 `models.json` 的 `params` 传入（Responses 适配器同样生效）。用量统计区分 `cache_read`、`cache_write` 与 `cache_write_1h`（1h 写入按目录价或 2 倍基础输入价计）。
 
 保存和移除凭据：
 
@@ -392,6 +401,26 @@ provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 head
 
 `/fork` 不带 ID 时复制当前分支；指定 ID 时复制至该消息之后，可在新会话中继续提问。当前为命令行文本操作，不含 TS 版的交互选择器、回填编辑器或离开分支时的自动摘要。JSONL 为 Python 自有格式，可重新加载，不保证与 TS 会话文件互通。HTML 为转义后的静态文本。导出不会覆盖已有文件。
 
+## 评测系统（documentation-lift evals）
+
+`packages/evals` 的 Python 移植版位于 `pi/evals/`（运行器代码）与两个仓库目录：`evals/`（评测套件，`*.docs.eval.py`）和 `docker/`（`Dockerfile` + `entrypoint.py`，容器侧）。TS 版依赖 Vitest 与 `vitest-evals`；Python 版用 `pi.evals.framework` 本地实现同等的最小契约（Harness 适配器、运行规范化、结构化输出裁判、`describe_eval` 注册、单用例运行器），报告仍写 Vitest JSON 结构（`testResults[].assertionResults[].meta`），因此 `report.ts` 的读取与配对逻辑按原样移植。
+
+运行一次文档对比：
+
+```bash
+python -m pi.evals.cli --provider openai --model gpt-4o-mini
+# 等价环境变量：PI_PROVIDER / PI_MODEL；重复次数：--runs-per-variant N 或 PI_EVAL_RUNS_PER_VARIANT
+# 用例过滤：-t "adds the model" 或 --testNamePattern=...
+```
+
+流程与 TS 版一致：构建 `without_docs` / `with_docs` 两个镜像 → 在两个容器内发现用例并要求完全一致 → 按 (case, variant, run) 计划任务（奇数轮先 without、偶数轮先 with，降低顺序偏差）→ 每个任务独立容器运行 → 写入 `protocol.json`、`expected-runs.json`、`observations.jsonl` → 读取观察、成对配对、产出 `report.json` / `report.txt`。成对 lift 只在两臂都恰好产生一个分数时计入；缺失、重复、跳过、未计分或出错都会阻塞该对，任一对被阻塞时隐藏标题通过率并退出码 1。结果目录为忽略的 `.eval/<时间戳>_<id>/`，其中 `evals/<variant>/sessions/<sha256>/session.jsonl` 保存原生会话快照。
+
+评测 harness（`create_pi_coding_agent_harness`）在临时根目录内组装与 CLI 相同的 Agent：隔离 HOME 与 agent 目录、注入宿主 `auth.json` 凭据、按名单选工具（文档评测固定为 `read/write/edit/grep/find/ls`，不暴露 shell 与联网搜索）、录制 JSONL 会话、统计 token/工具调用/成本，并在 POSIX 上按 `PI_EVAL_SANDBOX_UID/GID` 永久降权后再提示模型。评测失败时把部分运行数据（事件、用量、错误）附在异常上，报告据此保留部分指标。
+
+系统提示词现在包含 `<docs>` 一节（PI 文档路由：README/docs/examples 路径与阅读指引），`SystemPromptOptions.include_pi_documentation` 控制其出现：默认自动探测包内文档是否存在；评测 harness 强制包含并在 `without_docs` 变体中剥离该节（`exclude_pi_documentation`），配合镜像内删除文档文件构成对照实验。`<cwd>` 一节同步改为 `<cwd>\n路径\n</cwd>` 的分节格式。
+
+与 TS 版的差异（有意省略）：容器内不再运行 Vitest，而是 `docker/entrypoint.py` 直接发现/运行用例并写 Vitest JSON；`reload` 输入步骤不受支持（Python 会话无扩展重载）；TS 的 Vite transformed-module 保护无对应物，改由镜像内 `chmod go-rwx` 保证评测源码仅 root 可读；宿主侧 host evals（非 `*.docs.eval` 的普通套件）与 acme/configured-runtime 夹具未移植；npm tarball 打包换为容器内 `pip install /repo/pi-python`，并把 README 复制到 site-packages 作为 `with_docs` 的文档。凭据来源探测在降权时按环境变量名近似（`PROVIDER_API_KEY` / `PI_PY_API_KEY`），TS 版使用 ModelRuntime 的精确 source。
+
 ## 作为库使用
 
 ```python
@@ -436,7 +465,7 @@ python -m pytest tests -q
 
 Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时，摘要旧消息并保留近期消息、系统指令和工具声明。切分不会拆开工具调用与其结果。明确的上下文溢出错误会触发强制压缩并重试一次；其他错误不会触发重试。摘要失败、为空或达到输出上限时不会替换已有摘要。
 
-原始会话 JSONL 保持完整。摘要缓存在 Agent 内存中，恢复会话后按需重新生成，因此恢复时可能再次产生摘要调用费用。单条过大的最新输入、系统提示词或不可拆分工具结果仍可能超过窗口，需要缩短输入。
+原始会话 JSONL 保持完整。摘要与压缩切点（checkpoint：已消费消息数 + 末条消息指纹）一起持久化为会话 `compaction` 条目；恢复会话时按 checkpoint 从加载的 transcript 重建切点，校验通过则直接续用，不再重复投影或重新产生摘要调用费用。checkpoint 与 transcript 不匹配（例如切到更早分支）时清空摘要与切点，与运行中的自愈行为一致；旧版本会话文件只有摘要、没有 checkpoint，恢复摘要但切点未知，行为同修复前。单条过大的最新输入、系统提示词或不可拆分工具结果仍可能超过窗口，需要缩短输入。
 
 库调用可通过 `Agent(..., compaction=CompactionSettings(...))` 配置；从 `pi.agent.compaction` 导入 `CompactionSettings`。默认 `reserve_tokens=16384`、`keep_recent_tokens=20000`、`summary_tokens=2048`，可设置 `enabled=False` 关闭。未知模型应准确设置 `model.context_window`。Token 数使用 UTF-8 长度估算，并非模型的精确分词结果。
 

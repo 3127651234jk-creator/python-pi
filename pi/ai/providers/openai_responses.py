@@ -5,7 +5,7 @@ import time
 
 from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, ThinkingContent, get_system_message_text, get_message_text
 from ..utils import normalize_context
-from .base import SimpleStreamOptions, run_provider_stream, usage_from_counts
+from .base import SimpleStreamOptions, apply_model_params, run_provider_stream, usage_from_counts
 from .blocks import BlockEvents
 from .copilot import copilot_headers
 
@@ -48,6 +48,7 @@ def build_request(model, context, options):
         body["text"] = {"verbosity": "low"}
         for tool in body.get("tools", []):
             tool["strict"] = None
+    apply_model_params(body, model, options)
     return body
 
 

@@ -1,8 +1,9 @@
 """Bounded summary projection; the original transcript remains append-only."""
 
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from ..ai.models import Model
 from ..ai.providers import SimpleStreamOptions
@@ -195,6 +196,59 @@ class ContextCompactor:
                 return
 
 
+def prefix_checkpoint(prefix: List[Message]) -> Optional[dict]:
+    """Persistable description of the compaction cut point.
+
+    Stores the consumed-message count and a fingerprint of the last consumed
+    message instead of the messages themselves: the prefix is rebuilt from the
+    restored transcript on resume, so JSONL round-tripping cannot break the
+    value-equality check in ``project``.
+    """
+
+    if not prefix:
+        return None
+    digest = hashlib.sha256(
+        json.dumps(asdict(prefix[-1]), ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return {"length": len(prefix), "last": digest}
+
+
+def restore_compaction(compactor: "ContextCompactor", messages: List[Any], data: Optional[dict]) -> bool:
+    """Rebuild compactor state from a persisted ``compaction`` session entry.
+
+    Returns True when a checkpoint matched the transcript and the prefix was
+    restored. Legacy entries without a checkpoint still restore the summary;
+    a checkpoint that no longer matches the transcript (branched or edited
+    history) resets the compactor, matching the mid-session self-heal in
+    ``project``.
+    """
+
+    data = data or {}
+    summary = data.get("summary") or ""
+    checkpoint = data.get("checkpoint") or {}
+    rest = [m for m in messages if not isinstance(m, SystemMessage)]
+    valid = (
+        bool(summary)
+        and isinstance(checkpoint, dict)
+        and isinstance(checkpoint.get("length"), int)
+        and checkpoint["length"] > 0
+        and checkpoint.get("length") <= len(rest)
+        and prefix_checkpoint(rest[: checkpoint["length"]]) == checkpoint
+    )
+    if valid:
+        compactor.summary = summary
+        compactor.prefix = rest[: checkpoint["length"]]
+        return True
+    if summary and not checkpoint:
+        # Legacy entry: summary only, cut point unknown.
+        compactor.summary = summary
+        compactor.prefix = []
+        return False
+    compactor.summary = ""
+    compactor.prefix = []
+    return False
+
+
 async def compact_agent(agent, session=None, instructions: str = "") -> dict:
     """Run a manual compaction for one agent and persist the summary.
 
@@ -224,5 +278,5 @@ async def compact_agent(agent, session=None, instructions: str = "") -> dict:
     summary = agent.compactor.summary
     # With on_summary wired (CLI), the compactor already persisted the entry.
     if session is not None and summary and summary != previous and agent.compactor.on_summary is None:
-        session.append_compaction(summary, before)
+        session.append_compaction(summary, before, checkpoint=prefix_checkpoint(agent.compactor.prefix))
     return {"tokens_before": before, "tokens_after": after, "summary": summary}

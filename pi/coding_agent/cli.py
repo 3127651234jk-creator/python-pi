@@ -18,7 +18,7 @@ import httpx
 from ..ai.models import ModelError, resolve_model
 from ..ai.types import AssistantMessage, SystemMessage, TextContent, TextDeltaEvent, get_message_text
 from ..agent.agent import Agent
-from ..agent.compaction import compact_agent
+from ..agent.compaction import compact_agent, prefix_checkpoint, restore_compaction
 from ..agent.types import (
     AgentEndEvent,
     MessageEndEvent,
@@ -88,7 +88,8 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
     system_prompt = build_system_prompt(options)
     agent = Agent(model=model, tools=tools, system_prompt=system_prompt,
                  thinking_level=args.thinking or os.environ.get("PI_PY_THINKING") or settings.get("thinking", "off"),
-                 compaction=CompactionSettings(**settings.get("compaction", {})))
+                 compaction=CompactionSettings(**settings.get("compaction", {})),
+                 cache_retention=settings.get("cache_retention", "5m"))
     resources = resources or ResourceCatalog(registry.config)
     agent.messages[0].sections = {"skills": resources.system_prompt() or None}
     return agent
@@ -449,6 +450,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                     session.start_new()
                     for message in agent.messages:
                         session.append(message)
+                restore_compaction(agent.compactor, agent.messages,
+                                   session.latest_custom("compaction") if session else None)
                 print("conversation cleared")
                 continue
             if command == "/export-ts":
@@ -621,8 +624,7 @@ def handle_session_command(command: str, argument: str, agent: Agent, session: O
             raise ValueError("Usage: /export <path.jsonl|path.html|path.md>")
         print(session.export(argument))
     if command in ("/resume", "/tree", "/fork", "/clone") and (argument or command in ("/fork", "/clone")):
-        agent.compactor.prefix = []
-        agent.compactor.summary = ""
+        restore_compaction(agent.compactor, agent.messages, session.latest_custom("compaction"))
 
 
 def restore_session_settings(agent: Agent, session: SessionManager, registry: ModelRegistry) -> None:
@@ -636,9 +638,7 @@ def restore_session_settings(agent: Agent, session: SessionManager, registry: Mo
     thinking = session.latest_custom("thinking_level_change")
     if thinking and thinking.get("thinkingLevel") in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
         agent.thinking_level = thinking["thinkingLevel"]
-    compaction = session.latest_custom("compaction")
-    if compaction and compaction.get("summary"):
-        agent.compactor.summary = compaction["summary"]
+    restore_compaction(agent.compactor, agent.messages, session.latest_custom("compaction"))
 
 
 def sync_mcp_tools(agent: Agent, mcp: McpManager) -> None:
@@ -717,7 +717,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             session.append(update)
 
         def persist_summary(summary: str) -> None:
-            session.append_compaction(summary)
+            session.append_compaction(summary, checkpoint=prefix_checkpoint(agent.compactor.prefix))
 
         agent.compactor.on_summary = persist_summary
 

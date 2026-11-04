@@ -21,6 +21,9 @@ from .blocks import BlockEvents
 
 def build_request(model, context, options):
     system, messages = normalize_context(context)
+    cache_point = None
+    if options is not None and options.cache_retention in ("5m", "1h") and _supports_prompt_caching(model.id):
+        cache_point = {"cachePoint": {"type": "default", **({"ttl": "1h"} if options.cache_retention == "1h" else {})}}
     output = []
     for message in messages:
         content = []
@@ -54,9 +57,19 @@ def build_request(model, context, options):
         body["inferenceConfig"].pop("temperature", None)
     if system:
         body["system"] = [{"text": get_system_message_text(system)}]
+        if cache_point:
+            body["system"].append(dict(cache_point))
         if system.tools_added:
             body["toolConfig"] = {"tools": [{"toolSpec": {"name": t.name, "description": t.description, "inputSchema": {"json": t.parameters}}} for t in system.tools_added]}
+    if cache_point and output and output[-1]["role"] == "user":
+        output[-1]["content"].append(dict(cache_point))
     return body
+
+
+def _supports_prompt_caching(model_id: str) -> bool:
+    """Cache points are accepted by Claude models; others reject the block."""
+    lowered = model_id.lower()
+    return "claude" in lowered
 
 
 async def stream_bedrock(model, context, options=None):
@@ -110,7 +123,13 @@ async def stream_bedrock(model, context, options=None):
                     raise RuntimeError(f"Bedrock stopped: {raw}")
             elif "metadata" in item:
                 usage = item["metadata"].get("usage", {})
-                state.set_usage(usage_from_counts(usage.get("inputTokens", 0), usage.get("outputTokens", 0), usage.get("cacheReadInputTokens", 0), usage.get("cacheWriteInputTokens", 0)))
+                write = usage.get("cacheWriteInputTokens", 0) or 0
+                write_1h = sum((detail.get("inputTokens") or 0) for detail in (usage.get("cacheDetails") or [])
+                               if detail.get("ttl") == "1h")
+                if write_1h:
+                    write = max(0, write - write_1h)
+                state.set_usage(usage_from_counts(usage.get("inputTokens", 0), usage.get("outputTokens", 0),
+                    usage.get("cacheReadInputTokens", 0), write, cache_write_1h=write_1h))
             elif any(key.endswith("Exception") for key in item):
                 raise RuntimeError("Bedrock stream error: " + next(iter(item)))
             for event in events:

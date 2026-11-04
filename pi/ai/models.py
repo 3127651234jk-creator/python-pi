@@ -21,6 +21,7 @@ class ModelCost:
     output: float = 0.0
     cache_read: float = 0.0
     cache_write: float = 0.0
+    cache_write_1h: float = 0.0
 
 
 @dataclass
@@ -47,12 +48,18 @@ class Model:
         output_cost = usage.output * self.costs.output / m
         cache_read_cost = usage.cache_read * self.costs.cache_read / m
         cache_write_cost = usage.cache_write * self.costs.cache_write / m
+        # Anthropic extended-TTL rule: 1h cache writes bill at 2x base input
+        # unless the catalog carries a dedicated 1h price. Only Anthropic
+        # reports cache_write_1h tokens, so the fallback is safe elsewhere.
+        write_1h_price = self.costs.cache_write_1h or 2 * self.costs.input
+        cache_write_1h_cost = usage.cache_write_1h * write_1h_price / m
         return {
             "input": input_cost,
             "output": output_cost,
             "cache_read": cache_read_cost,
             "cache_write": cache_write_cost,
-            "total": input_cost + output_cost + cache_read_cost + cache_write_cost,
+            "cache_write_1h": cache_write_1h_cost,
+            "total": input_cost + output_cost + cache_read_cost + cache_write_cost + cache_write_1h_cost,
         }
 
 

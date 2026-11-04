@@ -36,10 +36,12 @@ class Agent:
         thinking_level: str = "off",
         queue_mode: str = "all",
         compaction: Optional[CompactionSettings] = None,
+        cache_retention: Optional[str] = "5m",
     ) -> None:
         self.model = model
         self.compactor = ContextCompactor(compaction or CompactionSettings())
         self.thinking_level = thinking_level
+        self.cache_retention = cache_retention if cache_retention in ("5m", "1h") else None
         self.tools: List[AgentTool] = list(tools or [])
         self.messages: List[Any] = []
         self.queue_mode = queue_mode
@@ -155,6 +157,7 @@ class Agent:
             tool_execution="parallel",
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
+            cache_retention=self.cache_retention,
         )
 
     async def stream_events(self, text: str) -> AsyncIterator[AgentEvent]:

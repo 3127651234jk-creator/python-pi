@@ -463,7 +463,7 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
                 except OSError as error:
                     cleanup_errors.append(error)
         try:
-            shutil.rmtree(root, ignore_errors=False)
+            shutil.rmtree(root, ignore_errors=True)
         except OSError as error:
             cleanup_errors.append(error)
         restore_environment()

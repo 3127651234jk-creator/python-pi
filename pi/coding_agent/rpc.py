@@ -16,7 +16,7 @@ from ..ai.json_io import to_json
 from ..ai.types import AssistantMessage, SystemMessage, TextContent
 from ..ai.models import ModelError
 from ..agent.agent import Agent
-from ..agent.compaction import compact_agent
+from ..agent.compaction import compact_agent, restore_compaction
 from .catalog_sync import fetch_catalog, save_cache
 from .session import SessionManager
 from .model_registry import ModelRegistry
@@ -193,6 +193,8 @@ class RpcServer:
                         self.session.start_new()
                         for message in self.agent.messages:
                             self.session.append(message)
+                    restore_compaction(self.agent.compactor, self.agent.messages,
+                                       self.session.latest_custom("compaction") if self.session else None)
                 elif kind in ("switch_session", "fork", "clone", "get_tree", "get_entries", "set_session_name", "export") and self.session:
                     if kind == "switch_session":
                         self.agent.messages = self.session.resume(command["path"])
@@ -206,6 +208,9 @@ class RpcServer:
                         self.session.rename(command["name"])
                     else:
                         data = {"path": self.session.export(command["path"])}
+                    if kind in ("switch_session", "fork", "clone"):
+                        restore_compaction(self.agent.compactor, self.agent.messages,
+                                           self.session.latest_custom("compaction"))
                 else:
                     raise ValueError(f"Unsupported command: {kind}")
             response["data"] = data

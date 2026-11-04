@@ -20,8 +20,10 @@ with ``--experimental-strip-types`` or Node 23.6+ (stripping by default)
 works; when neither is available the extension is skipped with a notice.
 
 Not every TS API is bridged: TUI renderers, virtual models, MCP server
-registration and session-management actions stay unimplemented and raise a
-clear error when an extension calls them.
+registration, session-management actions and most state getters stay
+unimplemented. Unsupported methods (including ``pi.events``) exist on the
+``pi`` object but raise a clear error when an extension calls them, instead
+of failing as opaque TypeErrors.
 """
 
 from __future__ import annotations

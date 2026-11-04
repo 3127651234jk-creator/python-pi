@@ -6,4 +6,5 @@ __pycache__/
 build/
 dist/
 .pi/
+.eval/
 _hang.log

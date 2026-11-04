@@ -18,8 +18,9 @@ EMPTY_USAGE = {
     "output": 0,
     "cache_read": 0,
     "cache_write": 0,
+    "cache_write_1h": 0,
     "total_tokens": 0,
-    "cost": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0},
+    "cost": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "cache_write_1h": 0.0, "total": 0.0},
 }
 
 
@@ -29,14 +30,17 @@ class Usage:
     output: int = 0
     cache_read: int = 0
     cache_write: int = 0
+    cache_write_1h: int = 0
     reasoning: Optional[int] = None
     cost: Dict[str, float] = field(
-        default_factory=lambda: {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0}
+        default_factory=lambda: {
+            "input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "cache_write_1h": 0.0, "total": 0.0
+        }
     )
 
     @property
     def total_tokens(self) -> int:
-        return self.input + self.output + self.cache_read + self.cache_write
+        return self.input + self.output + self.cache_read + self.cache_write + self.cache_write_1h
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -47,6 +51,8 @@ class Usage:
             "total_tokens": self.total_tokens,
             "cost": dict(self.cost),
         }
+        if self.cache_write_1h:
+            d["cache_write_1h"] = self.cache_write_1h
         if self.reasoning is not None:
             d["reasoning"] = self.reasoning
         return d

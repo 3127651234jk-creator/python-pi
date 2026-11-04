@@ -24,6 +24,7 @@ from pi.ai.types import (
 from pi.coding_agent.session import SessionManager
 from pi.coding_agent.cli import async_main, handle_session_command
 from pi.agent.agent import Agent
+from pi.agent.compaction import prefix_checkpoint
 from pi.ai.models import resolve_model
 from pi.ai.providers.faux import reset_script_index
 
@@ -160,6 +161,25 @@ def test_cli_persists_system_prompt_and_resumes(tmp_path, monkeypatch):
     reset_script_index()
     assert asyncio.run(async_main(["--provider", "faux", "--session", path, "again"])) == 0
     assert len(manager.load(path)) > before
+
+
+def test_resume_restores_compaction_checkpoint(tmp_path):
+    manager = SessionManager(str(tmp_path))
+    manager.start_new()
+    first = UserMessage(content="old" * 4000, timestamp=0)
+    second = UserMessage(content="latest", timestamp=1)
+    manager.append(first)
+    manager.append(second)
+    prefix = [first]
+    manager.append_compaction("summary so far", checkpoint=prefix_checkpoint(prefix))
+    session_id = os.path.basename(manager.session_file)[:-6]
+
+    agent = Agent(resolve_model("faux"))
+    agent.compactor.summary = "stale"
+    agent.compactor.prefix = []
+    handle_session_command("/resume", session_id, agent, manager)
+    assert agent.compactor.summary == "summary so far"
+    assert agent.compactor.prefix == prefix
 
 
 def test_branch_requires_complete_tool_results(tmp_path):

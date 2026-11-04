@@ -67,7 +67,7 @@ const pi = {
 		});
 	},
 	registerCommand(name, options = {}) {
-		const handler = options.handler ?? options.handler ?? null;
+		const handler = options.handler ?? null;
 		if (typeof name !== "string" || typeof handler !== "function") {
 			throw new Error("registerCommand requires a name and an options.handler function");
 		}
@@ -92,13 +92,40 @@ const pi = {
 	sendMessage: (customType, content, display = true) => request("sendMessage", { customType, content, display }),
 	log: (message) => request("log", { message: typeof message === "string" ? message : String(message) }),
 	ui,
-	// Present but unsupported under the Python host, so extensions fail with a clear message.
+	// Present but unsupported under the Python host, so extensions fail with a
+	// clear message instead of an opaque TypeError.
 	registerToolRenderer: failUnimplemented("registerToolRenderer"),
 	registerMcpServer: failUnimplemented("registerMcpServer"),
 	registerVirtualModel: failUnimplemented("registerVirtualModel"),
+	unregisterVirtualModel: failUnimplemented("unregisterVirtualModel"),
 	registerMessageRenderer: failUnimplemented("registerMessageRenderer"),
-	sendUserMessage: failUnimplemented("sendUserMessage"),
-	events: undefined,
+	registerEntryRenderer: failUnimplemented("registerEntryRenderer"),
+	registerMarkdownTransformer: failUnimplemented("registerMarkdownTransformer"),
+	registerShortcut: failUnimplemented("registerShortcut"),
+	registerFlag: failUnimplemented("registerFlag"),
+	getFlag: failUnimplemented("getFlag"),
+	setSessionName: failUnimplemented("setSessionName"),
+	getSessionName: failUnimplemented("getSessionName"),
+	setLabel: failUnimplemented("setLabel"),
+	exec: failUnimplemented("exec"),
+	getActiveTools: failUnimplemented("getActiveTools"),
+	getAllTools: failUnimplemented("getAllTools"),
+	setActiveTools: failUnimplemented("setActiveTools"),
+	refreshTools: failUnimplemented("refreshTools"),
+	getSettings: failUnimplemented("getSettings"),
+	getCommands: failUnimplemented("getCommands"),
+	setModel: failUnimplemented("setModel"),
+	getThinkingLevel: failUnimplemented("getThinkingLevel"),
+	setThinkingLevel: failUnimplemented("setThinkingLevel"),
+	unregisterProvider: failUnimplemented("unregisterProvider"),
+	unregisterMcpServer: failUnimplemented("unregisterMcpServer"),
+	getMcpServers: failUnimplemented("getMcpServers"),
+	events: {
+		on: failUnimplemented("events.on"),
+		once: failUnimplemented("events.once"),
+		off: failUnimplemented("events.off"),
+		emit: failUnimplemented("events.emit"),
+	},
 };
 
 function toScriptValue(value) {

@@ -375,6 +375,7 @@ def _build_stream_options(config: AgentLoopConfig, api_key: Optional[str], signa
         max_tokens=config.max_tokens,
         reasoning=config.reasoning,
         telemetry_context=config.telemetry_context,
+        cache_retention=getattr(config, "cache_retention", None),
     )
 
 

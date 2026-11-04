@@ -24,8 +24,6 @@ CONTROL = "without_docs"
 TREATMENT = "with_docs"
 VARIANTS = (CONTROL, TREATMENT)
 
-FLAGS = ("no-lift", "negative-delta", "control-saturated", "treatment-saturated", "flaky")
-
 
 class EvalRunIdentity(TypedDict):
     evalSet: str

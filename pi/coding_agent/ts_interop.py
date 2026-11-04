@@ -45,19 +45,23 @@ def _ts_usage(data: Optional[dict]) -> Usage:
         output=int(data.get("output", 0) or 0),
         cache_read=int(data.get("cacheRead", 0) or 0),
         cache_write=int(data.get("cacheWrite", 0) or 0),
+        cache_write_1h=int(data.get("cacheWrite1h", 0) or 0),
         reasoning=data.get("reasoning") if isinstance(data.get("reasoning"), int) else None,
         cost={"input": float(cost.get("input", 0) or 0), "output": float(cost.get("output", 0) or 0),
               "cache_read": float(cost.get("cacheRead", 0) or 0), "cache_write": float(cost.get("cacheWrite", 0) or 0),
+              "cache_write_1h": float(cost.get("cacheWrite1h", 0) or 0),
               "total": float(cost.get("total", 0) or 0)},
     )
 
 
 def _our_usage(usage: Usage) -> dict:
     return {
-        "input": usage.input, "output": usage.output, "cacheRead": usage.cache_read, "cacheWrite": usage.cache_write,
+        "input": usage.input, "output": usage.output, "cacheRead": usage.cache_read,
+        "cacheWrite": usage.cache_write, **({"cacheWrite1h": usage.cache_write_1h} if usage.cache_write_1h else {}),
         "totalTokens": usage.total_tokens,
         "cost": {"input": usage.cost.get("input", 0.0), "output": usage.cost.get("output", 0.0),
                  "cacheRead": usage.cost.get("cache_read", 0.0), "cacheWrite": usage.cost.get("cache_write", 0.0),
+                 "cacheWrite1h": usage.cost.get("cache_write_1h", 0.0),
                  "total": usage.cost.get("total", 0.0)},
         **({"reasoning": usage.reasoning} if usage.reasoning is not None else {}),
     }

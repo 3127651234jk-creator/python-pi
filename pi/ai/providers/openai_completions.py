@@ -184,15 +184,24 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         usage = data["usage"]
         details = usage.get("prompt_tokens_details", {}) or {}
         completion_details = usage.get("completion_tokens_details", {}) or {}
-        state.set_usage(
-            usage_from_counts(
-                input_tokens=usage.get("prompt_tokens", 0) or 0,
-                output_tokens=usage.get("completion_tokens", 0) or 0,
-                cache_read=details.get("cached_tokens", 0) or 0,
-                reasoning=completion_details.get("reasoning_tokens"),
-            )
+        # DeepSeek reports prompt_cache_hit_tokens; Kimi a top-level cached_tokens.
+        cached = (
+            details.get("cached_tokens")
+            or usage.get("prompt_cache_hit_tokens")
+            or usage.get("cached_tokens")
+            or 0
         )
-        # Usage arrives in its own final chunk; nothing else to do.
+        counted = usage_from_counts(
+            # prompt_tokens includes cache reads; report them separately.
+            input_tokens=max(0, (usage.get("prompt_tokens", 0) or 0) - cached),
+            output_tokens=usage.get("completion_tokens", 0) or 0,
+            cache_read=cached,
+            reasoning=completion_details.get("reasoning_tokens"),
+        )
+        # Usage arrives in its own final chunk; the [DONE] handler skips the
+        # shared cost application, so price it here.
+        counted.cost = state.model.calculate_cost(counted)
+        state.set_usage(counted)
         return
 
     choices = data.get("choices") or []

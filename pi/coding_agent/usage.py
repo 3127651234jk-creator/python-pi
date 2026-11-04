@@ -21,6 +21,7 @@ class ModelUsage:
     output: int = 0
     cache_read: int = 0
     cache_write: int = 0
+    cache_write_1h: int = 0
     cost: float = 0.0
 
     def add(self, usage: Usage, cost: float) -> None:
@@ -29,6 +30,7 @@ class ModelUsage:
         self.output += usage.output
         self.cache_read += usage.cache_read
         self.cache_write += usage.cache_write
+        self.cache_write_1h += getattr(usage, "cache_write_1h", 0) or 0
         self.cost += cost
 
 
@@ -39,6 +41,7 @@ class UsageTotals:
     output: int = 0
     cache_read: int = 0
     cache_write: int = 0
+    cache_write_1h: int = 0
     cost: float = 0.0
     by_model: Dict[str, ModelUsage] = field(default_factory=dict)
 
@@ -48,6 +51,7 @@ class UsageTotals:
         self.output += usage.output
         self.cache_read += usage.cache_read
         self.cache_write += usage.cache_write
+        self.cache_write_1h += getattr(usage, "cache_write_1h", 0) or 0
         self.cost += cost
         entry = self.by_model.setdefault(model_key, ModelUsage())
         entry.add(usage, cost)
@@ -95,11 +99,16 @@ def context_usage(messages: Iterable, model) -> Optional[dict]:
 
 
 def format_usage(totals: UsageTotals, context: Optional[dict] = None) -> str:
+    first = "requests: {}  input: {}  output: {}  cache read: {}  cache write: {}".format(
+        totals.requests, f"{totals.input:,}", f"{totals.output:,}",
+        f"{totals.cache_read:,}", f"{totals.cache_write:,}")
+    if totals.cache_write_1h:
+        first += f"  cache write (1h): {totals.cache_write_1h:,}"
     lines = [
-        "requests: {}  input: {}  output: {}  cache read: {}  cache write: {}".format(
-            totals.requests, f"{totals.input:,}", f"{totals.output:,}",
-            f"{totals.cache_read:,}", f"{totals.cache_write:,}"),
-        "total tokens: {}  cost: ${:.4f}".format(f"{totals.input + totals.output + totals.cache_read + totals.cache_write:,}", totals.cost),
+        first,
+        "total tokens: {}  cost: ${:.4f}".format(
+            f"{totals.input + totals.output + totals.cache_read + totals.cache_write + totals.cache_write_1h:,}",
+            totals.cost),
     ]
     if context is not None:
         lines.append("context: {} / {} tokens ({:.1f}%)".format(
@@ -107,9 +116,12 @@ def format_usage(totals: UsageTotals, context: Optional[dict] = None) -> str:
     if totals.by_model:
         lines.append("by model:")
         for key, entry in sorted(totals.by_model.items(), key=lambda item: item[1].cost, reverse=True):
-            lines.append("  {}: {} requests, in {}, out {}, cache {}/{}, ${:.4f}".format(
+            per_model = "  {}: {} requests, in {}, out {}, cache {}/{}".format(
                 key, entry.requests, f"{entry.input:,}", f"{entry.output:,}",
-                f"{entry.cache_read:,}", f"{entry.cache_write:,}", entry.cost))
+                f"{entry.cache_read:,}", f"{entry.cache_write:,}")
+            if entry.cache_write_1h:
+                per_model += f" (+1h {entry.cache_write_1h:,})"
+            lines.append(per_model + f", ${entry.cost:.4f}")
     return "\n".join(lines)
 
 
@@ -130,7 +142,8 @@ def session_stats(messages: list, model=None, session_file: Optional[str] = None
         "total_messages": len(messages),
         "tokens": {"input": totals.input, "output": totals.output,
                    "cache_read": totals.cache_read, "cache_write": totals.cache_write,
-                   "total": totals.input + totals.output + totals.cache_read + totals.cache_write},
+                   "cache_write_1h": totals.cache_write_1h,
+                   "total": totals.input + totals.output + totals.cache_read + totals.cache_write + totals.cache_write_1h},
         "cost": totals.cost,
         "context_usage": context_usage(messages, model) if model is not None else None,
     }

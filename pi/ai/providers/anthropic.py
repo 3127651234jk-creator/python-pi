@@ -60,6 +60,7 @@ _STOP_REASON_MAP = {
 def build_request(model: Model, context: TranscriptContext, options: Optional[SimpleStreamOptions]) -> Dict[str, Any]:
     """Build the ``/v1/messages`` payload from a normalized transcript."""
     system, messages = normalize_context(context)
+    cache_control = _cache_control(options.cache_retention if options else None)
     body: Dict[str, Any] = {
         "model": model.id,
         "max_tokens": (options.max_tokens if options and options.max_tokens else model.max_tokens),
@@ -69,13 +70,20 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
     if system is not None:
         text = get_system_message_text(system)
         if text:
-            body["system"] = text
+            if cache_control:
+                body["system"] = [{"type": "text", "text": text, "cache_control": cache_control}]
+            else:
+                body["system"] = text
     tools = _declared_tools(system)
     if tools:
         body["tools"] = [
             {"name": tool.name, "description": tool.description, "input_schema": tool.parameters}
             for tool in tools
         ]
+        if cache_control:
+            body["tools"][-1]["cache_control"] = cache_control
+    if cache_control:
+        _tag_last_message(body["messages"], cache_control)
 
     reasoning: Optional[ThinkingLevel] = options.reasoning if options else None
     budget = thinking_budget(reasoning) if model.reasoning else None
@@ -87,6 +95,28 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
         body["temperature"] = options.temperature
     apply_model_params(body, model, options)
     return body
+
+
+def _cache_control(retention: Optional[str]) -> Optional[Dict[str, str]]:
+    """Anthropic cache marker for the requested retention; None disables caching."""
+    if retention not in ("5m", "1h"):
+        return None
+    control = {"type": "ephemeral"}
+    if retention == "1h":
+        control["ttl"] = "1h"
+    return control
+
+
+def _tag_last_message(api_messages: List[Dict[str, Any]], cache_control: Dict[str, str]) -> None:
+    """Attach the cache marker to the last block of the final message."""
+    if not api_messages:
+        return
+    content = api_messages[-1]["content"]
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}] if content else []
+        api_messages[-1]["content"] = content
+    if content:
+        content[-1] = {**content[-1], "cache_control": cache_control}
 
 
 def _declared_tools(system: Optional[SystemMessage]) -> List[Tool]:
@@ -190,11 +220,20 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         message = data.get("message", {})
         state.set_response(message.get("id"), message.get("model"))
         usage = message.get("usage", {}) or {}
+        # Prefer the cache_creation split (5m/1h); fall back to the flat total.
+        creation = usage.get("cache_creation") or {}
+        write_5m = creation.get("ephemeral_5m_input_tokens")
+        if write_5m is None:
+            write_5m = usage.get("cache_creation_input_tokens", 0) or 0
+            write_1h = 0
+        else:
+            write_1h = creation.get("ephemeral_1h_input_tokens", 0) or 0
         state.set_usage(
             usage_from_counts(
                 input_tokens=usage.get("input_tokens", 0) or 0,
                 cache_read=usage.get("cache_read_input_tokens", 0) or 0,
-                cache_write=usage.get("cache_creation_input_tokens", 0) or 0,
+                cache_write=write_5m,
+                cache_write_1h=write_1h,
             )
         )
         return
@@ -306,10 +345,15 @@ async def stream_anthropic(
     def request_factory() -> Dict[str, Any]:
         body = build_request(model, context, options)
         if oauth:
-            text = body.get("system", "")
-            body["system"] = [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}]
-            if text:
-                body["system"].append({"type": "text", "text": text})
+            # The OAuth identity prepends a fixed first block; keep any cached
+            # prompt (block list from build_request) as the trailing block.
+            cached = body.get("system")
+            blocks = (
+                cached if isinstance(cached, list)
+                else [{"type": "text", "text": cached}] if isinstance(cached, str) and cached
+                else []
+            )
+            body["system"] = [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}] + blocks
             for tool in body.get("tools", []):
                 tool["name"] = name_map.get(tool["name"], tool["name"])
             for message in body["messages"]:
@@ -317,6 +361,8 @@ async def stream_anthropic(
                     if block.get("type") == "tool_use":
                         block["name"] = name_map.get(block["name"], block["name"])
         return body
+
+    retention = options.cache_retention if options else None
 
     def headers_factory() -> Dict[str, str]:
         headers = {
@@ -332,6 +378,9 @@ async def stream_anthropic(
         if oauth:
             headers.update({"anthropic-beta": "claude-code-20250219,oauth-2025-04-20", "x-app": "cli",
                 "user-agent": "claude-cli/2.1.280", "anthropic-dangerous-direct-browser-access": "true"})
+        elif retention == "1h":
+            # Extended cache TTL requires an opt-in beta header.
+            headers["anthropic-beta"] = "extended-cache-ttl-2025-04-11"
         return headers
 
     async def convert(event_name, data, state):

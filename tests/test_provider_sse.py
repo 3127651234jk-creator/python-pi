@@ -216,7 +216,8 @@ def test_openai_stream_mapping(monkeypatch):
     assert message.content[0].text == "Hi"
     assert message.content[1].thinking == "think"
     assert message.content[2].arguments == {"path": "x"}
-    assert message.usage.input == 11
+    # prompt_tokens 11 includes 3 cached tokens, reported separately.
+    assert message.usage.input == 8
     assert message.usage.output == 4
     assert message.usage.cache_read == 3
     assert message.usage.reasoning == 2
@@ -256,3 +257,143 @@ def test_anthropic_http_error_yields_error_event(monkeypatch):
     assert isinstance(error, StreamErrorEvent)
     assert "401" in error.error.error_message
     assert "bad key" in error.error.error_message
+
+
+def _capture_body_and_headers(monkeypatch):
+    holder = {}
+
+    async def fake_send(self, request, stream=False):
+        holder["body"] = json.loads(request.content.decode("utf-8"))
+        holder["headers"] = request.headers
+
+        class FakeResponse:
+            status_code = 200
+
+            async def aiter_lines(self):
+                return
+                yield
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                return None
+
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+    return holder
+
+
+def _tools_context():
+    from pi.ai.types import SystemMessage, Tool
+
+    return TranscriptContext(
+        messages=[
+            SystemMessage(content="prompt", timestamp=0,
+                          tools_added=[Tool(name="read", description="d", parameters={"type": "object"})]),
+            UserMessage(content="hi", timestamp=0),
+        ]
+    )
+
+
+@pytest.mark.parametrize("retention,ttl", [("5m", None), ("1h", "1h")])
+def test_anthropic_cache_control_breakpoints(monkeypatch, retention, ttl):
+    from pi.ai.providers import anthropic
+    from pi.ai.providers.base import SimpleStreamOptions
+
+    holder = _capture_body_and_headers(monkeypatch)
+    options = SimpleStreamOptions(cache_retention=retention)
+
+    async def run():
+        async for _ in anthropic.stream_anthropic(make_model("anthropic"), _tools_context(), options):
+            pass
+
+    asyncio.run(run())
+    body = holder["body"]
+    marker = {"type": "ephemeral"} if ttl is None else {"type": "ephemeral", "ttl": "1h"}
+    assert body["system"] == [{"type": "text", "text": "prompt", "cache_control": marker}]
+    assert body["tools"][-1]["cache_control"] == marker
+    assert body["messages"][-1]["content"] == [{"type": "text", "text": "hi", "cache_control": marker}]
+    if ttl == "1h":
+        assert holder["headers"].get("anthropic-beta") == "extended-cache-ttl-2025-04-11"
+    else:
+        assert holder["headers"].get("anthropic-beta") is None
+
+
+ANTHROPIC_CACHE_SSE = """event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":10,"cache_read_input_tokens":2,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":4}}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"""
+
+
+def test_anthropic_cache_creation_usage_split(monkeypatch):
+    from pi.ai.providers import anthropic
+
+    collect = stream_with(monkeypatch, anthropic, ANTHROPIC_CACHE_SSE)
+    events, _ = asyncio.run(collect())
+
+    done = [e for e in events if isinstance(e, DoneEvent)][0]
+    assert done.message.usage.cache_read == 2
+    assert done.message.usage.cache_write == 3
+    assert done.message.usage.cache_write_1h == 4
+
+
+def test_openai_deepseek_cache_fallback_and_cost(monkeypatch):
+    from pi.ai.models import ModelCost
+    from pi.ai.providers import openai_completions
+
+    sse = """data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":null}
+
+data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4,"prompt_cache_hit_tokens":3}}
+
+data: [DONE]
+"""
+    async def fake_send(self, request, stream=False):
+        class FakeResponse:
+            status_code = 200
+
+            async def aiter_lines(self):
+                for line in sse.splitlines():
+                    yield line
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                return None
+
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+
+    async def run():
+        model = make_model("openai")
+        model.costs = ModelCost(input=1.0)
+        events = []
+        async for event in openai_completions.stream_openai_completions(model, user_context()):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+    done = [e for e in events if isinstance(e, DoneEvent)][0]
+    assert done.message.usage.cache_read == 3
+    assert done.message.usage.input == 8  # prompt_tokens 11 minus 3 cached
+    assert done.message.usage.cost["input"] == pytest.approx(8 * 1.0 / 1_000_000)
+    assert done.message.usage.cost["total"] == pytest.approx(8 * 1.0 / 1_000_000)
