@@ -15,6 +15,7 @@ import pytest
 from pi.agent.agent import Agent
 from pi.agent.types import BeforeToolCallResult
 from pi.ai.models import ModelError, resolve_model
+from pi.ai.providers.faux import reset_script_index
 from pi.coding_agent.extensions import ExtensionAPI, ExtensionContext
 from pi.coding_agent.cli import build_parser, split_extension_flags
 from pi.coding_agent.config import Configuration
@@ -370,6 +371,9 @@ def test_dispatch_dynamic_mcp_registration(tmp_path):
 
 
 def test_virtual_model_routes_agent_requests(tmp_path):
+    # Earlier tests consume faux turns without resetting the shared index.
+    reset_script_index()
+
     async def check():
         extension_dir = tmp_path / ".pi" / "extensions"
         extension_dir.mkdir(parents=True)

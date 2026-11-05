@@ -192,8 +192,10 @@ from .framework import (  # noqa: E402
     describe_eval,
     get_harness_run_from_error,
     normalize_harness_run,
+    run_eval_case,
     structured_output_judge,
     to_json_value,
+    tool_calls,
 )
 from .harness import (  # noqa: E402
     DOCUMENTATION_EVAL_TOOLS,

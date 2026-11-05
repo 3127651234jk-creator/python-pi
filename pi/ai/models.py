@@ -25,6 +25,58 @@ class ModelCost:
 
 
 @dataclass
+class ModelImageResizeOptions:
+    """Per-model resize profile applied before a new image enters history."""
+
+    max_width: Optional[int] = None
+    max_height: Optional[int] = None
+    max_bytes: Optional[int] = None
+    jpeg_quality: Optional[int] = None
+
+
+@dataclass
+class ModelImageInputLimits:
+    """Image limits for one model (port of ModelImageInputLimits)."""
+
+    resize: Optional[ModelImageResizeOptions] = None
+    max_per_message: Optional[int] = None
+    max_per_request: Optional[int] = None
+
+
+@dataclass
+class ModelInputLimits:
+    """Provider input limits (port of ModelInputLimits)."""
+
+    max_request_bytes: Optional[int] = None
+    images: Optional[ModelImageInputLimits] = None
+
+
+def parse_input_limits(raw: Optional[dict]) -> Optional[ModelInputLimits]:
+    """Build ModelInputLimits from a catalog entry (camelCase JSON keys)."""
+    if not raw:
+        return None
+    images = raw.get("images") or {}
+    resize = images.get("resize") or {}
+    return ModelInputLimits(
+        max_request_bytes=raw.get("maxRequestBytes"),
+        images=ModelImageInputLimits(
+            resize=ModelImageResizeOptions(
+                max_width=resize.get("maxWidth"),
+                max_height=resize.get("maxHeight"),
+                max_bytes=resize.get("maxBytes"),
+                jpeg_quality=resize.get("jpegQuality"),
+            )
+            if resize
+            else None,
+            max_per_message=images.get("maxPerMessage"),
+            max_per_request=images.get("maxPerRequest"),
+        )
+        if images
+        else None,
+    )
+
+
+@dataclass
 class Model:
     id: str
     name: str
@@ -36,6 +88,8 @@ class Model:
     context_window: int = 200_000
     max_tokens: int = 8_192
     input: List[str] = field(default_factory=lambda: ["text"])
+    output: Optional[List[str]] = None  # image models: ["image"] or ["image", "text"]
+    input_limits: Optional[ModelInputLimits] = field(default=None, repr=False)
     costs: ModelCost = field(default_factory=ModelCost)
     headers: Dict[str, str] = field(default_factory=dict, repr=False)
     params: Dict[str, Any] = field(default_factory=dict, repr=False)
@@ -187,7 +241,38 @@ def resolve_model(
         context_window=entry.get("context_window", 200_000 if provider == "anthropic" else 128_000),
         max_tokens=entry.get("max_tokens", 8_192),
         input=entry.get("input", ["text"]),
+        input_limits=parse_input_limits(entry.get("input_limits")),
         costs=entry.get("costs", ModelCost()),
+    )
+
+
+def resolve_image_model(
+    provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Model:
+    """Resolve an image-generation model (currently openrouter-images only)."""
+
+    provider = (provider or _env("PI_PY_PROVIDER") or "openrouter").lower()
+    if provider != "openrouter":
+        raise ModelError(f"Unknown image provider '{provider}'. Supported: openrouter.")
+    key = api_key or _env("PI_PY_API_KEY") or _env("OPENROUTER_API_KEY")
+    if not key:
+        raise ModelError("Missing API key: set OPENROUTER_API_KEY (or pass PI_PY_API_KEY).")
+    identifier = model_id or _env("PI_PY_MODEL") or "google/gemini-2.5-flash-image"
+    endpoint = (
+        base_url or _env("PI_PY_BASE_URL") or _env("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+    )
+    return Model(
+        id=identifier,
+        name=identifier,
+        api="openrouter-images",
+        provider="openrouter",
+        base_url=endpoint.rstrip("/"),
+        api_key=key,
+        input=["text", "image"],
+        output=["image", "text"],
     )
 
 

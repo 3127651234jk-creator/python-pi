@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator, Callable, Deque, List, Optional
 
 from ..ai.models import Model
 from ..ai.providers import get_default_stream_fn
-from ..ai.types import SystemMessage, ToolResultMessage, UserMessage
+from ..ai.types import SystemMessage, TextContent, ToolResultMessage, UserMessage
 from ..util import AbortSignal
 from .agent_loop import default_convert_to_llm, run_agent_loop
 from .compaction import CompactionSettings, ContextCompactor
@@ -37,11 +37,13 @@ class Agent:
         queue_mode: str = "all",
         compaction: Optional[CompactionSettings] = None,
         cache_retention: Optional[str] = "5m",
+        block_images: bool = False,
     ) -> None:
         self.model = model
         self.compactor = ContextCompactor(compaction or CompactionSettings())
         self.thinking_level = thinking_level
         self.cache_retention = cache_retention if cache_retention in ("5m", "1h") else None
+        self.block_images = block_images
         self.tools: List[AgentTool] = list(tools or [])
         self.messages: List[Any] = []
         self.queue_mode = queue_mode
@@ -110,13 +112,22 @@ class Agent:
         if self._abort is not None:
             self._abort.abort()
 
-    async def prompt(self, text: str, system_message: Optional[SystemMessage] = None) -> List[Any]:
-        """Add a user prompt (and optional system message) and run the loop."""
+    async def prompt(
+        self,
+        text: str,
+        system_message: Optional[SystemMessage] = None,
+        images: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        """Add a user prompt (with optional image attachments and system message) and run the loop."""
 
         prompts: List[Any] = []
         if system_message is not None:
             prompts.append(system_message)
-        prompts.append(UserMessage(content=text, timestamp=_now_ms()))
+        if images:
+            content: Any = [TextContent(text=text)] + list(images) if text else list(images)
+            prompts.append(UserMessage(content=content, timestamp=_now_ms()))
+        else:
+            prompts.append(UserMessage(content=text, timestamp=_now_ms()))
         return await self._run(prompts)
 
     async def _run(self, prompts: List[Any]) -> List[Any]:
@@ -166,10 +177,15 @@ class Agent:
                 return model.api_key
             return await model.get_api_key(provider)
 
+        # Read block_images through the attribute so mid-session setting
+        # changes take effect on the next request.
+        def convert_to_llm(messages: List[Any]) -> List[Any]:
+            return default_convert_to_llm(messages, block_images=self.block_images)
+
         return AgentLoopConfig(
             model=self.model,
             get_api_key=get_api_key,
-            convert_to_llm=default_convert_to_llm,
+            convert_to_llm=convert_to_llm,
             reasoning=None if self.thinking_level == "off" else self.thinking_level,
             get_steering_messages=self._get_steering_messages,
             get_follow_up_messages=self._get_follow_up_messages,

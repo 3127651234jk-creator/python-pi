@@ -318,6 +318,23 @@ class SessionManager:
                 self.append_custom(entry.custom["kind"], entry.custom["data"])
         return self.messages()
 
+    def branch_jsonl(self) -> str:
+        """Active branch as JSONL records (same shape as a .jsonl export)."""
+        records = [{"type": "name", "name": self.name}]
+        for entry in self.get_branch():
+            if entry.custom is not None and entry.message is None:
+                records.append({"type": "custom", "id": entry.id, "parent_id": entry.parent_id,
+                                "customType": entry.custom["kind"], "data": entry.custom["data"]})
+            elif entry.custom is not None:
+                records.append({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
+                                "customType": entry.custom["kind"], "display": entry.custom["data"].get("display", True),
+                                "details": entry.custom["data"].get("details"),
+                                "message": _to_dict(entry.message)})
+            else:
+                records.append({"type": "message", "id": entry.id, "parent_id": entry.parent_id,
+                                "message": _to_dict(entry.message)})
+        return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+
     def export(self, path: str) -> str:
         path = os.path.abspath(path)
         if self.session_file and os.path.normcase(path) == os.path.normcase(os.path.abspath(self.session_file)):
@@ -327,20 +344,7 @@ class SessionManager:
             raise ValueError("Export extension must be .jsonl, .html or .md")
         branch = self.get_branch()
         if extension == ".jsonl":
-            records = [{"type": "name", "name": self.name}]
-            for entry in branch:
-                if entry.custom is not None and entry.message is None:
-                    records.append({"type": "custom", "id": entry.id, "parent_id": entry.parent_id,
-                                    "customType": entry.custom["kind"], "data": entry.custom["data"]})
-                elif entry.custom is not None:
-                    records.append({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
-                                    "customType": entry.custom["kind"], "display": entry.custom["data"].get("display", True),
-                                    "details": entry.custom["data"].get("details"),
-                                    "message": _to_dict(entry.message)})
-                else:
-                    records.append({"type": "message", "id": entry.id, "parent_id": entry.parent_id,
-                                    "message": _to_dict(entry.message)})
-            content = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+            content = self.branch_jsonl()
         else:
             text = "\n\n".join(f"## {e.message.role}\n\n{get_message_text(e.message.content)}"
                                for e in branch if e.message is not None)

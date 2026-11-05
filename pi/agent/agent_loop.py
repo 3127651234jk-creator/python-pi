@@ -753,6 +753,39 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def default_convert_to_llm(messages: List[Any]) -> List[Any]:
-    """Pass through the four LLM roles, filtering UI-only custom messages."""
-    return [m for m in messages if getattr(m, "role", None) in ("system", "user", "assistant", "toolResult")]
+IMAGE_DISABLED_TEXT = "Image reading is disabled."
+
+
+def _filter_message_images(message: Any) -> Any:
+    """Replace image blocks with a text placeholder, collapsing consecutive duplicates."""
+    import dataclasses  # noqa: PLC0415
+
+    content = getattr(message, "content", None)
+    if not isinstance(content, list) or not any(getattr(block, "type", None) == "image" for block in content):
+        return message
+    filtered: List[Any] = []
+    for block in content:
+        if getattr(block, "type", None) == "image":
+            previous = filtered[-1] if filtered else None
+            if isinstance(previous, TextContent) and previous.text == IMAGE_DISABLED_TEXT:
+                continue
+            filtered.append(TextContent(text=IMAGE_DISABLED_TEXT))
+        else:
+            filtered.append(block)
+    return dataclasses.replace(message, content=filtered)
+
+
+def default_convert_to_llm(messages: List[Any], block_images: bool = False) -> List[Any]:
+    """Pass through the four LLM roles, filtering UI-only custom messages.
+
+    With ``block_images`` set, image blocks in user and toolResult messages are
+    swapped for a text placeholder (defense-in-depth for the block_images
+    setting). The filter runs at the stream boundary so setting changes take
+    effect on the next request without touching stored history.
+    """
+    converted = [m for m in messages if getattr(m, "role", None) in ("system", "user", "assistant", "toolResult")]
+    if not block_images:
+        return converted
+    return [
+        _filter_message_images(m) if getattr(m, "role", None) in ("user", "toolResult") else m for m in converted
+    ]

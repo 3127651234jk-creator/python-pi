@@ -105,7 +105,8 @@ def test_cli_one_shot_template_is_expanded_and_persisted(resources, monkeypatch)
     monkeypatch.setenv("PI_PY_AGENT_DIR", str(resources.agent_dir))
     write(resources.cwd / ".pi/prompts/review.md", "Review $1")
     reset_script_index()
-    assert asyncio.run(async_main(["--provider", "faux", "/review", "tests"])) == 0
+    # The project .pi resources require trust; one-shot mode passes --approve.
+    assert asyncio.run(async_main(["--provider", "faux", "--approve", "/review", "tests"])) == 0
     session = SessionManager(cwd=str(resources.cwd))
     messages = session.load(session.latest_session_file())
     assert any(message.role == "user" and message.content == "Review tests" for message in messages)
@@ -154,10 +155,10 @@ def test_resume_refreshes_skill_catalog(resources, monkeypatch):
     monkeypatch.setenv("PI_PY_AGENT_DIR", str(resources.agent_dir))
     path = write(resources.cwd / ".pi/skills/demo/SKILL.md", "---\nname: demo\ndescription: Before\n---\nBody")
     reset_script_index()
-    asyncio.run(async_main(["--provider", "faux", "hello"]))
+    asyncio.run(async_main(["--provider", "faux", "--approve", "hello"]))
     write(path, "---\nname: demo\ndescription: After\n---\nBody")
     reset_script_index()
-    asyncio.run(async_main(["--provider", "faux", "--continue", "again"]))
+    asyncio.run(async_main(["--provider", "faux", "--approve", "--continue", "again"]))
     session = SessionManager(cwd=str(resources.cwd))
     system, _ = normalize_context(TranscriptContext(session.load(session.latest_session_file())))
     assert "After" in system.sections["skills"]

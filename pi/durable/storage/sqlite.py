@@ -61,6 +61,7 @@ class SqliteStorage(MemoryStorage):
 
     async def commit(self, writes: List[Dict[str, Any]]) -> int:
         self.assert_open()
+        self.reject_copy_source_conflicts(writes)
         resolved = [self.resolve_document_copy(w) if w["type"] == "document.copy" else w for w in writes]
         seq = self.next_seq
         # Validate before opening the transaction so rejections leave no rows.

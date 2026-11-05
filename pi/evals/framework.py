@@ -18,6 +18,7 @@ import inspect
 import json
 import math
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -160,6 +161,55 @@ def current_system_prompt(messages: List[Any]) -> str:
         if getattr(message, "role", None) == "system":
             return get_system_message_text(message)
     return ""
+
+
+def _session_events(source: Any) -> List[Dict[str, Any]]:
+    """Accept a normalized run, a session dict, or a raw event list."""
+    if isinstance(source, dict):
+        session = source.get("session")
+        if isinstance(session, dict):
+            return list(session.get("events") or [])
+        if isinstance(source.get("events"), list):
+            return list(source["events"])
+    if isinstance(source, list):
+        return source
+    return []
+
+
+def tool_calls(source: Any) -> List[Dict[str, Any]]:
+    """Tool calls with their outcomes, in call order (port of vitest-evals toolCalls).
+
+    Statuses: ``ok`` with ``result`` when the tool result arrived, ``error``
+    with ``error`` when it failed, ``pending`` when no result was recorded.
+    """
+    events = _session_events(source)
+    results_by_id: Dict[Any, Dict[str, Any]] = {}
+    calls: List[Dict[str, Any]] = []
+    for event in events:
+        kind = event.get("type") if isinstance(event, dict) else None
+        if kind == "tool_call":
+            calls.append(event)
+        elif kind == "tool_result":
+            call_id = event.get("toolCallId")
+            if call_id is not None and call_id not in results_by_id:
+                results_by_id[call_id] = event
+    resolved: List[Dict[str, Any]] = []
+    for call in calls:
+        entry: Dict[str, Any] = {"name": call.get("name")}
+        if call.get("arguments") is not None:
+            entry["arguments"] = call["arguments"]
+        result = results_by_id.get(call.get("id"))
+        if result is None:
+            entry["status"] = "pending"
+        elif result.get("error"):
+            entry["status"] = "error"
+            entry["error"] = result["error"]
+        else:
+            entry["status"] = "ok"
+            if "content" in result:
+                entry["result"] = result["content"]
+        resolved.append(entry)
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -329,17 +379,21 @@ def describe_eval(
     harness: Harness,
     judges: Optional[List[Any]] = None,
     judge_threshold: Optional[float] = None,
+    title: Optional[str] = None,
 ) -> Callable[[Callable[[Any], Any]], Callable[[Any], Any]]:
     """Register one eval case; the decorated function is the case body.
 
     The body receives an async ``run(input)`` callable that executes the harness
     and resolves to the normalized run. Use ``judge_threshold=None`` for
     comparative scoring: a low score is data, not an infrastructure failure.
+    ``title`` overrides the derived case title; parameterized suites (one
+    registered case per input, like Vitest's ``it.for``) need it to give every
+    case its own identity.
     """
     def decorator(body: Callable[[Callable[[Any], Any]], Any]) -> Callable[[Any], Any]:
         _REGISTRY.append(EvalCaseDef(
             eval_set=name,
-            title=body.__name__.replace("_", " "),
+            title=title if title is not None else body.__name__.replace("_", " "),
             body=body,
             harness=harness,
             judges=list(judges or []),
@@ -358,7 +412,18 @@ def load_cases_from_file(path: Union[str, Path]) -> List[EvalCaseDef]:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load eval file: {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Eval files import sibling fixtures (acme_server, configured_runtime) the
+    # way the TypeScript suites import ./acme-server.ts, so make the file's
+    # directory importable for the duration of the import.
+    directory = str(Path(path).resolve().parent)
+    inserted = directory not in sys.path
+    if inserted:
+        sys.path.insert(0, directory)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if inserted:
+            sys.path.remove(directory)
     cases = _REGISTRY[before:]
     for case in cases:
         case.file = str(path)
@@ -370,8 +435,12 @@ def load_cases_from_file(path: Union[str, Path]) -> List[EvalCaseDef]:
 # ---------------------------------------------------------------------------
 
 
-async def _run_case(case: EvalCaseDef) -> Dict[str, Any]:
-    """Execute one case and return its assertion record (Vitest JSON shape)."""
+async def run_eval_case(case: EvalCaseDef) -> Dict[str, Any]:
+    """Execute one case and return its assertion record (Vitest JSON shape).
+
+    Host runners call this once per selected case; the documentation runner
+    reaches it through :func:`run_eval_file`, which enforces one case per run.
+    """
     state: Dict[str, Any] = {"run": None, "input": None}
 
     async def run(input_value: Any) -> Dict[str, Any]:
@@ -465,5 +534,5 @@ async def run_eval_file(file: str, test_name_pattern: Optional[str] = None) -> D
                 if test_name_pattern is None or re.search(test_name_pattern, case.full_name)]
     if len(selected) != 1:
         raise ValueError(f"Eval selection must match exactly one case in {file}: {test_name_pattern!r}")
-    assertion = await _run_case(selected[0])
+    assertion = await run_eval_case(selected[0])
     return case_report(assertion, file, started_ms)

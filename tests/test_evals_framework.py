@@ -15,6 +15,7 @@ from pi.evals.framework import (
     run_eval_file,
     structured_output_judge,
     to_json_value,
+    tool_calls,
 )
 
 SUITE_TEMPLATE = '''
@@ -131,3 +132,44 @@ def test_run_eval_file_requires_exactly_one_matching_case(tmp_path):
     path = write_suite(tmp_path)
     with pytest.raises(ValueError, match="exactly one case"):
         asyncio.run(run_eval_file(str(path), "no-such-case"))
+
+
+TITLE_SUITE = '''
+from pi.evals.framework import create_harness, describe_eval
+
+harness = create_harness("fixture", run=lambda args: {"output": "ok", "events": []})
+
+
+@describe_eval("Suite", harness=harness, title="page.md matches the implementation")
+async def any_function_name(run):
+    await run("x")
+'''
+
+
+def test_describe_eval_honors_an_explicit_case_title(tmp_path):
+    path = tmp_path / "suite.eval.py"
+    path.write_text(TITLE_SUITE, encoding="utf-8")
+    records = discover_eval_files([str(path)])
+    assert records == [{"name": "Suite > page.md matches the implementation", "file": str(path)}]
+
+
+def test_tool_calls_pair_calls_with_results():
+    run = {"session": {"events": [
+        {"type": "tool_call", "id": "c1", "name": "read", "arguments": {"path": "a"}},
+        {"type": "tool_call", "id": "c2", "name": "grep", "arguments": {}},
+        {"type": "tool_call", "id": "c3", "name": "ls"},
+        {"type": "tool_result", "toolCallId": "c1", "name": "read", "content": "text"},
+        {"type": "tool_result", "toolCallId": "c2", "name": "grep", "content": "",
+         "error": {"message": "boom"}},
+    ]}}
+    assert tool_calls(run) == [
+        {"name": "read", "arguments": {"path": "a"}, "status": "ok", "result": "text"},
+        {"name": "grep", "arguments": {}, "status": "error", "error": {"message": "boom"}},
+        {"name": "ls", "status": "pending"},
+    ]
+
+
+def test_tool_calls_accepts_a_raw_event_list_or_session():
+    events = [{"type": "tool_call", "id": "c1", "name": "read"}]
+    assert tool_calls(events) == tool_calls({"session": {"events": events}}) == [
+        {"name": "read", "status": "pending"}]

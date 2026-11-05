@@ -15,6 +15,7 @@ RESERVED_COMMANDS = {
     "help", "exit", "quit", "model", "models", "login", "logout", "settings", "reload",
     "clear", "new", "resume", "session", "name", "tree", "fork", "clone", "export", "usage",
     "skills", "prompts", "mcp", "theme", "keys", "compact", "thinking", "package",
+    "extensions", "image", "sync-models", "evals", "export-ts", "trust", "bug",
 }
 
 
@@ -112,17 +113,22 @@ class ResourceCatalog:
         self.skills = {}
         self.prompts = {}
         self.diagnostics = []
+        trusted = self.config.project_trusted
         # First discovered name wins: explicit project/user paths, then defaults.
-        skill_paths = self.configured_paths("skills")
-        prompt_paths = self.configured_paths("prompts")
+        skill_paths = self.configured_paths("skills", trusted)
+        prompt_paths = self.configured_paths("prompts", trusted)
         cwd = self.config.cwd.resolve()
         if self.config.settings.get("include_default_resources", True):
-            skill_paths.extend([cwd / ".pi" / "skills", self.config.agent_dir / "skills", self.home / ".agents" / "skills"])
-            for parent in (cwd, *cwd.parents):
-                skill_paths.append(parent / ".agents" / "skills")
-                if (parent / ".git").exists():
-                    break
-            prompt_paths.extend([cwd / ".pi" / "prompts", self.config.agent_dir / "prompts"])
+            if trusted:
+                skill_paths.extend([cwd / ".pi" / "skills"])
+                for parent in (cwd, *cwd.parents):
+                    skill_paths.append(parent / ".agents" / "skills")
+                    if (parent / ".git").exists():
+                        break
+                prompt_paths.extend([cwd / ".pi" / "prompts"])
+            skill_paths.extend([self.config.agent_dir / "skills", self.home / ".agents" / "skills"])
+            prompt_paths.extend([self.config.agent_dir / "prompts"])
+
         seen = set()
         for root in skill_paths:
             for path in self.discover(root, skills=True):
@@ -172,9 +178,9 @@ class ResourceCatalog:
                 except (OSError, ValueError, yaml.YAMLError) as exc:
                     self.diagnostics.append(f"{path}: {exc}")
 
-    def configured_paths(self, kind: str) -> List[Path]:
+    def configured_paths(self, kind: str, trusted: bool = True) -> List[Path]:
         paths = []
-        for base in (self.config.cwd / ".pi", self.config.agent_dir):
+        for base in ((self.config.cwd / ".pi", self.config.agent_dir) if trusted else (self.config.agent_dir,)):
             for raw in read_json(base / "settings.json").get(kind, []):
                 path = Path(raw).expanduser()
                 paths.append(path if path.is_absolute() else base / path)

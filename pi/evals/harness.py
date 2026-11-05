@@ -7,14 +7,19 @@ Python CLI does, inside an isolated temporary root.
 
 The documentation variant machinery (with_docs / without_docs), the isolated
 process environment, the POSIX tool sandbox, transcript normalization, and
-usage accounting all follow the TypeScript implementation. The TypeScript
-Vite-specific transformed-module protection has no Python equivalent and is
-omitted; the container image keeps eval sources root-only instead.
+usage accounting all follow the TypeScript implementation. Input steps accept
+``{"type": "reload"}`` like the TypeScript harness: the Python agent has no
+extension runner to rebuild, so a reload re-reads the isolated agent
+directory's model configuration and hands the refreshed registry to the
+``output`` grading hook. The TypeScript Vite-specific transformed-module
+protection has no Python equivalent and is omitted; the container image keeps
+eval sources root-only instead.
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 import shutil
 import stat
@@ -308,23 +313,27 @@ async def _resolve_eval_model(workspace: str, agent_dir: str, host_agent_dir: st
     except ModelError as error:
         raise RuntimeError(
             f"Eval model has no configured authentication: {selection.provider}/{selection.id}") from error
-    return model, api_key, stored_credential
+    return registry, model, api_key, stored_credential
 
 
 def _create_agent(workspace: str, model: Any, options: PiCodingAgentHarnessOptions):
     """Assemble the agent exactly like the CLI does, with eval-selected tools."""
     base_tools = create_default_tools(workspace)
+    custom_tools = list(options.custom_tools or [])
     if options.no_tools:
         tools: List[AgentTool] = []
     elif options.tools is not None:
         known = {tool.name: tool for tool in base_tools}
+        for tool in custom_tools:
+            known.setdefault(tool.name, tool)
         missing = [name for name in options.tools if name not in known]
         if missing:
             raise ValueError(f"Unknown eval tools: {', '.join(missing)}")
         tools = [known[name] for name in options.tools]
+        custom_tools = []
     else:
         tools = base_tools
-    tools.extend(options.custom_tools or [])
+    tools.extend(custom_tools)
     snippets, guidelines = tool_prompt_contributions(tools)
     prompt_options = SystemPromptOptions(
         cwd=workspace,
@@ -373,7 +382,7 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
         os.makedirs(workspace, exist_ok=True)
         os.makedirs(agent_dir, exist_ok=True)
         seed_workspace(workspace, options.workspace_files)
-        model, api_key, stored_credential = await _resolve_eval_model(
+        registry, model, api_key, stored_credential = await _resolve_eval_model(
             workspace, agent_dir, host_agent_dir, selection)
         if sandbox_identity:
             try:
@@ -410,7 +419,18 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
             for step in steps:
                 kind = step.get("type")
                 if kind == "reload":
-                    raise ValueError("Reload steps are not supported by the Python eval harness.")
+                    # The TypeScript reload rebuilds extensions and settings; the
+                    # Python agent has neither, so a reload re-reads the agent
+                    # directory's model configuration (models.json/auth.json),
+                    # which is what provider/model evals observe afterwards. A
+                    # broken configuration does not fail the run: the registry
+                    # keeps its last good state and the output hook's own reload
+                    # reports the failure as a structured probe error.
+                    try:
+                        registry.reload()
+                    except (ModelError, ValueError):
+                        pass
+                    continue
                 if kind != "prompt":
                     raise ValueError(f"Unknown eval input step type: {kind!r}")
                 response = await prompt_agent(agent, step["content"], args.signal)
@@ -447,7 +467,9 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
         output = response
         if options.output is not None:
             output = options.output(response=response, session=agent,
-                                    system_prompt=system_prompt, agent_dir=agent_dir)
+                                    system_prompt=system_prompt, agent_dir=agent_dir, registry=registry)
+            if inspect.isawaitable(output):
+                output = await output
         result = {"output": output, **run_diagnostics}
     except BaseException as error:  # noqa: BLE001 - the run records failures
         run_error = error

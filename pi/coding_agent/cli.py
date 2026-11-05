@@ -8,16 +8,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import os
 import sys
 import json
 import getpass
 from contextlib import nullcontext, redirect_stdout
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 import httpx
 
-from ..ai.models import ModelError, resolve_model
-from ..ai.types import AssistantMessage, SystemMessage, TextContent, TextDeltaEvent, get_message_text
+from ..ai.models import ModelError, resolve_image_model, resolve_model
+from ..ai.providers import generate_images
+from ..ai.types import AssistantMessage, ImageContent, ImagesContext, SystemMessage, TextContent, TextDeltaEvent, get_message_text
 from ..agent.agent import Agent
 from ..agent.compaction import compact_agent, prefix_checkpoint, restore_compaction
 from ..agent.types import (
@@ -31,16 +33,26 @@ from ..agent.types import (
 )
 from .catalog_sync import fetch_catalog, save_cache
 from .codemode import create_codemode_tool
+from .crash_log import clear_crash_log, crash_log_path, read_crash_log, record_crash, take_unnotified_crash
+from .diagnostics import Diagnostic, deduplicate_diagnostics, report_diagnostics, settings_diagnostics
+from .bug_report import (BUG_REPORT_CUSTOM_ENTRY_TYPE, bug_report_archive_file_name,
+                         collect_bug_report_diagnostics, collect_bug_report_metadata,
+                         generate_bug_report_summary, upload_bug_report, write_bug_report_archive)
+from .file_processor import process_file_arguments
 from .markdown_render import render_markdown
+from .output_guard import raw_stdout, restore_stdout, take_over_stdout
 from .packages import PackageManager
+from .provider_attribution import apply_attribution, is_opencode_like
 from .session import SessionManager
 from .system_prompt import SystemPromptOptions, build_system_prompt
 from .tools import create_default_tools, tool_prompt_contributions
-from .config import Configuration
+from .trust import TrustStore, project_trust_parent_path, resolve_project_trusted, trust_options
+from .config import Configuration, read_json
 from .model_registry import ModelRegistry
 from .auth import login_device, login_openrouter
 from .subscription_auth import get_or_create_device_id, login_claude, login_codex, login_copilot, login_kimi_coding, login_openai_chatgpt, login_radius, login_xai
 from ..agent.compaction import CompactionSettings
+from . import timings
 from .resources import ResourceCatalog
 from .mcp import McpManager
 from .rpc import JsonWriter, RpcServer
@@ -50,6 +62,10 @@ from .tui import ExtensionAction, TerminalUI, THEMES, DEFAULT_KEYBINDINGS, load_
 from .usage import context_usage, format_usage, session_stats, usage_cost_breakdown
 
 BANNER = "pi-python — Python port of the pi coding agent core. Type /help for commands."
+
+# Crash-report context for main(): filled in as async_main creates the registry
+# and session, so an uncaught exception can be persisted with its location.
+CRASH_CONTEXT: dict = {}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-models", action="store_true", help="List model catalog and capabilities")
     parser.add_argument("--mode", choices=["text", "json", "rpc"], default="text")
     parser.add_argument("--tui", choices=["auto", "on", "off", "fullscreen"], default="auto")
+    parser.add_argument("--approve", "-a", dest="approve", action="store_true", default=None,
+                        help="Trust the project folder for this run")
+    parser.add_argument("--no-approve", "-na", dest="approve", action="store_false",
+                        help="Do not trust the project folder for this run")
     parser.add_argument("--sync-models", action="store_true", help="Refresh the cached online model catalog")
     parser.add_argument("--evals", metavar="FILE", help="Run eval cases from a JSON file and exit")
     return parser
@@ -113,14 +133,25 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
     model_id = args.model or os.environ.get("PI_PY_MODEL") or (settings.get("model") if provider == settings.get("provider", provider) else None)
     base_url = args.base_url or os.environ.get("PI_PY_BASE_URL") or os.environ.get(provider.upper() + "_BASE_URL")
     model = registry.resolve(provider, model_id, args.api_key, base_url)
-    tools = create_default_tools(cwd)
+    image_settings = settings.get("images", {})
+    # The read tool consults these lazily so /model switches and /settings
+    # changes take effect without recreating the tools.
+    current_agent: dict = {}
+    tools = create_default_tools(
+        cwd,
+        get_model=lambda: current_agent.get("agent"),
+        image_settings=lambda: registry.config.settings.get("images", {}),
+    )
     snippets, guidelines = tool_prompt_contributions(tools)
     options = SystemPromptOptions(cwd=cwd, selected_tools=[tool.name for tool in tools], tool_snippets=snippets, tool_guidelines=guidelines)
     system_prompt = build_system_prompt(options)
     agent = Agent(model=model, tools=tools, system_prompt=system_prompt,
                  thinking_level=args.thinking or os.environ.get("PI_PY_THINKING") or settings.get("thinking", "off"),
                  compaction=CompactionSettings(**settings.get("compaction", {})),
-                 cache_retention=settings.get("cache_retention", "5m"))
+                 cache_retention=settings.get("cache_retention", "5m") or None,
+                 block_images=bool(image_settings.get("block_images", False)))
+    apply_attribution(model, settings)
+    current_agent["agent"] = agent
     resources = resources or ResourceCatalog(registry.config)
     agent.messages[0].sections = {"skills": resources.system_prompt() or None}
     return agent
@@ -212,7 +243,8 @@ class CliRenderer:
 
 async def run_prompt(agent: Agent, text: str, renderer: CliRenderer, session: Optional[SessionManager],
                      resources: Optional[ResourceCatalog] = None, extensions: Optional[ExtensionManager] = None,
-                     mcp: Optional[McpManager] = None) -> None:
+                     mcp: Optional[McpManager] = None,
+                     images: Optional[List[ImageContent]] = None) -> None:
     """Run one prompt with abort handling and session persistence."""
 
     if mcp is not None and mcp.lazy_servers:
@@ -229,7 +261,7 @@ async def run_prompt(agent: Agent, text: str, renderer: CliRenderer, session: Op
         text = resources.expand(text)
     unsubscribe = agent.subscribe(_session_recorder(session))
     unsubscribe_render = agent.subscribe(renderer)
-    task = asyncio.ensure_future(agent.prompt(text))
+    task = asyncio.ensure_future(agent.prompt(text, images=images))
     try:
         await task
     except KeyboardInterrupt:
@@ -275,8 +307,11 @@ SLASH_HELP = """Commands:
   /skill:<name> [request]   load a skill explicitly
   /compact [instructions]  summarize older context now
   /usage         show cumulative token usage and cost
+  /image [model] <prompt>  generate an image via openrouter-images
   /sync-models   refresh the cached online model catalog
   /evals <file>  run eval cases against this agent
+  /trust         save a project trust decision for this folder
+  /bug [hint]    report a bug to the pi developers (upload or zip)
   /clear         start a fresh conversation
   /new           start a fresh session
   /resume [id]   list or switch saved sessions
@@ -294,9 +329,15 @@ Anything else is sent as a prompt. Ctrl+C aborts the current run."""
 async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optional[SessionManager], registry: Optional[ModelRegistry] = None,
                            resources: Optional[ResourceCatalog] = None, mcp: Optional[McpManager] = None,
                            extensions: Optional[ExtensionManager] = None, ui: Optional[TerminalUI] = None,
-                           packages: Optional[PackageManager] = None) -> None:
+                           packages: Optional[PackageManager] = None,
+                           initial: Optional[Tuple[str, List[ImageContent]]] = None) -> None:
     loop = asyncio.get_running_loop()
     print(BANNER)
+    if initial is not None and (initial[0] or initial[1]):
+        try:
+            await run_prompt(agent, initial[0], renderer, session, resources, extensions, mcp, images=initial[1])
+        except (OSError, RuntimeError, ModelError, ValueError, httpx.HTTPError) as exc:
+            print(f"error: {exc}")
     while True:
         try:
             value = await ui.read() if ui else await loop.run_in_executor(None, lambda: input("\n> ").strip())
@@ -441,6 +482,12 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                 totals = usage_cost_breakdown(agent.messages, registry)
                 print(format_usage(totals, context_usage(agent.messages, agent.model)))
                 continue
+            if command == "/image":
+                try:
+                    await image_command(rest, registry)
+                except (ModelError, OSError, ValueError, httpx.HTTPError) as exc:
+                    print(f"error: {exc}")
+                continue
             if command == "/sync-models":
                 if registry is None:
                     print("error: model registry unavailable")
@@ -484,6 +531,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         key, _, value = rest.strip().partition(" ")
                         if key:
                             registry.config.save(key, json.loads(value))
+                            if key == "images":
+                                sync_block_images(agent, registry)
                         print(json.dumps(registry.config.settings, ensure_ascii=False, indent=2))
                     else:
                         registry.config.reload()
@@ -491,6 +540,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         agent.model = registry.resolve(agent.model.provider, agent.model.id)
                         agent.thinking_level = registry.config.settings.get("thinking", agent.thinking_level)
                         agent.compactor.settings = CompactionSettings(**registry.config.settings.get("compaction", {}))
+                        sync_block_images(agent, registry)
                         if resources:
                             resources.reload()
                             for diagnostic in resources.diagnostics:
@@ -541,6 +591,24 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     print(f"error: {exc}")
                 continue
+            if command == "/trust":
+                if registry is None:
+                    print("error: model registry unavailable")
+                else:
+                    try:
+                        await trust_command(registry, ui)
+                    except (OSError, ValueError) as exc:
+                        print(f"error: {exc}")
+                continue
+            if command == "/bug":
+                if registry is None:
+                    print("error: model registry unavailable")
+                    continue
+                try:
+                    await bug_report_command(rest, agent, session, registry, extensions, ui)
+                except (OSError, ValueError, RuntimeError, ModelError, asyncio.TimeoutError, httpx.HTTPError) as exc:
+                    print(f"error: {exc}")
+                continue
             if not (extensions and command[1:] in extensions.commands) and (not resources or (not command.startswith("/skill:") and command[1:] not in resources.prompts)):
                 print(f"unknown command: {command}")
                 continue
@@ -552,6 +620,51 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                 await prompt
         except (OSError, RuntimeError, ModelError, ValueError, httpx.HTTPError) as exc:
             print(f"error: {exc}")
+
+
+IMAGE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+
+async def image_command(argument: str, registry: Optional[ModelRegistry]) -> None:
+    """Handle /image [model] <prompt>: generate an image via openrouter-images."""
+    parts = argument.strip()
+    if not parts:
+        raise ValueError("Usage: /image [model] <prompt>")
+    model_id: Optional[str] = None
+    first, separator, remainder = parts.partition(" ")
+    if separator and "/" in first:
+        model_id, parts = first, remainder
+    api_key = None
+    if registry is not None:
+        api_key = await registry.auth.key("openrouter", None)
+    model = resolve_image_model("openrouter", model_id, api_key=api_key)
+    result = await generate_images(model, ImagesContext(input=[TextContent(text=parts)]))
+    if result.stop_reason != "stop" and result.error_message:
+        raise ValueError(result.error_message)
+    if result.usage is not None:
+        cost = result.usage.cost.get("total", 0.0) if isinstance(result.usage.cost, dict) else 0.0
+        print(f"[{result.usage.total_tokens} tokens, ${cost:.4f}]")
+    saved = 0
+    for block in result.output:
+        if isinstance(block, TextContent):
+            print(block.text)
+        elif isinstance(block, ImageContent):
+            saved += 1
+            extension = IMAGE_EXTENSIONS.get(block.mime_type, ".png")
+            path = os.path.join(os.getcwd(), f"image-{saved}{extension}")
+            with open(path, "wb") as handle:
+                handle.write(base64.b64decode(block.data))
+            print(f"saved: {path}")
+
+
+def sync_block_images(agent: Agent, registry: ModelRegistry) -> None:
+    """Apply the images.block_images setting to a running agent."""
+    agent.block_images = bool(registry.config.settings.get("images", {}).get("block_images", False))
 
 
 async def package_command(argument: str, config: Configuration, resources: Optional[ResourceCatalog]) -> None:
@@ -661,6 +774,116 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
     print(f"credentials saved for {provider}")
 
 
+async def _choose_console(title: str, values):
+    """Numbered input() selector for flows that run before the TUI exists."""
+    print(title)
+    for index, (label, _value) in enumerate(values, 1):
+        print(f"  {index}. {label}")
+    raw = await asyncio.get_running_loop().run_in_executor(
+        None, input, f"Choose [1-{len(values)}]: ")
+    try:
+        index = int(raw.strip())
+    except ValueError:
+        return None
+    return values[index - 1][1] if 1 <= index <= len(values) else None
+
+
+async def trust_command(registry: ModelRegistry, ui) -> None:
+    """Save a project trust decision for the current folder."""
+    store = TrustStore(registry.config.agent_dir)
+    cwd_path = str(registry.config.cwd)
+    options = trust_options(cwd_path)
+    chooser = ui.choose if ui else _choose_console
+    selected = await chooser(
+        "Trust project folder?\n" + cwd_path
+        + "\n\nThis allows pi to load .pi settings and resources, and execute project extensions.",
+        [(option["label"], option) for option in options])
+    if selected is None:
+        print("trust: no change")
+        return
+    if selected["updates"]:
+        store.set_many(selected["updates"])
+        print(f"project trust: {'trusted' if selected['trusted'] else 'not trusted'} (saved)")
+    else:
+        print(f"project trust: {'trusted' if selected['trusted'] else 'not trusted'} (this session only)")
+
+
+async def bug_report_command(argument: str, agent: Agent, session: Optional[SessionManager],
+                             registry: ModelRegistry, extensions, ui) -> None:
+    """Run the /bug flow: hint, transcript/summary choice, upload or zip export."""
+    chooser = ui.choose if ui else _choose_console
+    hint = argument.strip()
+    if not hint:
+        hint = await asyncio.get_running_loop().run_in_executor(
+            None, input, "What went wrong? (optional, Enter to skip): ")
+    include_session = False
+    if session is not None:
+        include_session = await chooser("Include the session transcript?", [
+            ("Yes, include the transcript", True), ("No", False)]) is True
+    include_summary = False
+    if not include_session:
+        include_summary = await chooser(
+            f"Attach a summary written by {agent.model.name or 'the current model'} instead?", [
+                ("Yes, generate a summary", True), ("No", False)]) is True
+    delivery = await chooser("Bug report", [
+        ("Upload report", "upload"), ("Export as zip", "zip"), ("Cancel", "cancel")])
+    if delivery in (None, "cancel"):
+        print("bug report cancelled")
+        return
+    if delivery == "upload" and os.environ.get("PI_OFFLINE"):
+        raise ValueError("Uploading bug reports requires online mode. Use Export as Zip instead.")
+    if include_summary:
+        print(f"writing summary with {agent.model.name or agent.model.id}...")
+        summary = await generate_bug_report_summary(agent.messages, agent.model, hint, agent.thinking_level)
+    else:
+        summary = None
+    try:
+        project_settings = read_json(registry.config.cwd / ".pi" / "settings.json")
+    except ValueError:
+        project_settings = {}
+    metadata = collect_bug_report_metadata(
+        hint=hint, session_id=os.path.basename(session.session_file) if session else "no-session",
+        cwd=str(registry.config.cwd), include_session=include_session,
+        include_summary=summary is not None, message_count=len(agent.messages),
+        model=agent.model, thinking_level=agent.thinking_level,
+        extensions=[str(api.path) for api in extensions.extensions] if extensions else [],
+        extension_errors=[], global_settings=registry.config.settings,
+        project_settings=project_settings)
+    crashes = read_crash_log(crash_log_path(registry.config.agent_dir))
+    bundle = {
+        "metadata": metadata,
+        "diagnostics": collect_bug_report_diagnostics(session, crashes),
+        "sessionJsonl": session.branch_jsonl() if include_session else None,
+        "summary": summary,
+    }
+    if delivery == "upload":
+        try:
+            token = await registry.auth.key("radius", None)
+        except (ValueError, OSError, httpx.HTTPError):
+            token = None
+        try:
+            report_id = await upload_bug_report(bundle, token=token)
+            print(f"bug report uploaded. report id: {report_id}")
+        except (OSError, ValueError, httpx.HTTPError) as exc:
+            fallback = await chooser(f"Upload failed: {exc}\n\nExport the report as a zip archive instead?", [
+                ("Export as zip", "zip"), ("Cancel", "cancel")])
+            if fallback != "zip":
+                print("bug report cancelled")
+                return
+            delivery = "zip"
+    if delivery == "zip":
+        path = os.path.join(os.getcwd(), bug_report_archive_file_name(metadata["id"]))
+        write_bug_report_archive(bundle, path)
+        print(f"bug report exported to: {path}\nreport id: {metadata['id']}")
+    if session is not None:
+        session.append_custom(BUG_REPORT_CUSTOM_ENTRY_TYPE, {
+            "id": metadata["id"], "createdAt": metadata["createdAt"], "hint": metadata["hint"],
+            "sessionIncluded": include_session, "summaryIncluded": summary is not None,
+            "delivery": delivery})
+    if crashes:
+        clear_crash_log(crash_log_path(registry.config.agent_dir))
+
+
 def handle_session_command(command: str, argument: str, agent: Agent,
                            session: Optional[SessionManager]) -> None:
     if session is None:
@@ -745,6 +968,20 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         print("error: --no-session cannot be combined with session options", file=sys.stderr)
         return 2
     cwd = os.getcwd()
+    file_args = [arg[1:] for arg in args.prompt if arg.startswith("@")]
+    message_args = [arg for arg in args.prompt if not arg.startswith("@")]
+    prompt_text = " ".join(message_args)
+    prompt_images: Optional[List[ImageContent]] = None
+    if file_args:
+        try:
+            processed = await process_file_arguments(file_args, cwd=cwd, auto_resize_images=False)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        # AgentSession-equivalent resize runs per model after hooks; the CLI
+        # attachment pass only normalizes formats.
+        prompt_text = processed.text + prompt_text
+        prompt_images = processed.images or None
     if args.mode == "rpc" and args.prompt or args.mode == "json" and not args.prompt:
         print("error: rpc accepts prompts through stdin; json requires a prompt argument", file=sys.stderr)
         return 2
@@ -752,8 +989,15 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         print("error: authentication, model-list, sync and eval commands require text mode", file=sys.stderr)
         return 2
 
+    timings.reset_timings()
+    # Protocol modes protect their stdout stream from stray print() output.
+    if args.mode in ("json", "rpc"):
+        take_over_stdout()
+    has_ui = args.mode == "text" and not message_args and sys.stdin.isatty()
+
     try:
         registry = ModelRegistry(Configuration(cwd, args.agent_dir or ""))
+        CRASH_CONTEXT.update({"cwd": cwd, "agent_dir": str(registry.config.agent_dir)})
         if args.sync_models:
             providers = await fetch_catalog()
             save_cache(registry.config.agent_dir, providers)
@@ -772,10 +1016,28 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             return 0
         if args.oauth:
             raise ModelError("--oauth requires --login")
+        timings.time("registry")
+        # The trust default must come from user settings only: an untrusted
+        # project must not be able to set default_project_trust=always.
+        global_settings = read_json(registry.config.agent_dir / "settings.json")
+        trusted = await resolve_project_trusted(
+            cwd, TrustStore(registry.config.agent_dir), _choose_console if has_ui else None,
+            settings=global_settings, override=args.approve, has_ui=has_ui,
+            notify=None if has_ui else (lambda message: print(f"warning: {message}", file=sys.stderr)))
+        registry.config.project_trusted = trusted
+        # Re-merge settings so untrusted project settings are not applied.
+        registry.config.reload()
+        registry.reload()
         resources = ResourceCatalog(registry.config)
-        for diagnostic in resources.diagnostics:
-            print(f"warning: {diagnostic}", file=sys.stderr)
+        report_diagnostics(deduplicate_diagnostics([*settings_diagnostics(registry.config.errors),
+            *[Diagnostic("warning", message) for message in resources.diagnostics]]))
         agent = make_agent(args, cwd, registry, resources)
+        timings.time("agent")
+        if has_ui:
+            crash = take_unnotified_crash(crash_log_path(registry.config.agent_dir))
+            if crash:
+                print(f"warning: the previous run crashed: {crash['message']} (run /bug to report it)",
+                      file=sys.stderr)
     except ModelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -811,6 +1073,10 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             session.append_compaction(summary, checkpoint=prefix_checkpoint(agent.compactor.prefix))
 
         agent.compactor.on_summary = persist_summary
+        CRASH_CONTEXT["session_file"] = session.session_file
+        if is_opencode_like(agent.model):
+            apply_attribution(agent.model, registry.config.settings,
+                              session_id=os.path.basename(session.session_file or ""))
 
     renderer = CliRenderer(settings=registry.config.settings)
 
@@ -831,28 +1097,31 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         if registry.config.settings.get("codemode", {}).get("enabled"):
             agent.tools.append(create_codemode_tool(
                 agent.tools, session, registry.config.settings.get("codemode", {})))
+        timings.time("extensions")
         for name, error in mcp.errors.items():
             print(f"MCP {name}: {error}", file=sys.stderr)
         if args.evals:
             passed = await run_evals_file(agent, renderer, session, args.evals, mcp)
+            timings.print_timings()
             return 0 if passed else 1
+        timings.print_timings()
         if args.mode == "rpc":
-            server = RpcServer(agent, JsonWriter(), session, registry, resources, extensions)
+            server = RpcServer(agent, JsonWriter(output=raw_stdout()), session, registry, resources, extensions)
             extensions.set_ui_sink(server.ui_sink)
             await server.serve()
             return 0
         if args.mode == "json":
-            writer = JsonWriter()
+            writer = JsonWriter(output=raw_stdout())
             try:
-                await run_prompt(agent, " ".join(args.prompt), writer, session, resources, extensions, mcp)
+                await run_prompt(agent, prompt_text, writer, session, resources, extensions, mcp, images=prompt_images)
             except Exception as exc:
                 await writer.write({"type": "run_error", "error": str(exc)})
                 return 1
             finally:
                 await writer.write({"type": "agent_settled"})
             return 0
-        if args.prompt:
-            await run_prompt(agent, " ".join(args.prompt), renderer, session, resources, extensions, mcp)
+        if message_args:
+            await run_prompt(agent, prompt_text, renderer, session, resources, extensions, mcp, images=prompt_images)
             return 0
         ui = None
         if args.tui in ("on", "fullscreen") or args.tui == "auto" and sys.stdin.isatty() and sys.stdout.isatty():
@@ -871,7 +1140,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             extensions.set_ui_sink(ui.ui_request)
         with redirect_stdout(ui) if ui and ui.full_screen else nullcontext():
             await interactive_loop(agent, renderer, session, registry, resources, mcp, extensions, ui,
-                                   PackageManager(registry.config))
+                                   PackageManager(registry.config), initial=(prompt_text, prompt_images or []))
         return 0
     finally:
         await extensions.close()
@@ -887,6 +1156,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (OSError, ValueError, ModelError, asyncio.TimeoutError, httpx.HTTPError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 - persist the crash, then surface it
+        record_crash("uncaught_exception", exc,
+                     cwd=CRASH_CONTEXT.get("cwd", os.getcwd()),
+                     session_file=CRASH_CONTEXT.get("session_file"),
+                     agent_dir=CRASH_CONTEXT.get("agent_dir"))
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        restore_stdout()
 
 
 if __name__ == "__main__":

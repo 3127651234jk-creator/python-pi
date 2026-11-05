@@ -20,7 +20,8 @@ pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不�
 | `pi.evals.report` | `packages/evals/src/report.ts` | 观察读取、成对配对、lift/标记/运营总量与文本报告 |
 | `pi.evals.docker` | `packages/evals/src/docker.ts` | 变体镜像构建、auth.json 校验、容器发现与单任务运行 |
 | `pi.evals.cli` | `packages/evals/src/cli.ts` | 评测编排 CLI：参数解析、发现对齐、协议落盘、报告产出 |
-| `pi.evals.framework` | `vitest-evals`（npm 依赖） | 本地替代：Harness 适配器、运行规范化、结构化输出裁判、用例发现与运行器 |
+| `pi.evals.framework` | `vitest-evals`（npm 依赖） | 本地替代：Harness 适配器、运行规范化、结构化输出裁判、用例发现与运行器、`tool_calls` 提取 |
+| `pi.evals.host` | `packages/evals/vitest.evals.config.ts`（host project） | host 评测运行器：发现非 docs 套件、顺序执行、聚合 Vitest JSON 报告 |
 
 ## 安装
 
@@ -69,6 +70,8 @@ CLI 还内置 `openrouter`，并可从 `models.json` 注册其他兼容 provider
 /clone        将当前活动分支复制为独立会话
 /export <path.jsonl|path.html|path.md>  导出当前活动分支
 /usage        说明
+/trust        保存当前目录的项目信任决策
+/bug [hint]   上传或导出 bug 报告（环境元数据 + 失败诊断，脱敏）
 /help /exit
 Ctrl+C        中止当前运行
 ```
@@ -302,9 +305,11 @@ Review the changes. Focus on ${1:-correctness and tests}.
 
 | 文件 | 内容 |
 | --- | --- |
-| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention |
+| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention、default_project_trust、enable_install_telemetry |
 | `models.json` | 自定义 provider、模型元数据与覆盖 |
 | `auth.json` | API key、OAuth access/refresh token 和过期时间 |
+| `trust.json` | 项目信任决策（`{规范化路径: true/false}`，沿父目录就近生效） |
+| `crashes.json` | 最近 5 条未捕获异常记录（7 天有效） |
 
 项目 `.pi/settings.json` 覆盖用户设置，对象字段递归合并。模型选择、thinking 和端点的优先级为命令行 > `PI_PY_*` 环境变量 > 项目设置 > 用户设置 > 内置默认值。端点从 `models.json` 加载，也支持 provider 的 `*_BASE_URL` 环境变量；设置文件中不存 API key。
 
@@ -405,7 +410,9 @@ provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 head
 
 ## 评测系统（documentation-lift evals）
 
-`packages/evals` 的 Python 移植版位于 `pi/evals/`（运行器代码）与两个仓库目录：`evals/`（评测套件，`*.docs.eval.py`）和 `docker/`（`Dockerfile` + `entrypoint.py`，容器侧）。TS 版依赖 Vitest 与 `vitest-evals`；Python 版用 `pi.evals.framework` 本地实现同等的最小契约（Harness 适配器、运行规范化、结构化输出裁判、`describe_eval` 注册、单用例运行器），报告仍写 Vitest JSON 结构（`testResults[].assertionResults[].meta`），因此 `report.ts` 的读取与配对逻辑按原样移植。
+`packages/evals` 的 Python 移植版位于 `pi/evals/`（运行器代码）与两个仓库目录：`evals/`（评测套件与夹具）和 `docker/`（`Dockerfile` + `entrypoint.py`，容器侧）。TS 版依赖 Vitest 与 `vitest-evals`；Python 版用 `pi.evals.framework` 本地实现同等的最小契约（Harness 适配器、运行规范化、结构化输出裁判、`describe_eval` 注册、用例运行器），报告仍写 Vitest JSON 结构（`testResults[].assertionResults[].meta`），因此 `report.ts` 的读取与配对逻辑按原样移植。
+
+评测套件与 TS 版对应：`evals/smoke.eval.py` 与 `evals/documentation_audit.eval.py` 是 host 评测（非 docs 套件），`evals/examples.docs.eval.py` 是文档对比用例；`evals/acme_server.py`（进程内假 provider 服务器，openai/stream 两种协议形态与探针标志）与 `evals/configured_runtime.py`（重载后用隔离 agent 目录的模型配置发起真实补全的探针，错误为结构化输出）是 provider/model 类评测的共享夹具，单元测试与未来 provider docs 套件共用。`describe_eval` 支持 `title` 参数，供一文件多用例的参数化套件（对应 TS 的 `it.for`）使用。
 
 运行一次文档对比：
 
@@ -417,11 +424,23 @@ python -m pi.evals.cli --provider openai --model gpt-4o-mini
 
 流程与 TS 版一致：构建 `without_docs` / `with_docs` 两个镜像 → 在两个容器内发现用例并要求完全一致 → 按 (case, variant, run) 计划任务（奇数轮先 without、偶数轮先 with，降低顺序偏差）→ 每个任务独立容器运行 → 写入 `protocol.json`、`expected-runs.json`、`observations.jsonl` → 读取观察、成对配对、产出 `report.json` / `report.txt`。成对 lift 只在两臂都恰好产生一个分数时计入；缺失、重复、跳过、未计分或出错都会阻塞该对，任一对被阻塞时隐藏标题通过率并退出码 1。结果目录为忽略的 `.eval/<时间戳>_<id>/`，其中 `evals/<variant>/sessions/<sha256>/session.jsonl` 保存原生会话快照。
 
-评测 harness（`create_pi_coding_agent_harness`）在临时根目录内组装与 CLI 相同的 Agent：隔离 HOME 与 agent 目录、注入宿主 `auth.json` 凭据、按名单选工具（文档评测固定为 `read/write/edit/grep/find/ls`，不暴露 shell 与联网搜索）、录制 JSONL 会话、统计 token/工具调用/成本，并在 POSIX 上按 `PI_EVAL_SANDBOX_UID/GID` 永久降权后再提示模型。评测失败时把部分运行数据（事件、用量、错误）附在异常上，报告据此保留部分指标。
+host 评测（非 `*.docs.eval` 的普通套件）在宿主机直接运行，对应 TS 的 `npm run eval:host`：
+
+```bash
+set PI_PROVIDER=openai
+set PI_MODEL=gpt-4o-mini
+python -m pi.evals.host                              # 发现并运行全部 host 套件
+python -m pi.evals.host evals/smoke.eval.py          # 指定套件
+python -m pi.evals.host -t "matches the implementation" --report out/vitest.json
+```
+
+运行器顺序执行每个用例（对应 TS 的 `maxWorkers: 1`），聚合输出 Vitest JSON 报告（`--report` 落盘），任一用例失败退出码 1。host 套件不做结构化裁判打分，直接用断言判分（与 TS 相同）。
+
+评测 harness（`create_pi_coding_agent_harness`）在临时根目录内组装与 CLI 相同的 Agent：隔离 HOME 与 agent 目录、注入宿主 `auth.json` 凭据、按名单选工具（文档评测固定为 `read/write/edit/grep/find/ls`，不暴露 shell 与联网搜索）、录制 JSONL 会话、统计 token/工具调用/成本，并在 POSIX 上按 `PI_EVAL_SANDBOX_UID/GID` 永久降权后再提示模型。输入步骤支持 `{"type": "reload"}`：Python Agent 没有可重建的扩展运行器，reload 重新读取隔离 agent 目录的模型配置（models.json/auth.json），刷新后的 registry 传给 `output` 判分钩子（异步钩子会被等待）；配置损坏不使运行失败，registry 保留上次成功状态，由探针以结构化错误上报。评测失败时把部分运行数据（事件、用量、错误）附在异常上，报告据此保留部分指标。
 
 系统提示词现在包含 `<docs>` 一节（PI 文档路由：README/docs/examples 路径与阅读指引），`SystemPromptOptions.include_pi_documentation` 控制其出现：默认自动探测包内文档是否存在；评测 harness 强制包含并在 `without_docs` 变体中剥离该节（`exclude_pi_documentation`），配合镜像内删除文档文件构成对照实验。`<cwd>` 一节同步改为 `<cwd>\n路径\n</cwd>` 的分节格式。
 
-与 TS 版的差异（有意省略）：容器内不再运行 Vitest，而是 `docker/entrypoint.py` 直接发现/运行用例并写 Vitest JSON；`reload` 输入步骤不受支持（Python 会话无扩展重载）；TS 的 Vite transformed-module 保护无对应物，改由镜像内 `chmod go-rwx` 保证评测源码仅 root 可读；宿主侧 host evals（非 `*.docs.eval` 的普通套件）与 acme/configured-runtime 夹具未移植；npm tarball 打包换为容器内 `pip install /repo/pi-python`，并把 README 复制到 site-packages 作为 `with_docs` 的文档。凭据来源探测在降权时按环境变量名近似（`PROVIDER_API_KEY` / `PI_PY_API_KEY`），TS 版使用 ModelRuntime 的精确 source。
+与 TS 版的差异（有意省略）：容器内不再运行 Vitest，而是 `docker/entrypoint.py` 直接发现/运行用例并写 Vitest JSON；host 评测运行器（`pi.evals.host`）取代 Vitest host project，报告结构一致但不经 Vitest；TS 的 Vite transformed-module 保护无对应物，改由镜像内 `chmod go-rwx` 保证评测源码仅 root 可读；`reload` 只重读模型配置（Python 会话无扩展重载）；acme/configured-runtime 夹具的 models.json 与探针沿用 Python 的 snake_case 键（`context_window`/`max_tokens`/`costs`），`configured_runtime` 对模型快照与 judge 期望保持 TS 的 camelCase 形状，models.json 解析失败的消息为 Python 的 `Cannot read configuration`（TS 为 `Failed to parse models.json`）；npm tarball 打包换为容器内 `pip install /repo/pi-python`，并把 README 复制到 site-packages 作为 `with_docs` 的文档。凭据来源探测在降权时按环境变量名近似（`PROVIDER_API_KEY` / `PI_PY_API_KEY`），TS 版使用 ModelRuntime 的精确 source。
 
 ## 作为库使用
 
@@ -452,6 +471,33 @@ async def main():
 asyncio.run(main())
 ```
 
+## 持久化运行时（pi.durable）
+
+`pi/durable/` 是 `packages/durable` 核心的 Python 移植：会话/任务/文档先提交后可见（`pi.durable.session`、`pi.durable.harness`、`pi.durable.storage`）。此外还移植了三块：
+
+| Python 模块 | TS 源 | 内容 |
+| --- | --- | --- |
+| `pi.durable.env` | `packages/durable/src/env` | 可移植执行环境契约（`ExecutionEnv`：文件系统 + shell + watch，`Result` 化错误）与本地实现 `LocalExecutionEnv`（asyncio + os，Windows 打开文件带 FILE_SHARE_DELETE，支持打开期间改名）；流式 UTF-8 解码（BOM/非法序列与一次性解码一致）、有界内存行扫描 `LineScanner`、轮询 `PollingFileWatcher`（TS 为原生 watcher + 轮询回退，Python 仅轮询，`mode="polling"`） |
+| `pi.durable.tools` | `packages/durable/src/tools` | 持久化编码工具 `read`/`write`/`edit`/`bash`：跑在 `ExecutionEnv` 上而非宿主进程；read 截断走诊断（内容只有文件文本）、edit 精确唯一匹配（模糊归一 + 未改动行保留 + BOM/CRLF 保留）、bash 流式输出 + 尾窗口（跳过计数精确）+ 溢出落盘 + 超时/中止进程树终结；同文件 `edit`/`write` 经变更队列串行化 |
+| `pi.durable.testing` | `packages/durable/src/testing` | 一致性套件：`create_storage_conformance`（23 个用例 × 任意后端）、`create_env_conformance`（21 个用例 × 任意 ExecutionEnv）、`createExpectAssertions` 对应的 `ConformanceAssertions`、存储基准（`seed_storage_benchmark`/`measure_*_benchmarks`）与 pytest 适配（`runner.py`）；套件与测试运行器无关，`tests/test_durable_*_conformance.py` 驱动 |
+
+移植偏差：文档内容按完整版本存储（base 或 delta）；delta 操作批次（chord `r/s/d/a/t/p/m`，见 `pi.durable.delta`）在物化时重放到基准上，与 TS 语义一致。读取一律返回脱离存储的副本（调用方改动不影响存储），ID 分配在 2^53-1 耗尽时报错。
+
+```python
+from pi.durable.env import LocalExecutionEnv, Context
+from pi.durable.tools import create_read_tool
+
+env = LocalExecutionEnv(cwd=".")
+
+class Api:  # 最小 ToolExecutionApi
+    env = env
+    output_window = None
+    def output(self, chunk, skipped=None): print(chunk, end="")
+    def diagnostic(self, diagnostic): print(diagnostic.message, file=__import__("sys").stderr)
+
+result = __import__("asyncio").run(create_read_tool().execute({"path": "README.md", "limit": 5}, Api(), Context()))
+```
+
 ## 测试
 
 ```bash
@@ -460,6 +506,22 @@ python -m pytest tests -q
 ```
 
 测试全部离线：provider 层用 canned SSE 通过 `httpx` mock 传输验证事件映射；agent loop 用 `faux` 脚本驱动；工具层直接操作临时目录。
+
+## 项目信任、崩溃报告与诊断
+
+启动时若项目目录（或其祖先）存在 `.pi/` 下的 `settings.json`、`mcp.json`、`extensions`、`skills`、`prompts`、`themes`、`SYSTEM.md`、`APPEND_SYSTEM.md`，或存在 `.agents/skills`（用户主目录的 `~/.agents/skills` 除外），会先要求项目信任决策：
+
+- 决策保存在用户目录 `trust.json`（`{规范化路径: true/false}`），沿父目录就近生效；`null` 删除条目。`/trust` 打开决策选择器，`--approve` / `--no-approve`（`-a` / `-na`）为单次运行覆盖。
+- settings 的 `default_project_trust`（`ask`/`always`/`never`，默认 `ask`）控制默认行为；该值只读用户配置，项目配置无法用它跳过询问。
+- 未信任时跳过项目 `.pi` 下的设置、MCP、skills、prompts 与扩展，只保留用户目录资源；非交互模式（print/json/rpc）无法询问时同样按未信任处理并输出 warning。
+
+其他应用层行为：
+
+- 未捕获异常写入用户目录 `crashes.json`（最多 5 条、7 天有效）；下次交互启动提示一次。`/bug` 成功提交后清空。
+- `/bug [hint]` 生成 bug 报告：环境与模型元数据（`api_key`、`token`、`password`、`authorization` 等敏感键及 URL 凭据/查询参数自动脱敏）、会话中失败回合的诊断；可选附带会话 JSONL，或在不含 transcript 时由当前模型生成 Markdown 摘要。交付方式为上传到 Radius 网关（`/v1/bug-reports`，匿名或带已保存的 Radius 凭据）或导出 zip 到当前目录；成功后写入 `pi.bug-report` 会话条目。`PI_OFFLINE=1` 时仅可导出 zip。
+- JSON 与 RPC 模式接管 stdout：杂散 `print`（扩展、第三方库）转发到 stderr，协议输出始终写原始 stdout。
+- OpenRouter、NVIDIA NIM、Cloudflare、OpenCode 的客户端归属请求头自动合并进模型请求；开关为 settings 的 `enable_install_telemetry`（默认开启），环境变量 `PI_TELEMETRY` 优先。
+- `PI_TIMING=1` 在退出前于 stderr 打印启动耗时分组（解析、registry、agent、session、extensions）。
 
 ## 未移植（有意省略）
 
@@ -472,6 +534,7 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 库调用可通过 `Agent(..., compaction=CompactionSettings(...))` 配置；从 `pi.agent.compaction` 导入 `CompactionSettings`。默认 `reserve_tokens=16384`、`keep_recent_tokens=20000`、`summary_tokens=2048`，可设置 `enabled=False` 关闭。未知模型应准确设置 `model.context_window`。Token 数使用 UTF-8 长度估算，并非模型的精确分词结果。
 
 - TS TUI 的全屏对话布局、富文本/图片渲染与工具输出折叠；Python 已有多行编辑、补全、选择器、主题及快捷键
-- codemode、协议/服务器等包；扩展系统、MCP、durable、telemetry 已有部分 Python 实现
+- codemode、协议/服务器等包；扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）
+- prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）与嵌套工具调用的记录/用量聚合（TS nested-tool-calls）
 - 其他 provider 的专属认证；已实现 Claude、Codex、Copilot 订阅登录、OpenRouter PKCE 及可配置标准设备码 OAuth
 - 模型目录只内置少量常见型号，任意 id 会以默认参数运行

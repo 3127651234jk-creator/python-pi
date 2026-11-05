@@ -5,14 +5,18 @@ Python port of ``packages/coding-agent/src/core/tools/read.ts``.
 
 from __future__ import annotations
 
-import base64
-import asyncio
 import os
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 from ...ai.types import ImageContent, TextContent
 from ...agent.types import AgentTool, AgentToolResult
-from .common import detect_image_mime_type, resolve_to_cwd
+from ..images import (
+    ProcessImageOptions,
+    detect_supported_image_mime_type_from_file,
+    process_image,
+    resize_options_from_profile,
+)
+from .common import resolve_to_cwd
 from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationResult, format_size, truncate_head
 
 READ_SCHEMA = {
@@ -36,7 +40,31 @@ READ_PROMPT_SNIPPET = "Read file contents"
 READ_PROMPT_GUIDELINES = ["Use read to examine files instead of cat or sed."]
 
 
-def create_read_tool(cwd: str) -> AgentTool:
+def _get_non_vision_image_note(model: Any) -> str:
+    if model is None or "image" in (getattr(model, "input", None) or []):
+        return ""
+    return "[Current model does not support images. The image will be omitted from this request.]"
+
+
+def _model_resize_options(model: Any):
+    """Per-model resize profile from ``input_limits.images.resize``, if declared."""
+    limits = getattr(model, "input_limits", None) if model is not None else None
+    profile = limits.images.resize if limits is not None and limits.images is not None else None
+    return resize_options_from_profile(profile) if profile is not None else None
+
+
+def create_read_tool(
+    cwd: str,
+    get_model: Optional[Callable[[], Any]] = None,
+    image_settings: Optional[Callable[[], dict]] = None,
+) -> AgentTool:
+    """Create the read tool.
+
+    ``get_model`` supplies the current model for per-model resize profiles and
+    non-vision-model notes; ``image_settings`` supplies the live ``images``
+    settings (``auto_resize``) so mid-session changes take effect.
+    """
+
     async def execute(
         tool_call_id: str,
         params: Any,
@@ -51,16 +79,38 @@ def create_read_tool(cwd: str) -> AgentTool:
         if not os.path.isfile(absolute_path):
             raise FileNotFoundError(f"File not found: {path}")
 
-        mime_type = detect_image_mime_type(absolute_path)
+        mime_type = detect_supported_image_mime_type_from_file(absolute_path)
         content: List[Union[TextContent, ImageContent]]
 
         if mime_type:
             with open(absolute_path, "rb") as handle:
-                data = base64.b64encode(handle.read()).decode("ascii")
-            content = [
-                TextContent(text=f"Read image file [{mime_type}]"),
-                ImageContent(data=data, mime_type=mime_type),
-            ]
+                data = handle.read()
+            model = get_model() if get_model is not None else None
+            settings = image_settings() if image_settings is not None else {}
+            processed = await process_image(
+                data,
+                mime_type,
+                ProcessImageOptions(
+                    auto_resize_images=bool(settings.get("auto_resize", True)),
+                    resize_options=_model_resize_options(model),
+                ),
+            )
+            non_vision_note = _get_non_vision_image_note(model)
+            if not processed.ok:
+                text = f"Read image file [{mime_type}]\n{processed.message}"
+                if non_vision_note:
+                    text += f"\n{non_vision_note}"
+                content = [TextContent(text=text)]
+            else:
+                text = f"Read image file [{processed.mime_type}]"
+                if processed.hints:
+                    text += "\n" + "\n".join(processed.hints)
+                if non_vision_note:
+                    text += f"\n{non_vision_note}"
+                content = [
+                    TextContent(text=text),
+                    ImageContent(data=processed.data, mime_type=processed.mime_type),
+                ]
             return AgentToolResult(content=content)
 
         with open(absolute_path, "r", encoding="utf-8", errors="replace") as handle:

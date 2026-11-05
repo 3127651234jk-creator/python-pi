@@ -167,6 +167,43 @@ class Context:
     tools: Optional[List[Tool]] = None
 
 
+# ---------------------------------------------------------------------------
+# Image generation (port of ImagesContext / ImagesOptions / AssistantImages)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ImagesContext:
+    """Input for one image generation request."""
+
+    input: List[Union[TextContent, ImageContent]] = field(default_factory=list)
+
+
+@dataclass
+class ImagesOptions:
+    """Options for image generation calls."""
+
+    signal: Optional[Any] = None  # util.AbortSignal
+    api_key: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    timeout_ms: Optional[float] = None
+
+
+@dataclass
+class AssistantImages:
+    """Result of one image generation request (port of AssistantImages)."""
+
+    api: str
+    provider: str
+    model: str
+    output: List[Union[TextContent, ImageContent]] = field(default_factory=list)
+    stop_reason: str = "stop"
+    timestamp: int = 0
+    response_id: Optional[str] = None
+    usage: Optional[Usage] = None
+    error_message: Optional[str] = None
+
+
 @dataclass
 class TranscriptContext:
     """Normalized context: prompt and tools live in the leading system message."""

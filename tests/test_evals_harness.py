@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -185,3 +186,156 @@ def test_run_pi_coding_agent_preserves_partial_diagnostics_on_failure(monkeypatc
     assert partial["errors"]
     assert partial["session"]["events"]
     assert "totalMs" in partial["timings"]
+
+
+ACME_MODEL = {
+    "id": "acme-chat",
+    "name": "Acme Chat",
+    "provider": "acme",
+    "reasoning": False,
+    "input": ["text"],
+    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+    "contextWindow": 32768,
+    "maxTokens": 4096,
+}
+
+
+def test_reload_step_reloads_the_registry_for_the_output_hook(tmp_path, monkeypatch, direct_httpx):
+    """Prompt, reload, then probe the reloaded registry (openai-provider eval flow)."""
+    from evals.acme_server import (
+        OPENAI_MODEL_ID,
+        OPENAI_PROBE_PROMPT,
+        OPENAI_PROBE_RESPONSE,
+        OPENAI_PROVIDER_ID,
+        create_acme_server,
+    )
+    from evals.configured_runtime import ProviderScenario, inspect_provider
+    from pi.agent.types import AgentTool, AgentToolResult
+    from pi.ai.providers.base import SimpleStreamOptions
+    from pi.ai.providers.faux import reset_script_index
+    from pi.ai.types import TextContent, TranscriptContext, UserMessage
+    from pi.coding_agent.config import write_json
+
+    monkeypatch.setenv("ACME_API_KEY", "resolved-acme-key")
+    server = create_acme_server("openai")
+    server.start()
+    try:
+        def configure_acme_tool():
+            async def execute(tool_call_id, params, signal=None, on_update=None):
+                agent_dir = Path(os.environ["PI_PY_AGENT_DIR"])
+                write_json(agent_dir / "models.json", {"providers": {
+                    OPENAI_PROVIDER_ID: {
+                        "base_url": server.base_url(),
+                        "api": "openai-completions",
+                        "api_key": "$ACME_API_KEY",
+                        "models": [{
+                            "id": ACME_MODEL["id"],
+                            "name": ACME_MODEL["name"],
+                            "reasoning": ACME_MODEL["reasoning"],
+                            "input": ACME_MODEL["input"],
+                            "costs": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+                            "context_window": ACME_MODEL["contextWindow"],
+                            "max_tokens": ACME_MODEL["maxTokens"],
+                        }],
+                    },
+                }})
+                return AgentToolResult(content=[TextContent(text="Provider configured.")])
+
+            return AgentTool(
+                name="configure_acme",
+                label="Configure acme",
+                description="Write the acme provider into the agent models.json.",
+                parameters={"type": "object", "properties": {}},
+                execute=execute,
+            )
+
+        async def probe_output(**kwargs):
+            return await inspect_provider(kwargs["registry"], ProviderScenario(
+                provider_id=OPENAI_PROVIDER_ID,
+                model_id=OPENAI_MODEL_ID,
+                create_context=lambda: TranscriptContext(
+                    [UserMessage(content=OPENAI_PROBE_PROMPT, timestamp=0)]),
+                options=SimpleStreamOptions(max_tokens=32),
+                valid_request_received=server.valid_request_received,
+            ))
+
+        monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+            {"toolCalls": [{"name": "configure_acme", "arguments": {}}]},
+            {"text": "Provider configured."},
+        ]))
+        reset_script_index()
+        artifacts = {}
+        args = HarnessRunArgs(
+            input=[{"type": "prompt", "content": "Configure the acme provider."},
+                   {"type": "reload"}],
+            artifacts=artifacts,
+            set_artifact=lambda name, value: artifacts.__setitem__(name, value),
+        )
+        options = PiCodingAgentHarnessOptions(
+            name="reload-eval",
+            model=ModelSelection(provider="faux", id="faux"),
+            custom_tools=[configure_acme_tool()],
+            output=probe_output,
+        )
+        result = asyncio.run(run_pi_coding_agent(args, options))
+
+        assert result["output"] == {"result": {
+            "validRequestReceived": True,
+            "model": ACME_MODEL,
+            "response": {"text": OPENAI_PROBE_RESPONSE, "stopReason": "stop",
+                         "inputTokens": 3, "outputTokens": 2},
+        }}
+        assert server.valid_request_received() is True
+    finally:
+        server.stop()
+
+
+def test_reload_step_reports_a_broken_configuration_to_the_output_hook(monkeypatch, direct_httpx):
+    """A models.json the agent broke surfaces as a structured probe error."""
+    from evals.configured_runtime import ProviderScenario, inspect_provider
+    from pi.agent.types import AgentTool, AgentToolResult
+    from pi.ai.providers.faux import reset_script_index
+    from pi.ai.types import TextContent, TranscriptContext, UserMessage
+
+    def break_models_tool():
+        async def execute(tool_call_id, params, signal=None, on_update=None):
+            agent_dir = Path(os.environ["PI_PY_AGENT_DIR"])
+            (agent_dir / "models.json").write_text("{", encoding="utf-8")
+            return AgentToolResult(content=[TextContent(text="Configuration written.")])
+
+        return AgentTool(
+            name="break_models",
+            label="Break models",
+            description="Write an invalid models.json.",
+            parameters={"type": "object", "properties": {}},
+            execute=execute,
+        )
+
+    async def probe_output(**kwargs):
+        return await inspect_provider(kwargs["registry"], ProviderScenario(
+            provider_id="acme", model_id="acme-chat",
+            create_context=lambda: TranscriptContext([UserMessage(content="hi", timestamp=0)]),
+        ))
+
+    monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+        {"toolCalls": [{"name": "break_models", "arguments": {}}]},
+        {"text": "Configuration written."},
+    ]))
+    reset_script_index()
+    args = HarnessRunArgs(input=[{"type": "prompt", "content": "Write configuration."},
+                                 {"type": "reload"}])
+    options = PiCodingAgentHarnessOptions(
+        name="reload-eval",
+        model=ModelSelection(provider="faux", id="faux"),
+        custom_tools=[break_models_tool()],
+        output=probe_output,
+    )
+    result = asyncio.run(run_pi_coding_agent(args, options))
+    assert "Cannot read configuration" in result["output"]["result"]["error"]
+
+
+def test_unknown_input_step_types_are_rejected():
+    args = HarnessRunArgs(input=[{"type": "restart"}])
+    options = PiCodingAgentHarnessOptions(model=ModelSelection(provider="faux", id="faux"))
+    with pytest.raises(ValueError, match="Unknown eval input step type"):
+        asyncio.run(run_pi_coding_agent(args, options))

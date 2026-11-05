@@ -493,7 +493,10 @@ class McpManager:
         self.errors, self.tools = {}, []
         self._refresh_locks = {}
         servers = {}
-        for path in (self.config.agent_dir / "mcp.json", self.config.cwd / ".pi/mcp.json"):
+        paths = [self.config.agent_dir / "mcp.json"]
+        if self.config.project_trusted:
+            paths.append(self.config.cwd / ".pi/mcp.json")
+        for path in paths:
             entries = read_json(path).get("mcpServers", {})
             if not isinstance(entries, dict):
                 self.errors[str(path)] = "mcpServers must be an object"

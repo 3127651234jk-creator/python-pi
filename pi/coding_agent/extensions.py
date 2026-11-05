@@ -403,12 +403,17 @@ class ExtensionManager:
 
     def paths(self):
         paths = []
-        for base in (self.config.cwd / ".pi", self.config.agent_dir):
+        bases = (self.config.cwd / ".pi", self.config.agent_dir) if self.config.project_trusted \
+            else (self.config.agent_dir,)
+        for base in bases:
             for raw in read_json(base / "settings.json").get("extensions", []):
                 path = Path(raw).expanduser()
                 paths.append(path if path.is_absolute() else base / path)
         if self.config.settings.get("include_default_extensions", True):
-            for base in (self.config.cwd / ".pi/extensions", self.config.agent_dir / "extensions"):
+            default_bases = [self.config.agent_dir / "extensions"]
+            if self.config.project_trusted:
+                default_bases.insert(0, self.config.cwd / ".pi/extensions")
+            for base in default_bases:
                 if base.is_dir():
                     paths.extend(sorted(base.iterdir()))
         result = []

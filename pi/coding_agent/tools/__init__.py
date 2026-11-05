@@ -5,7 +5,7 @@ Python port of ``packages/coding-agent/src/core/tools``.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ...agent.types import AgentTool
 from .bash import BASH_PROMPT_SNIPPET, create_bash_tool
@@ -35,10 +35,18 @@ __all__ = [
 ]
 
 
-def create_default_tools(cwd: str) -> List[AgentTool]:
-    """Create built-in tools bound to ``cwd``."""
+def create_default_tools(
+    cwd: str,
+    get_model: Optional[Callable[[], Any]] = None,
+    image_settings: Optional[Callable[[], dict]] = None,
+) -> List[AgentTool]:
+    """Create built-in tools bound to ``cwd``.
+
+    ``get_model``/``image_settings`` are passed to the read tool for per-model
+    image resize profiles and live ``images`` settings.
+    """
     return [
-        create_read_tool(cwd),
+        create_read_tool(cwd, get_model=get_model, image_settings=image_settings),
         create_bash_tool(cwd),
         create_edit_tool(cwd),
         create_write_tool(cwd),

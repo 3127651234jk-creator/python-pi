@@ -9,21 +9,27 @@ once in ``BaseStorage`` (in-memory indexes) and derives:
 - ``JsonlStorage`` — append-only JSONL commit log, replayed on open
 - ``SqliteStorage`` — sqlite tables via the standard library
 
-Porting deviation: document content is stored as full base snapshots (no delta
-batches); every ``document.change`` writes a new base revision.
+Porting deviation: every ``document.change`` stores a full content revision
+(base or delta); deltas replay over their base at materialization time, like
+the TS storage does.
 """
 
 from __future__ import annotations
 
 import bisect
+import copy as _copy
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..delta import PathError, UnsafePathError, apply_ops
 from ..errors import StorageRejected
 from ..types import (
     DocumentRecord,
     Page,
     StoredDocument,
 )
+
+# The TS storage mints ids in the JS safe-integer range; exhaustion is contractual.
+MAX_SAFE_ID = 2**53 - 1
 
 
 def _scope_key(scope: Dict[str, Any]) -> str:
@@ -143,6 +149,7 @@ class BaseStorage:
 
     def apply_commit(self, writes: List[Dict[str, Any]], seq: int) -> int:
         """Validate and apply one commit; returns the sequence."""
+        self.reject_copy_source_conflicts(writes)
         writes = [self.resolve_document_copy(w) if w["type"] == "document.copy" else w for w in writes]
         self.check_global_ids(writes)
         document_actions = self.prepare_document_actions(writes)
@@ -150,6 +157,20 @@ class BaseStorage:
         self.apply_writes(writes, document_actions, seq)
         self.next_seq = seq + 1
         return seq
+
+    @staticmethod
+    def reject_copy_source_conflicts(writes: List[Dict[str, Any]]) -> None:
+        """A copy's source must not be created, changed, or retired in the same batch."""
+        changed: set = set()
+        for write in writes:
+            wtype = write["type"]
+            if wtype == "document.change" or wtype == "document.retire":
+                changed.add(write["id"])
+            elif wtype == "document.create":
+                changed.add(_record_field(write["record"], "id"))
+        for write in writes:
+            if write["type"] == "document.copy" and write["source"]["id"] in changed:
+                raise StorageRejected(f"Document copy {_record_field(write['record'], 'id')} was rejected")
 
     def check_global_ids(self, writes: List[Dict[str, Any]]) -> None:
         claimed: Dict[int, str] = {}
@@ -312,7 +333,14 @@ class BaseStorage:
                 stored = {
                     "record": record,
                     "revisions": [
-                        {"content": {"kind": "base", "version": content["version"], "value": content["value"]}, "seq": seq}
+                        {
+                            "content": {
+                                "kind": "base",
+                                "version": content["version"],
+                                "value": _copy.deepcopy(content["value"]),
+                            },
+                            "seq": seq,
+                        }
                     ],
                 }
                 self.record_types[rid] = "document"
@@ -327,7 +355,7 @@ class BaseStorage:
             else:
                 content = action.get("content")
                 if content is not None:
-                    revision = {"content": content, "seq": seq}
+                    revision = {"content": _copy.deepcopy(content), "seq": seq}
                     if content["kind"] == "base" and _is_current_only(stored["record"]):
                         stored["revisions"] = [revision]
                     else:
@@ -522,10 +550,18 @@ class BaseStorage:
         if base_index < 0:
             raise StorageRejected(f"Document {rid} is missing a required base")
         base = revisions[base_index]["content"]
+        value = _copy.deepcopy(base["value"])
+        for revision in revisions[base_index + 1 :]:
+            content = revision["content"]
+            if content["kind"] == "delta":
+                try:
+                    value = apply_ops(value, content["ops"])
+                except (PathError, UnsafePathError, TypeError) as exc:
+                    raise StorageRejected(f"Document {rid} has an inapplicable delta: {exc}") from exc
         return StoredDocument(
             record=stored["record"],
             version=base["version"],
-            value=base["value"],
+            value=value,
             deltas_since_base=len(revisions) - base_index - 1,
         )
 
