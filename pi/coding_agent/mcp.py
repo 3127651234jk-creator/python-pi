@@ -22,7 +22,7 @@ import signal as process_signal
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -469,6 +469,8 @@ class McpManager:
         self.lazy_servers = set()
         self.log_path = config.agent_dir / "mcp.log"
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
+        self.extension_servers: Dict[str, dict] = {}
+        self.extension_server_owners: Dict[str, str] = {}
 
     def _log_message(self, server: str, params: dict) -> None:
         """Append one ``notifications/message`` to mcp.log; continuation lines are indented."""
@@ -501,6 +503,8 @@ class McpManager:
                     self.errors[name] = "Server configuration must be an object"
                     continue
                 servers[name] = {**servers.get(name, {}), **value}
+        # File configuration has precedence over ephemeral extension registrations.
+        servers = {**self.extension_servers, **servers}
         normalized = set()
         for name, settings in servers.items():
             client = None
@@ -550,6 +554,41 @@ class McpManager:
                 self.clients.pop(name, None)
                 self.tools = [tool for tool in self.tools if not getattr(tool, "_mcp_server", None) == name]
         self._register_resource_tools()
+
+    async def register_extension_server(self, name: str, settings: dict, owner: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ValueError("Invalid MCP server name")
+        if not isinstance(settings, dict) or ("command" in settings) == ("url" in settings):
+            raise ValueError("MCP server must specify either command or url")
+        existing = self.extension_server_owners.get(name)
+        if existing is not None and existing != owner:
+            raise ValueError(f'MCP server "{name}" is already registered by extension "{existing}"')
+        namespace = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        for other in self.extension_servers:
+            if other != name and re.sub(r"[^A-Za-z0-9_]", "_", other) == namespace:
+                raise ValueError(f'MCP server "{name}" conflicts with registered server "{other}"')
+        self.extension_servers[name] = dict(settings)
+        self.extension_server_owners[name] = owner
+        await self.reload()
+        if self.on_tools_changed is not None:
+            await _maybe_call(self.on_tools_changed, name)
+
+    async def unregister_extension_server(self, name: str, owner: str) -> None:
+        existing = self.extension_server_owners.get(name)
+        if existing is None:
+            return
+        if existing != owner:
+            raise ValueError(f'MCP server "{name}" belongs to extension "{existing}"')
+        self.extension_server_owners.pop(name, None)
+        self.extension_servers.pop(name, None)
+        await self.reload()
+        if self.on_tools_changed is not None:
+            await _maybe_call(self.on_tools_changed, name)
+
+    def registered_extension_servers(self) -> List[dict]:
+        return [{"name": name, "config": dict(config),
+                 "extensionPath": self.extension_server_owners[name]}
+                for name, config in self.extension_servers.items()]
 
     async def _connect_client(self, client: McpClient, namespace: str) -> None:
         """Connect with OAuth credentials when configured; never auto-launches a browser."""

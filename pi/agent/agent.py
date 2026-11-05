@@ -55,6 +55,8 @@ class Agent:
         self.system_prompt = system_prompt
         self.before_tool_call = None
         self.after_tool_call = None
+        self.prepare_request = None
+        self._request_model = None
         if system_prompt:
             self.messages.append(SystemMessage(content=system_prompt, timestamp=_now_ms()))
 
@@ -147,9 +149,26 @@ class Agent:
         return new_messages
 
     def _build_config(self) -> AgentLoopConfig:
+        async def prepare_request(context, signal):
+            self._request_model = None
+            if self.prepare_request is None:
+                return None
+            update = self.prepare_request(context, signal)
+            if hasattr(update, "__await__"):
+                update = await update
+            if update is not None and update.model is not None:
+                self._request_model = update.model
+            return update
+
+        async def get_api_key(provider):
+            model = self._request_model if self._request_model is not None else self.model
+            if model.get_api_key is None:
+                return model.api_key
+            return await model.get_api_key(provider)
+
         return AgentLoopConfig(
             model=self.model,
-            get_api_key=self.model.get_api_key,
+            get_api_key=get_api_key,
             convert_to_llm=default_convert_to_llm,
             reasoning=None if self.thinking_level == "off" else self.thinking_level,
             get_steering_messages=self._get_steering_messages,
@@ -157,6 +176,7 @@ class Agent:
             tool_execution="parallel",
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
+            prepare_request=prepare_request,
             cache_retention=self.cache_retention,
         )
 

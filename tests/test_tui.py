@@ -85,3 +85,22 @@ def test_invalid_theme_and_bindings():
         validate_settings({"theme": "invalid"})
     with pytest.raises(ValueError):
         validate_settings({"keybindings": {"unknown": ["c-x"]}})
+
+
+def test_fullscreen_transcript_widgets_and_input():
+    async def check(pipe):
+        ui = TerminalUI(Agent(resolve_model("faux")), lambda: [], input=pipe,
+                        output=DummyOutput(), full_screen=True)
+        ui.write("assistant output\n")
+        await ui.ui_request({"method": "setStatus", "text": "extension ready"})
+        await ui.ui_request({"method": "setWidget", "placement": "above", "lines": ["progress"]})
+        task = asyncio.create_task(ui.read())
+        await asyncio.sleep(0.05)
+        pipe.send_text("hello\r")
+        assert await asyncio.wait_for(task, 3) == "hello"
+        assert ui.session.app.full_screen
+        assert "assistant output" in ui.transcript and "> hello" in ui.transcript
+        assert ui.widgets["above"] == ["progress"]
+        assert "extension ready" in ui.toolbar()[0][1]
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))

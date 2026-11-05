@@ -10,11 +10,60 @@ from pi.ai.types import (TextContent, ToolCall, Tool, SystemMessage, UserMessage
     ToolResultMessage, TranscriptContext, DoneEvent, StreamErrorEvent)
 from pi.ai.json_io import to_json, message_from_json
 from pi.ai.providers.base import SimpleStreamOptions
-from pi.ai.providers import openai_responses, google, amazon_bedrock
+from pi.ai.providers import openai_responses, google, amazon_bedrock, openai_completions
+from pi.coding_agent.config import Configuration
+from pi.coding_agent.model_registry import ModelRegistry
 
 
 def context():
     return TranscriptContext([SystemMessage(content="system", timestamp=0, tools_added=[Tool("echo", "Echo", {"type": "object"})]), UserMessage(content="hello", timestamp=0)])
+
+
+@pytest.mark.parametrize("entra", [False, True])
+def test_azure_endpoint_auth_and_transport_params(tmp_path, monkeypatch, entra):
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://azure.example.test")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    monkeypatch.delenv("PI_PY_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_ACCESS_TOKEN", raising=False)
+    if entra:
+        monkeypatch.setenv("AZURE_ACCESS_TOKEN", "entra-token")
+    registry = ModelRegistry(Configuration(tmp_path, tmp_path / "agent"))
+    model = registry.resolve("azure-openai", "deployment/name")
+    model.params = {"api_version": "2024-10-21"}
+    captured = {}
+    async def send(self, request, **kwargs):
+        captured["request"] = request
+        return httpx.Response(200, request=request, content=b'data: [DONE]\n\n')
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    async def check():
+        key = await model.get_api_key(model.provider)
+        return [event async for event in openai_completions.stream_openai_completions(
+            model, context(), SimpleStreamOptions(api_key=key))]
+    assert isinstance(asyncio.run(check())[-1], DoneEvent)
+    request = captured["request"]
+    assert request.url.raw_path == b"/openai/deployments/deployment%2Fname/chat/completions?api-version=2024-10-21"
+    assert "api_version" not in json.loads(request.content)
+    if entra:
+        assert request.headers["authorization"] == "Bearer entra-token"
+        assert "api-key" not in request.headers
+    else:
+        assert request.headers["api-key"] == "azure-key"
+
+
+@pytest.mark.parametrize("module,api,params,field", [
+    (openai_completions, "openai-completions", {"reasoning_effort": "low"}, "reasoning_effort"),
+    (openai_responses, "openai-responses", {"reasoning": {"effort": "low"}, "max_output_tokens": 1}, "reasoning"),
+    (google, "google-generative-ai", {"thinkingConfig": {"thinkingBudget": 1}, "maxOutputTokens": 1}, "thinkingConfig"),
+])
+def test_explicit_reasoning_and_output_override_model_defaults(module, api, params, field):
+    model = Model("test", "test", api, "test", "https://example.test", reasoning=True, params=params)
+    body = module.build_request(model, context(), SimpleStreamOptions(reasoning="high", max_tokens=4096))
+    config = body["generationConfig"] if module is google else body
+    assert config[field] != params[field]
+    if module is openai_responses:
+        assert config["max_output_tokens"] == 4096
+    if module is google:
+        assert config["maxOutputTokens"] == 4096
 
 
 @pytest.mark.parametrize("module,api,payload", [

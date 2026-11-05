@@ -19,8 +19,11 @@ from .google import stream_google
 from .openai_completions import stream_openai_completions
 from .openai_responses import stream_openai_responses
 from .vertex import stream_vertex
+from .pi_messages import stream_pi_messages
 
 STREAM_FNS: Dict[str, StreamFn] = {
+    "pi-messages": stream_pi_messages,
+    "azure-openai-responses": stream_openai_responses,
     "anthropic-messages": stream_anthropic,
     "openai-completions": stream_openai_completions,
     "faux": stream_faux,

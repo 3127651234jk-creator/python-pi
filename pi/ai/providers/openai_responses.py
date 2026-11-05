@@ -2,6 +2,8 @@
 
 import json
 import time
+import os
+from urllib.parse import urlencode
 
 from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, ThinkingContent, get_system_message_text, get_message_text
 from ..utils import normalize_context
@@ -25,7 +27,7 @@ def build_request(model, context, options):
                     items.append({"role": "assistant", "content": [{"type": "output_text", "text": block.text}]})
                 elif isinstance(block, ToolCall):
                     items.append({"type": "function_call", "call_id": block.id, "name": block.name, "arguments": json.dumps(block.arguments)})
-                elif isinstance(block, ThinkingContent) and block.thinking_signature and message.api in ("openai-responses", "openai-codex-responses"):
+                elif isinstance(block, ThinkingContent) and block.thinking_signature and message.api in ("openai-responses", "openai-codex-responses", "azure-openai-responses"):
                     items.append(json.loads(block.thinking_signature))
         elif isinstance(message, ToolResultMessage):
             output = [{"type": "input_image", "image_url": f"data:{b.mime_type};base64,{b.data}"} if isinstance(b, ImageContent)
@@ -49,6 +51,11 @@ def build_request(model, context, options):
         for tool in body.get("tools", []):
             tool["strict"] = None
     apply_model_params(body, model, options)
+    if model.api == "azure-openai-responses":
+        body.pop("api_version", None)
+        body["model"] = model.params.get("deployment_name", model.id)
+        body.pop("deployment_name", None)
+        body["max_output_tokens"] = max(16, body["max_output_tokens"])
     return body
 
 
@@ -96,8 +103,15 @@ async def stream_openai_responses(model, context, options=None):
         for event in events:
             yield event
     path = "/codex/responses" if model.api == "openai-codex-responses" else "/responses"
+    azure = model.api == "azure-openai-responses"
+    if azure:
+        path += "?" + urlencode({"api-version": model.params.get("api_version") or os.environ.get("AZURE_OPENAI_API_VERSION") or "v1"})
+    def headers():
+        key = options.api_key or model.api_key or ""
+        return {**({"api-key": key} if azure and model.auth_type != "entra" else {"Authorization": "Bearer " + key}),
+                "content-type": "application/json",
+                **({"originator": "pi", "OpenAI-Beta": "responses=experimental"} if model.api == "openai-codex-responses" else {}),
+                **model.headers, **copilot_headers(model, context)}
     async for event in run_provider_stream(model, lambda: build_request(model, context, options), path,
-        lambda: {"Authorization": "Bearer " + (options.api_key or model.api_key or ""), "content-type": "application/json",
-            **({"originator": "pi", "OpenAI-Beta": "responses=experimental"} if model.api == "openai-codex-responses" else {}), **model.headers,
-            **copilot_headers(model, context)}, convert, options, int(time.time() * 1000)):
+        headers, convert, options, int(time.time() * 1000)):
         yield event

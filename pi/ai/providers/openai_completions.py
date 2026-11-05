@@ -8,6 +8,7 @@ OpenRouter, vLLM, llama.cpp, ...).
 from __future__ import annotations
 
 import json
+from urllib.parse import quote, urlencode
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from ..models import Model
@@ -81,6 +82,8 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
     if model.reasoning and reasoning not in (None, "off"):
         body["reasoning_effort"] = _reasoning_effort(reasoning)
     apply_model_params(body, model, options)
+    if model.api == "azure-openai":
+        body.pop("api_version", None)
     return body
 
 
@@ -336,7 +339,7 @@ async def stream_openai_completions(
 
     if azure:
         version = model.params.get("api_version") or os.environ.get("AZURE_OPENAI_API_VERSION") or "2024-10-21"
-        path = f"/openai/deployments/{model.id}/chat/completions?api-version={version}"
+        path = f"/openai/deployments/{quote(model.id, safe='')}/chat/completions?{urlencode({'api-version': version})}"
     else:
         path = "/chat/completions"
 

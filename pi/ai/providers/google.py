@@ -48,7 +48,14 @@ def build_request(model, context, options):
         if system.tools_added:
             body["tools"] = [{"functionDeclarations": [{"name": t.name, "description": t.description, "parametersJsonSchema": t.parameters} for t in system.tools_added]}]
     # Model-specific params tune generationConfig (top_k, temperature, ...).
-    config_params = {k: v for k, v in (model.params or {}).items() if k not in ("temperature",) or options.temperature is None}
+    explicit = set()
+    if options.temperature is not None:
+        explicit.add("temperature")
+    if options.max_tokens is not None:
+        explicit.add("maxOutputTokens")
+    if options.reasoning is not None:
+        explicit.add("thinkingConfig")
+    config_params = {k: v for k, v in (model.params or {}).items() if k not in explicit}
     body["generationConfig"].update(config_params)
     return body
 

@@ -1,5 +1,6 @@
 """Python extension factories, command registry and ordered lifecycle hooks."""
 
+import asyncio
 import inspect
 import importlib.util
 import sys
@@ -7,17 +8,18 @@ import re
 import uuid
 from contextlib import redirect_stdout
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..agent.agent import Agent
-from ..agent.types import AgentTool, BeforeToolCallResult, AfterToolCallResult
+from ..agent.types import AgentRequestUpdate, AgentTool, BeforeToolCallResult, AfterToolCallResult
 from ..ai.providers import register_provider_stream_fn, unregister_provider_stream_fn
 from .config import Configuration, read_json
+from .model_registry import ModelRegistry
 from .resources import RESERVED_COMMANDS
 from .session import SessionManager
-from .ts_extension import InputResult, TsExtensionBridge, load_ts_extension
+from .ts_extension import InputResult, TsExtensionBridge, load_ts_extension, to_jsonable
 
 _extension_output = ContextVar("pi_extension_output", default=False)
 
@@ -86,6 +88,16 @@ class ExtensionContext:
     agent: Agent
     cwd: Path
     session: Optional[SessionManager] = None
+    event_receivers: List[Callable] = field(default_factory=list, repr=False)
+    config: Optional[Configuration] = None
+    commands: dict = field(default_factory=dict)
+    tool_catalog: dict = field(default_factory=dict)
+    registry: Any = None
+    mcp: Any = None
+    refresh_tools: Optional[Callable] = None
+    sync_providers: Optional[Callable] = None
+    sync_virtual_models: Optional[Callable] = None
+    mcp_servers_changed: Optional[Callable] = None
 
 
 async def invoke(handler, *args):
@@ -107,13 +119,22 @@ class ExtensionAPI:
         self.tools: List[AgentTool] = []
         self.commands = {}
         self.providers = {}
+        self.virtual_models = {}
+        self.mcp_servers = {}
+        self.flags = {}
+        self.flag_values = {}
+        self.tool_renderers: List[Callable] = []
+        self.message_renderers: Dict[str, Callable] = {}
+        self.entry_renderers: Dict[str, Callable] = {}
+        self.markdown_transformers: List[Callable] = []
         self.keybindings: List[tuple] = []
         self.ui = ExtensionUI(path)
         self.sealed = False
+        self.closed = False
 
     def check_registration(self):
-        if self.sealed:
-            raise RuntimeError("Register extension capabilities inside setup(api)")
+        if self.closed:
+            raise RuntimeError("Extension is closed")
 
     def on(self, event: str, handler: Callable):
         self.check_registration()
@@ -163,6 +184,92 @@ class ExtensionAPI:
         self.providers[name] = config
         if callable(config.get("stream_simple")):
             register_provider_stream_fn(name, config["stream_simple"])
+        if self.sealed and self.context.sync_providers:
+            self.context.sync_providers()
+
+    def unregister_provider(self, name: str):
+        self.check_registration()
+        self.providers.pop(name, None)
+        unregister_provider_stream_fn(name)
+        if self.sealed and self.context.sync_providers:
+            self.context.sync_providers()
+
+    def register_flag(self, name: str, options: dict):
+        self.check_registration()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in self.flags:
+            raise ValueError("Invalid or duplicate extension flag")
+        if not isinstance(options, dict) or options.get("type") not in ("boolean", "string"):
+            raise ValueError("Extension flag type must be boolean or string")
+        default = options.get("default")
+        expected = bool if options["type"] == "boolean" else str
+        if default is not None and type(default) is not expected:
+            raise ValueError("Extension flag default has the wrong type")
+        self.flags[name] = dict(options)
+        if default is not None:
+            self.flag_values[name] = default
+
+    def get_flag(self, name: str):
+        return self.flag_values.get(name)
+
+    def register_tool_renderer(self, renderer: Callable):
+        self.check_registration()
+        self.tool_renderers.append(renderer)
+
+    def register_message_renderer(self, custom_type: str, renderer: Callable):
+        self.check_registration()
+        self.message_renderers[custom_type] = renderer
+
+    def register_entry_renderer(self, custom_type: str, renderer: Callable):
+        self.check_registration()
+        self.entry_renderers[custom_type] = renderer
+
+    def register_markdown_transformer(self, transformer: Callable):
+        self.check_registration()
+        self.markdown_transformers.append(transformer)
+
+    def register_virtual_model(self, definition: dict):
+        self.check_registration()
+        provider, model_id = definition.get("provider"), definition.get("id")
+        if not isinstance(provider, str) or not provider or not isinstance(model_id, str) or not model_id:
+            raise ValueError("Virtual model requires provider and id")
+        if not callable(definition.get("route")):
+            raise ValueError("Virtual model requires a route function")
+        self.virtual_models[(provider, model_id)] = definition
+        if self.sealed and self.context.sync_virtual_models:
+            self.context.sync_virtual_models()
+
+    def unregister_virtual_model(self, provider: str, model_id: str):
+        self.check_registration()
+        self.virtual_models.pop((provider, model_id), None)
+        if self.sealed and self.context.sync_virtual_models:
+            self.context.sync_virtual_models()
+
+    async def register_mcp_server(self, name: str, config: dict):
+        self.check_registration()
+        if self.context.mcp is None:
+            raise RuntimeError("MCP manager is unavailable")
+        await self.context.mcp.register_extension_server(name, config, str(self.path))
+        self.mcp_servers[name] = dict(config)
+        if self.context.mcp_servers_changed:
+            await self.context.mcp_servers_changed()
+
+    async def unregister_mcp_server(self, name: str):
+        self.check_registration()
+        if self.context.mcp is None:
+            raise RuntimeError("MCP manager is unavailable")
+        await self.context.mcp.unregister_extension_server(name, str(self.path))
+        self.mcp_servers.pop(name, None)
+        if self.context.mcp_servers_changed:
+            await self.context.mcp_servers_changed()
+
+    def get_mcp_servers(self) -> List[dict]:
+        if self.context.mcp is None:
+            return []
+        return self.context.mcp.registered_extension_servers()
+
+    def refresh_tools(self) -> None:
+        if self.context.refresh_tools:
+            self.context.refresh_tools()
 
     def register_keybinding(self, action: str, keys: List[str], handler: Callable):
         """Register a terminal shortcut; the handler runs when the editor is idle."""
@@ -179,27 +286,120 @@ class ExtensionAPI:
             return None
         return self.context.session.append_custom(custom_type, data)
 
-    def send_message(self, custom_type: str, content: str, display: bool = True) -> Optional[str]:
+    def send_message(self, custom_type: str, content, display: bool = True,
+                     details=None) -> Optional[str]:
         """Append a custom message that enters the LLM context."""
         if self.context.session is None:
             return None
-        return self.context.session.append_custom_message(custom_type, content, display)
+        return self.context.session.append_custom_message(custom_type, content, display, details)
 
     def log(self, message: str):
         print(f"extension {self.path}: {message}", file=sys.stderr)
 
 
 class ExtensionManager:
-    def __init__(self, config: Configuration, agent: Agent, session: Optional[SessionManager] = None) -> None:
+    def __init__(self, config: Configuration, agent: Agent, session: Optional[SessionManager] = None,
+                 registry=None, mcp=None, flag_values: Optional[dict] = None) -> None:
         self.config, self.agent = config, agent
         self.context = ExtensionContext(agent, config.cwd, session)
+        self.context.config = config
+        self.context.registry = registry
+        self.context.mcp = mcp
+        self.context.refresh_tools = self.refresh_tools
+        self.context.sync_providers = self.sync_providers
+        self.context.sync_virtual_models = self.sync_virtual_models
+        self.context.mcp_servers_changed = self.mcp_servers_changed
+        self.flag_values = dict(flag_values or {})
         self.extensions = []
         self.commands = {}
         self.module_names = []
         self.ts_bridges: List["TsExtensionBridge"] = []
         self.unsubscribe = None
         self.old_before, self.old_after = agent.before_tool_call, agent.after_tool_call
+        self.old_prepare_request = agent.prepare_request
         self.output = None
+
+    def refresh_tools(self) -> None:
+        """Publish tools registered after setup without changing the active set otherwise."""
+        known = {tool.name: tool for tool in self.agent.tools}
+        for api in self.extensions:
+            for tool in api.tools:
+                known[tool.name] = tool
+        self.agent.tools[:] = list(known.values())
+        self.context.tool_catalog.update(known)
+
+    def sync_providers(self) -> None:
+        if self.context.registry is not None:
+            self.context.registry.register_extension_providers(self.all_providers())
+
+    def sync_virtual_models(self) -> None:
+        if self.context.registry is not None:
+            self.context.registry.register_virtual_models(self.all_virtual_models())
+
+    async def mcp_servers_changed(self) -> None:
+        servers = self.context.mcp.registered_extension_servers() if self.context.mcp is not None else []
+        asyncio.create_task(self.emit("mcp_servers_change", {
+            "type": "mcp_servers_change", "servers": servers}))
+
+    async def apply_flag_values(self) -> None:
+        registered = {name: options for api in self.extensions for name, options in api.flags.items()}
+        unknown = sorted(set(self.flag_values) - set(registered))
+        if unknown:
+            raise ValueError("Unknown option" + ("s" if len(unknown) > 1 else "") + ": "
+                             + ", ".join("--" + name for name in unknown))
+        values = {}
+        for name, options in registered.items():
+            value = self.flag_values.get(name, options.get("default"))
+            if options["type"] == "boolean":
+                value = name in self.flag_values or bool(value)
+            elif name in self.flag_values and not isinstance(value, str):
+                raise ValueError(f'Extension flag "--{name}" requires a value')
+            values[name] = value
+        for api in self.extensions:
+            api.flag_values.update({name: value for name, value in values.items() if name in api.flags})
+        for bridge in self.ts_bridges:
+            await bridge.set_flag_values(values)
+
+    def all_virtual_models(self) -> dict:
+        models = {}
+        for api in self.extensions:
+            models.update(api.virtual_models)
+        return models
+
+    async def transform_markdown(self, markdown: str, message_type: str,
+                                 is_streaming: bool = False, available_width: int = 80) -> str:
+        value = markdown
+        context = {"messageType": message_type, "isStreaming": is_streaming,
+                   "availableWidth": available_width}
+        for api in self.extensions:
+            for transformer in api.markdown_transformers:
+                value = await invoke(transformer, value, context)
+        return value
+
+    async def render_tool(self, tool_name: str, phase: str, payload: dict,
+                          options: Optional[dict] = None, width: int = 80) -> Optional[List[str]]:
+        for api in self.extensions:
+            for renderer in api.tool_renderers:
+                lines = await invoke(renderer, tool_name, phase, payload, options or {}, width)
+                if lines is not None:
+                    return lines
+        return None
+
+    async def render_message(self, custom_type: str, message: dict,
+                             options: Optional[dict] = None, width: int = 80) -> Optional[List[str]]:
+        for api in reversed(self.extensions):
+            renderer = api.message_renderers.get(custom_type)
+            if renderer:
+                return await invoke(renderer, message, options or {}, width)
+        return None
+
+    async def render_entry(self, custom_type: str, entry: dict,
+                           options: Optional[dict] = None, width: int = 80) -> Optional[List[str]]:
+        for api in reversed(self.extensions):
+            renderer = api.entry_renderers.get(custom_type)
+            if renderer:
+                return await invoke(renderer, entry, options or {}, width)
+        return None
 
     def paths(self):
         paths = []
@@ -261,6 +461,9 @@ class ExtensionManager:
                 await self._load_remote(path)
             else:
                 await self._load_python(path)
+        await self.apply_flag_values()
+        self.sync_providers()
+        self.sync_virtual_models()
         async def event(event):
             await self.emit(event.type, event)
         self.unsubscribe = self.agent.subscribe(event)
@@ -284,6 +487,49 @@ class ExtensionManager:
 
         self.agent.before_tool_call = before
         self.agent.after_tool_call = after
+
+        async def prepare_request(request, signal):
+            if self.old_prepare_request:
+                previous = self.old_prepare_request(request, signal)
+                previous = await previous if inspect.isawaitable(previous) else previous
+                if previous is not None:
+                    request = replace(request,
+                        context=previous.context or request.context,
+                        model=previous.model or request.model,
+                        thinking_level=previous.thinking_level or request.thinking_level)
+            selected = self.agent.model
+            definition = self.all_virtual_models().get((selected.provider, selected.id))
+            if definition is None:
+                return None
+            state = None
+            if self.context.session is not None:
+                saved = self.context.session.latest_custom("pi.virtual-model-state")
+                if saved and saved.get("provider") == selected.provider and saved.get("modelId") == selected.id:
+                    state = saved.get("state")
+            messages = request.context.messages
+            reason = "user" if messages and getattr(messages[-1], "role", None) == "user" else "continuation"
+            routed = await definition["route"]({
+                "model": {"provider": selected.provider, "id": selected.id, "name": selected.name,
+                          "api": selected.api},
+                "thinkingLevel": request.thinking_level, "reason": reason,
+                "state": state, "messages": to_jsonable(messages),
+            })
+            if not isinstance(routed, dict) or not isinstance(routed.get("model"), dict):
+                raise ValueError("Virtual model route must return a model")
+            target = routed["model"]
+            registry = self.context.registry
+            if registry is None:
+                registry = ModelRegistry(self.config)
+            physical = registry.resolve(target["provider"], target["id"])
+            if physical.api == "pi-virtual":
+                raise ValueError("Virtual model routes must select a physical model")
+            if "state" in routed and self.context.session is not None and routed["state"] is not state:
+                self.context.session.append_custom("pi.virtual-model-state", {
+                    "provider": selected.provider, "modelId": selected.id, "state": routed["state"]})
+            return AgentRequestUpdate(model=physical,
+                thinking_level=routed.get("thinkingLevel", request.thinking_level))
+
+        self.agent.prepare_request = prepare_request
         await self.emit("session_start", {"type": "session_start"})
 
     def _seal(self, api: ExtensionAPI, path: Path) -> None:
@@ -298,6 +544,7 @@ class ExtensionManager:
         self.extensions.append(api)
         self.agent.tools.extend(api.tools)
         self.commands.update(api.commands)
+        self.context.commands = self.commands
 
     async def _load_python(self, path: Path) -> None:
         name = "_pi_extension_" + uuid.uuid4().hex
@@ -327,12 +574,15 @@ class ExtensionManager:
         """Load a TS/JS extension through the Node bridge into a shared ExtensionAPI."""
 
         api = ExtensionAPI(path, self.context)
+        bridge = None
         try:
             bridge = await load_ts_extension(path, api)
-            self.ts_bridges.append(bridge)
             self._seal(api, path)
+            self.ts_bridges.append(bridge)
         except Exception as exc:
             await self.cleanup_api(api)
+            if bridge is not None:
+                await bridge.close()
             print(f"Extension {path} failed: {exc}", file=sys.stderr)
 
     async def cleanup_api(self, api):
@@ -341,30 +591,42 @@ class ExtensionManager:
                 await invoke(handler, {"type": "session_shutdown"}, self.context)
             except Exception as exc:
                 print(f"Extension cleanup failed: {exc}", file=sys.stderr)
+        api.closed = True
 
     async def close(self):
         if self.unsubscribe:
             self.unsubscribe()
             self.unsubscribe = None
+        for api in reversed(self.extensions):
+            await self.cleanup_api(api)
         for api in self.extensions:
             for name, config in api.providers.items():
                 if callable(config.get("stream_simple")):
                     unregister_provider_stream_fn(name)
+            if self.context.mcp is not None:
+                for name in list(api.mcp_servers):
+                    await self.context.mcp.unregister_extension_server(name, str(api.path))
         for bridge in self.ts_bridges:
             try:
                 await bridge.close()
             except Exception as exc:  # noqa: BLE001
                 print(f"TS extension bridge shutdown failed: {exc}", file=sys.stderr)
         self.ts_bridges = []
-        for api in reversed(self.extensions):
-            await self.cleanup_api(api)
         owned = {id(tool) for api in self.extensions for tool in api.tools}
+        active_names = {tool.name for tool in self.agent.tools}
+        self.agent.tools.extend(tool for name, tool in self.context.tool_catalog.items()
+                                if name not in active_names and id(tool) not in owned)
         self.agent.tools = [tool for tool in self.agent.tools if id(tool) not in owned]
         self.agent.before_tool_call, self.agent.after_tool_call = self.old_before, self.old_after
+        self.agent.prepare_request = self.old_prepare_request
         for name in list(sys.modules):
             if any(name == root or name.startswith(root + ".") for root in self.module_names):
                 sys.modules.pop(name, None)
         self.extensions, self.commands, self.module_names = [], {}, []
+        self.context.commands = self.commands
+        self.context.tool_catalog.clear()
+        self.sync_providers()
+        self.sync_virtual_models()
         if self.output is not None and sys.stdout is self.output:
             sys.stdout = self.output.protocol_output
         self.output = None

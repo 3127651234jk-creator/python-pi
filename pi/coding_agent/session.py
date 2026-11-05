@@ -180,12 +180,17 @@ class SessionManager:
         self.leaf_id = entry.id
         return entry.id
 
-    def append_custom_message(self, custom_type: str, content: str, display: bool = True) -> str:
+    def append_custom_message(self, custom_type: str, content, display: bool = True,
+                              details=None) -> str:
         """Custom entry that does enter the LLM context as a user message."""
         message = UserMessage(content=content, timestamp=_now_ms())
-        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, message, {"kind": custom_type, "data": {"display": display}})
+        metadata = {"display": display}
+        if details is not None:
+            metadata["details"] = details
+        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, message, {"kind": custom_type, "data": metadata})
         self._write({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
-                     "customType": custom_type, "display": display, "message": _to_dict(message)})
+                     "customType": custom_type, "display": display, "details": details,
+                     "message": _to_dict(message)})
         self.entries.append(entry)
         self.leaf_id = entry.id
         return entry.id
@@ -330,6 +335,7 @@ class SessionManager:
                 elif entry.custom is not None:
                     records.append({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
                                     "customType": entry.custom["kind"], "display": entry.custom["data"].get("display", True),
+                                    "details": entry.custom["data"].get("details"),
                                     "message": _to_dict(entry.message)})
                 else:
                     records.append({"type": "message", "id": entry.id, "parent_id": entry.parent_id,
@@ -374,8 +380,11 @@ class SessionManager:
                         entries.append(SessionEntry(entry_id, parent, None,
                             {"kind": record.get("customType", ""), "data": record.get("data", {})}))
                     else:
+                        metadata = {"display": record.get("display", True)}
+                        if record.get("details") is not None:
+                            metadata["details"] = record["details"]
                         entries.append(SessionEntry(entry_id, parent, message_from_json(record["message"]),
-                            {"kind": record.get("customType", ""), "data": {"display": record.get("display", True)}}))
+                            {"kind": record.get("customType", ""), "data": metadata}))
                     leaf = entry_id
                 else:
                     entry_id = record["id"] if kind == "message" else f"legacy-{len(entries)}"

@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import getpass
+from contextlib import nullcontext, redirect_stdout
 from typing import Any, List, Optional
 import httpx
 
@@ -25,6 +26,7 @@ from ..agent.types import (
     MessageUpdateEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
+    ToolExecutionUpdateEvent,
     TurnEndEvent,
 )
 from .catalog_sync import fetch_catalog, save_cache
@@ -43,6 +45,7 @@ from .resources import ResourceCatalog
 from .mcp import McpManager
 from .rpc import JsonWriter, RpcServer
 from .extensions import ExtensionManager
+from .ts_extension import to_jsonable as to_json_value
 from .tui import ExtensionAction, TerminalUI, THEMES, DEFAULT_KEYBINDINGS, load_themes
 from .usage import context_usage, format_usage, session_stats, usage_cost_breakdown
 
@@ -68,10 +71,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logout", metavar="PROVIDER", help="Remove stored provider credentials")
     parser.add_argument("--list-models", action="store_true", help="List model catalog and capabilities")
     parser.add_argument("--mode", choices=["text", "json", "rpc"], default="text")
-    parser.add_argument("--tui", choices=["auto", "on", "off"], default="auto")
+    parser.add_argument("--tui", choices=["auto", "on", "off", "fullscreen"], default="auto")
     parser.add_argument("--sync-models", action="store_true", help="Refresh the cached online model catalog")
     parser.add_argument("--evals", metavar="FILE", help="Run eval cases from a JSON file and exit")
     return parser
+
+
+def split_extension_flags(argv: List[str], parser: argparse.ArgumentParser):
+    """Keep TS-compatible unknown long flags out of argparse until extensions load."""
+    known = {option for action in parser._actions for option in action.option_strings}
+    filtered, values = [], {}
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--":
+            filtered.extend(argv[index:])
+            break
+        name, separator, inline_value = argument.partition("=")
+        if argument.startswith("--") and name not in known:
+            flag_name = name[2:]
+            if not flag_name:
+                filtered.append(argument)
+            elif separator:
+                values[flag_name] = inline_value
+            elif index + 1 < len(argv) and not argv[index + 1].startswith(("-", "@")):
+                values[flag_name] = argv[index + 1]
+                index += 1
+            else:
+                values[flag_name] = True
+        else:
+            filtered.append(argument)
+        index += 1
+    return filtered, values
 
 
 def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegistry] = None,
@@ -103,24 +134,49 @@ class CliRenderer:
         self.settings = settings or {}
         self.markdown = bool(self.settings.get("markdown", False))
         self.fold = int(self.settings.get("fold_output", 10))
+        self.extensions: Optional[ExtensionManager] = None
+        self.tool_args = {}
 
     async def __call__(self, event: Any) -> None:
         if self.quiet:
             return
         if isinstance(event, MessageUpdateEvent):
             inner = event.assistant_message_event
-            if isinstance(inner, TextDeltaEvent) and not self.markdown:
+            transformed = self.extensions is not None and any(
+                api.markdown_transformers for api in self.extensions.extensions)
+            if isinstance(inner, TextDeltaEvent) and not self.markdown and not transformed:
                 print(inner.delta, end="", flush=True)
-        elif isinstance(event, MessageEndEvent) and self.markdown and isinstance(event.message, AssistantMessage):
+        elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage) and (
+                self.markdown or self.extensions is not None and any(
+                    api.markdown_transformers for api in self.extensions.extensions)):
             text = "\n".join(block.text for block in event.message.content if isinstance(block, TextContent))
             if text.strip():
+                if self.extensions is not None:
+                    text = await self.extensions.transform_markdown(text, "assistant")
                 print("\n" + render_markdown(text), flush=True)
         elif isinstance(event, ToolExecutionStartEvent):
             args = event.args or {}
+            self.tool_args[event.tool_call_id] = args
+            if self.extensions is not None:
+                lines = await self.extensions.render_tool(event.tool_name, "call", args,
+                    {"args": args, "toolCallId": event.tool_call_id, "expanded": not bool(self.fold),
+                     "isPartial": False, "executionStarted": True, "argsComplete": True}, 80)
+                if lines is not None:
+                    print("\n" + "\n".join(lines), flush=True)
+                    return
             shown = args.get("command") or args.get("path") or ""
             print(f"\n[{event.tool_name}] {shown}", flush=True)
         elif isinstance(event, ToolExecutionEndEvent):
             result = event.result
+            if self.extensions is not None and result is not None:
+                lines = await self.extensions.render_tool(event.tool_name, "result", to_json_value(result),
+                    {"args": self.tool_args.pop(event.tool_call_id, {}), "toolCallId": event.tool_call_id,
+                     "expanded": not bool(self.fold), "isPartial": False, "isError": event.is_error,
+                     "executionStarted": True, "argsComplete": True}, 80)
+                if lines is not None:
+                    if lines:
+                        print("\n".join(lines), flush=True)
+                    return
             text = ""
             if result is not None and getattr(result, "content", None):
                 text = result.content[0].text
@@ -132,6 +188,15 @@ class CliRenderer:
                     print(f"  {line}", flush=True)
                 if len(lines) > self.fold:
                     print(f"  [+{len(lines) - self.fold} lines folded; /set fold_output 0 shows all]", flush=True)
+        elif isinstance(event, ToolExecutionUpdateEvent) and self.extensions is not None:
+            lines = await self.extensions.render_tool(event.tool_name, "result",
+                to_json_value(event.partial_result), {
+                    "args": self.tool_args.get(event.tool_call_id, {}),
+                    "toolCallId": event.tool_call_id, "expanded": not bool(self.fold),
+                    "isPartial": True, "isError": False, "executionStarted": True,
+                    "argsComplete": True}, 80)
+            if lines:
+                print("\n".join(lines), flush=True)
         elif isinstance(event, TurnEndEvent):
             message = event.message
             usage = getattr(message, "usage", None)
@@ -440,6 +505,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             sync_mcp_tools(agent, mcp)
                         if extensions:
                             await extensions.reload()
+                            if ui and ui.full_screen:
+                                extensions.set_ui_sink(ui.ui_request)
                             registry.register_extension_providers(extensions.all_providers())
                 except (OSError, ValueError, ModelError, asyncio.TimeoutError, httpx.HTTPError) as exc:
                     print(f"error: {exc}")
@@ -469,6 +536,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
             if command in ("/resume", "/session", "/name", "/tree", "/fork", "/clone", "/export"):
                 try:
                     handle_session_command(command, rest.strip(), agent, session)
+                    if command == "/tree" and not rest.strip() and session and extensions:
+                        await render_custom_entries(session, extensions)
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     print(f"error: {exc}")
                 continue
@@ -592,7 +661,8 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
     print(f"credentials saved for {provider}")
 
 
-def handle_session_command(command: str, argument: str, agent: Agent, session: Optional[SessionManager]) -> None:
+def handle_session_command(command: str, argument: str, agent: Agent,
+                           session: Optional[SessionManager]) -> None:
     if session is None:
         raise ValueError("Session persistence is disabled")
     if command == "/resume":
@@ -627,6 +697,25 @@ def handle_session_command(command: str, argument: str, agent: Agent, session: O
         restore_compaction(agent.compactor, agent.messages, session.latest_custom("compaction"))
 
 
+async def render_custom_entries(session: SessionManager, extensions: ExtensionManager) -> None:
+    for entry in session.get_branch():
+        if entry.custom is None:
+            continue
+        custom_type = entry.custom["kind"]
+        if entry.message is None:
+            lines = await extensions.render_entry(custom_type, {
+                "id": entry.id, "parentId": entry.parent_id,
+                "customType": custom_type, "data": entry.custom["data"]}, {"expanded": True})
+        else:
+            lines = await extensions.render_message(custom_type, {
+                "role": "custom", "customType": custom_type,
+                "content": get_message_text(entry.message.content),
+                "display": entry.custom["data"].get("display", True),
+                "details": entry.custom["data"].get("details")}, {"expanded": True})
+        if lines:
+            print("\n".join(lines))
+
+
 def restore_session_settings(agent: Agent, session: SessionManager, registry: ModelRegistry) -> None:
     """Replay model_change / thinking_level_change / compaction entries on resume."""
     model_change = session.latest_custom("model_change")
@@ -649,7 +738,9 @@ def sync_mcp_tools(agent: Agent, mcp: McpManager) -> None:
 
 
 async def async_main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    filtered_argv, extension_flag_values = split_extension_flags(raw_argv, build_parser())
+    args = build_parser().parse_args(filtered_argv)
     if args.no_session and (args.session or args.continue_session or args.name):
         print("error: --no-session cannot be combined with session options", file=sys.stderr)
         return 2
@@ -724,12 +815,18 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     renderer = CliRenderer(settings=registry.config.settings)
 
     mcp = McpManager(registry.config)
-    extensions = ExtensionManager(registry.config, agent, session)
+    extensions = ExtensionManager(registry.config, agent, session, registry=registry, mcp=mcp,
+                                  flag_values=extension_flag_values)
+    renderer.extensions = extensions
     try:
         await mcp.reload()
         sync_mcp_tools(agent, mcp)
         mcp.on_tools_changed = lambda server: sync_mcp_tools(agent, mcp)
-        await extensions.reload()
+        try:
+            await extensions.reload()
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         registry.register_extension_providers(extensions.all_providers())
         if registry.config.settings.get("codemode", {}).get("enabled"):
             agent.tools.append(create_codemode_tool(
@@ -758,7 +855,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             await run_prompt(agent, " ".join(args.prompt), renderer, session, resources, extensions, mcp)
             return 0
         ui = None
-        if args.tui == "on" or args.tui == "auto" and sys.stdin.isatty() and sys.stdout.isatty():
+        if args.tui in ("on", "fullscreen") or args.tui == "auto" and sys.stdin.isatty() and sys.stdout.isatty():
             def commands():
                 names = [line.strip().split()[0] for line in SLASH_HELP.splitlines() if line.strip().startswith("/")]
                 names.extend("/" + name for name in extensions.commands)
@@ -768,9 +865,13 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 return names
             ui = TerminalUI(agent, commands, registry.config.settings,
                             extra_bindings=extensions.all_keybindings(),
-                            themes=load_themes(registry.config.agent_dir))
-        await interactive_loop(agent, renderer, session, registry, resources, mcp, extensions, ui,
-                               PackageManager(registry.config))
+                            themes=load_themes(registry.config.agent_dir), full_screen=args.tui == "fullscreen")
+            ui.markdown_transform = lambda text: extensions.transform_markdown(text, "user")
+        if ui and ui.full_screen:
+            extensions.set_ui_sink(ui.ui_request)
+        with redirect_stdout(ui) if ui and ui.full_screen else nullcontext():
+            await interactive_loop(agent, renderer, session, registry, resources, mcp, extensions, ui,
+                                   PackageManager(registry.config))
         return 0
     finally:
         await extensions.close()

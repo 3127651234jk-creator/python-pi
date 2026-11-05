@@ -33,11 +33,16 @@ class ModelRegistry:
         self.config = config
         self.auth = AuthStore(config.agent_dir / "auth.json")
         self.extension_providers: Dict[str, dict] = {}
+        self.virtual_models: Dict[tuple, dict] = {}
         self.reload()
 
     def register_extension_providers(self, providers: Dict[str, dict]) -> None:
         """Merge extension-registered providers below user models.json settings."""
         self.extension_providers = dict(providers)
+        self.reload()
+
+    def register_virtual_models(self, models: Dict[tuple, dict]) -> None:
+        self.virtual_models = dict(models)
         self.reload()
 
     def reload(self) -> None:
@@ -50,9 +55,9 @@ class ModelRegistry:
             # Subscription sign-in for the "openai" provider is Sign in with ChatGPT; the access token is used as the API key.
             "kimi-coding": {"api": "anthropic-messages", "base_url": "https://api.kimi.com/coding", "api_key_env": "KIMI_API_KEY", "models": [{"id": "k3", "name": "Kimi K3", "reasoning": True, "input": ["text", "image"], "context_window": 1048576, "max_tokens": 131072}]},
             "xai": {"api": "openai-responses", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY", "models": [{"id": "grok-4.3", "name": "Grok 4.3", "reasoning": True, "input": ["text", "image"], "context_window": 1000000, "max_tokens": 30000}]},
-            # The Radius gateway speaks pi-messages, which this port does not serve; sign-in works and the
-            # credential is stored, but models must be configured in models.json before the provider resolves.
-            "radius": {"base_url": "https://radius.pi.dev", "api_key_env": "RADIUS_API_KEY"},
+            "radius": {"api": "pi-messages", "base_url": "https://radius.pi.dev", "api_key_env": "RADIUS_API_KEY"},
+            "azure-openai-responses": {"api": "azure-openai-responses", "api_key_env": "AZURE_OPENAI_API_KEY", "base_url": "",
+                "models": [{"id": "gpt-4o", "input": ["text", "image"], "context_window": 128000}]},
             "openai-responses": {"api": "openai-responses", "api_key_env": "OPENAI_API_KEY", "base_url": "https://api.openai.com/v1", "models": [{"id": "gpt-4o-mini", "input": ["text", "image"], "context_window": 128000}]},
             "google": {"api": "google-generative-ai", "api_key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta", "models": [{"id": "gemini-2.5-flash", "reasoning": True, "input": ["text", "image"], "context_window": 1048576}]},
             "google-vertex": {"api": "google-vertex", "auth_required": False, "base_url": "",
@@ -98,7 +103,7 @@ class ModelRegistry:
             api = provider.get("api", "anthropic-messages" if name == "anthropic" else "faux" if name == "faux" else "openai-completions")
             # A provider with a custom stream function implements its own protocol,
             # so it may name its api freely and keep its endpoint empty.
-            if stream_simple is None and api not in ("anthropic-messages", "openai-completions", "faux", "openai-responses", "openai-codex-responses", "google-generative-ai", "google-vertex", "azure-openai", "bedrock-converse-stream"):
+            if stream_simple is None and api not in ("pi-messages", "azure-openai-responses", "anthropic-messages", "openai-completions", "faux", "openai-responses", "openai-codex-responses", "google-generative-ai", "google-vertex", "azure-openai", "bedrock-converse-stream"):
                 raise ModelError(f"Unsupported API: {api}")
             # Providers may leave the endpoint empty: Vertex and Azure build it from
             # the environment at request time, and catalog models carry their own
@@ -151,9 +156,19 @@ class ModelRegistry:
                 if model.provider != name:
                     continue
                 base_url = provider.get("base_url", model.base_url)
-                if stream_simple is None and (api not in ("faux", "google-vertex", "azure-openai") or base_url):
+                if stream_simple is None and (api not in ("faux", "google-vertex", "azure-openai", "azure-openai-responses") or base_url):
                     validate_url(base_url)
                 models[identifier] = replace(model, api=api, base_url=base_url.rstrip("/"), api_key=None)
+        for (provider, model_id), definition in self.virtual_models.items():
+            merged.setdefault(provider, {"auth_required": False})
+            levels = definition.get("thinkingLevels") or ["off"]
+            models[provider + "/" + model_id] = Model(
+                id=model_id, name=definition.get("name") or model_id, api="pi-virtual",
+                provider=provider, base_url="", reasoning=any(level != "off" for level in levels),
+                context_window=definition.get("contextWindow") or 1,
+                max_tokens=definition.get("maxTokens") or 1,
+                input=list(definition.get("input") or ["text", "image"]),
+            )
         self.providers = merged
         self.models = models
 
@@ -172,11 +187,24 @@ class ModelRegistry:
         if model is None:
             if provider in ("openai", "anthropic", "faux"):
                 model = resolve_model(provider, model_id, api_key="catalog-only")
-            elif provider in ("google", "amazon-bedrock", "openai-responses", "openai-codex", "github-copilot", "google-vertex", "azure-openai"):
+            elif settings.get("api") == "pi-messages":
+                model = Model(model_id, model_id, "pi-messages", provider, settings["base_url"])
+            elif provider in ("google", "amazon-bedrock", "openai-responses", "openai-codex", "github-copilot", "google-vertex", "azure-openai", "azure-openai-responses"):
                 model = replace(entries[0], id=model_id, name=model_id)
             else:
                 raise ModelError(f"Unknown model: {provider}/{model_id}")
         endpoint = base_url or settings.get("base_url", model.base_url)
+        if settings.get("api", model.api) == "azure-openai" and not endpoint:
+            endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        if settings.get("api", model.api) == "azure-openai-responses":
+            endpoint = endpoint or os.environ.get("AZURE_OPENAI_BASE_URL") or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+            if not endpoint and os.environ.get("AZURE_OPENAI_RESOURCE_NAME"):
+                endpoint = "https://" + os.environ["AZURE_OPENAI_RESOURCE_NAME"] + ".openai.azure.com"
+            if not endpoint:
+                raise ModelError("Azure Responses requires an endpoint or AZURE_OPENAI_RESOURCE_NAME")
+            parsed = urlsplit(endpoint)
+            if parsed.path.rstrip("/") in ("", "/openai", "/openai/v1/responses"):
+                endpoint = parsed._replace(path="/openai/v1", query="").geturl()
         if model.api != "faux" and endpoint:
             validate_url(endpoint)
         if settings.get("api", model.api) == "azure-openai" and not endpoint:
@@ -202,7 +230,7 @@ class ModelRegistry:
                     resolved.base_url = copilot_endpoint(key)
                     resolved.headers.update({**COPILOT_HEADERS, "x-github-api-version": "2026-06-01", "openai-intent": "conversation-panel", "X-Initiator": "user"})
                 return key
-            if provider == "azure-openai":
+            if resolved.api in ("azure-openai", "azure-openai-responses"):
                 token = os.environ.get("AZURE_ACCESS_TOKEN", "")
                 if token:
                     resolved.auth_type = "entra"

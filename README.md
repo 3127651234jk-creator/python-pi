@@ -133,7 +133,7 @@ python -m pi --provider amazon-bedrock --model anthropic.claude-3-5-sonnet-20241
 }
 ```
 
-快捷键使用 prompt_toolkit 的键名，空格分隔组合序列；每项覆盖对应默认值，重启后生效。重复绑定会报错。当前界面使用终端滚动记录配合多行编辑器和模态选择器，尚未实现 TS 版的全屏固定对话区、Markdown 富文本、图片内联显示或工具输出折叠。已用受控输入验证编辑、选择器和中止操作，尚未完成所有实际终端的人工验证。
+快捷键使用 prompt_toolkit 的键名，空格分隔组合序列；每项覆盖对应默认值，重启后生效。重复绑定会报错。`--tui fullscreen` 使用固定对话区，文本模式支持 ANSI Markdown 和工具输出折叠；当前尚未实现图片内联显示。已用受控输入验证编辑、选择器和中止操作，尚未完成所有实际终端的人工验证。
 
 ## Python 扩展
 
@@ -165,7 +165,7 @@ def setup(api):
     api.on("session_shutdown", lambda event, ctx: api.log("stopped"))
 ```
 
-`/greeting Alice` 返回的字符串会作为 prompt 发送给模型；返回 `None` 表示命令已处理、不启动模型。扩展命令优先于同名模板，不能覆盖内置命令。注册只允许在 `setup` 内完成，重名工具/命令或失败 factory 的注册整体丢弃，并给出 stderr 诊断。
+`/greeting Alice` 返回的字符串会作为 prompt 发送给模型；返回 `None` 表示命令已处理、不启动模型。扩展命令优先于同名模板，不能覆盖内置命令。扩展加载后仍可动态注册工具、Provider、虚拟模型和 MCP 服务；`refreshTools()` 发布新增工具。重名工具/命令或失败 factory 会给出 stderr 诊断。
 
 事件回调接受 `(event, ctx)`；`ctx` 提供 `agent`、`cwd` 和可选 `session`。支持 `session_start`、`session_shutdown`，以及 Agent 的 `agent_start/end`、`turn_start/end`、`message_start/update/end`、`tool_execution_start/update/end` 通知。`api.on` 返回取消订阅函数。通知异常仅记录诊断；回调按加载与注册顺序执行。
 
@@ -175,7 +175,9 @@ def setup(api):
 
 扩展同时作用于文本、JSON 和 RPC 模式。RPC `get_commands` 列出扩展命令，空闲时可调用 `reload_extensions`；通过 `prompt` 发送 `/命令`，纯本地处理返回 `disposition=handled`，此时不产生新的 `agent_settled`。
 
-扩展是本机 Python 代码，以 Pi 进程权限运行，没有沙箱或项目授权界面。扩展 factory、回调和注册工具内的普通 `print` 重定向到 stderr，推荐使用 `api.log`；自行创建的后台任务仍须自行管理输出和生命周期。TS/JS 扩展可通过 Node 桥接（`pi.coding_agent.ts_extension`，需 PATH 中的 Node 22.6+）加载：`registerTool/registerCommand/registerProvider/registerKeybinding/on/ui/appendEntry/sendMessage/log` 跨进程桥接，其余 TS 专用 API（TUI 渲染器、虚拟模型、MCP 注册、会话管理、`pi.events`、状态 getter 等）在调用时抛出明确错误而非静默缺失。Python `ExtensionAPI` 本身不包含 TUI 渲染器或 npm/git 包安装。
+扩展是本机 Python 代码，以 Pi 进程权限运行，没有沙箱或项目授权界面。扩展 factory、回调和注册工具内的普通 `print` 重定向到 stderr，推荐使用 `api.log`；自行创建的后台任务仍须自行管理输出和生命周期。TS/JS 扩展可通过 Node 桥接（`pi.coding_agent.ts_extension`，需 PATH 中的 Node 22.6+）加载。桥接支持工具、消息和会话条目渲染器、Markdown transformer、虚拟模型、动态 MCP、Provider 注销、`refreshTools`、事件总线、状态 getter 和扩展 CLI flag。渲染函数在 Node 侧执行，组件的 `render(width)` 结果作为终端行返回；依赖鼠标、焦点或原生 TS TUI 实例的交互组件仍不适用。
+
+扩展 flag 与 TS CLI 一样使用未知长参数的两阶段解析。`--flag` 传入布尔值，`--flag=value` 或 `--flag value` 传入字符串；扩展加载后校验名称和类型，未注册参数会报错。
 
 ## JSON 输出与 RPC
 
@@ -235,7 +237,7 @@ Python CLI 自动读取用户目录的 `mcp.json` 和项目 `.pi/mcp.json`。项
 
 服务工具以 `mcp__服务__工具_哈希` 名称直接注册给模型，支持工具列表分页、JSON Schema 参数、文本/图片、`structuredContent` 和 `isError`。配置或连接失败会输出诊断，其他服务仍可使用。`/mcp` 显示状态，`/mcp reconnect` 或 `/reload` 重连并重新发现工具；退出时关闭连接并终止本地进程树。工具调用不自动重试，避免重复副作用。
 
-当前为核心工具接入：尚不包含 MCP OAuth、资源列表/读取、codemode/deferred exposure、后台工具变更通知或自动断线重连。HTTP 服务可通过 headers 配置现有 Bearer token。本地配置中的服务会在启动时执行，不包含 TS 版的项目信任交互。
+扩展可用 `registerMcpServer`、`unregisterMcpServer` 和 `getMcpServers` 动态管理同一运行时的服务；变更会重建连接并刷新 Agent 工具。文件配置优先于同名扩展注册。当前尚不包含 codemode/deferred exposure 和 TS 版的项目信任交互。
 
 ## Skills 与提示词模板
 

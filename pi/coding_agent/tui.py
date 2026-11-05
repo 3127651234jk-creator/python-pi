@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -14,6 +15,10 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
+from prompt_toolkit.layout import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.screen import Point
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 
 from ..agent.agent import Agent
 
@@ -71,12 +76,17 @@ class AgentCompleter(Completer):
 class TerminalUI:
     def __init__(self, agent: Agent, commands: Callable[[], List[str]], settings: Optional[dict] = None,
                  input=None, output=None, extra_bindings: Optional[List[tuple]] = None,
-                 themes: Optional[dict] = None) -> None:
+                 themes: Optional[dict] = None, full_screen: bool = False) -> None:
         self.agent = agent
         self.commands = commands
         self.settings = settings or {}
         self.themes = themes or dict(THEMES)
         self.running = False
+        self.full_screen = full_screen
+        self.transcript = ""
+        self.status = ""
+        self.widgets = {"above": [], "below": []}
+        self.markdown_transform = None
         self.style = Style.from_dict(self.themes[self.settings.get("theme", "dark")])
         bindings = KeyBindings()
         keys = {**DEFAULT_KEYBINDINGS, **self.settings.get("keybindings", {})}
@@ -146,10 +156,54 @@ class TerminalUI:
             style=self.style, bottom_toolbar=self.toolbar, input=input, output=output,
             prompt_continuation=lambda width, line, wrap: "... ", refresh_interval=0.2,
         )
+        if full_screen:
+            editor = self.session.app.layout.container
+            conversation = FormattedTextControl(
+                lambda: to_formatted_text(ANSI(self.transcript)),
+                get_cursor_position=lambda: Point(
+                    len(self.transcript.rsplit("\n", 1)[-1]), self.transcript.count("\n")))
+            self.session.app.layout.container = HSplit([
+                Window(conversation, wrap_lines=True),
+                Window(FormattedTextControl(lambda: "\n".join(self.widgets["above"])),
+                       dont_extend_height=True),
+                editor,
+                Window(FormattedTextControl(lambda: "\n".join(self.widgets["below"])),
+                       dont_extend_height=True),
+            ])
+            self.session.app.full_screen = True
+
+    def write(self, text: str) -> int:
+        self.transcript += text
+        self.session.app.invalidate()
+        return len(text)
+
+    def flush(self) -> None:
+        self.session.app.invalidate()
+
+    def isatty(self) -> bool:
+        return True
+
+    async def ui_request(self, request: dict):
+        method = request["method"]
+        if method == "notify":
+            self.write(f"\n[{request.get('level', 'info')}] {request['message']}\n")
+        elif method == "setStatus":
+            self.status = request["text"]
+        elif method == "setWidget":
+            self.widgets[request["placement"]] = list(request["lines"])
+        elif method == "setTitle":
+            self.session.app.output.set_title(request["title"])
+        elif method == "select":
+            return await self.choose(request["title"], [(item, item) for item in request["options"]])
+        elif method == "confirm":
+            return await self.choose(request["message"], [("yes", "Yes"), ("no", "No")]) == "yes"
+        else:
+            raise ValueError(f"Unsupported terminal UI request: {method}")
+        self.session.app.invalidate()
 
     def toolbar(self):
         state = "running; input steers the agent" if self.running else "ready"
-        return [("class:bottom-toolbar", f" {self.agent.model.provider}/{self.agent.model.id} | {self.agent.thinking_level} | {state} ")]
+        return [("class:bottom-toolbar", f" {self.agent.model.provider}/{self.agent.model.id} | {self.agent.thinking_level} | {state} | {self.status} ")]
 
     def set_theme(self, name: str):
         if name not in self.themes:
@@ -159,8 +213,17 @@ class TerminalUI:
 
     async def read(self, running=False):
         self.running = running
-        with create_app_session(input=self.session.app.input, output=self.session.app.output), patch_stdout():
-            return await self.session.prompt_async([("class:prompt", "> ")])
+        with create_app_session(input=self.session.app.input, output=self.session.app.output), \
+                (nullcontext() if self.full_screen else patch_stdout()):
+            result = await self.session.prompt_async([("class:prompt", "> ")])
+        if self.full_screen and isinstance(result, str) and result:
+            shown = result
+            if self.markdown_transform is not None:
+                shown = self.markdown_transform(result)
+                if hasattr(shown, "__await__"):
+                    shown = await shown
+            self.write(f"\n> {shown}\n")
+        return result
 
     async def choose(self, title: str, values: List[Tuple[str, str]]) -> Optional[str]:
         if not values:

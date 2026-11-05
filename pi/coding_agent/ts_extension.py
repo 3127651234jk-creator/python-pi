@@ -19,9 +19,12 @@ to erasable syntax (the same rule pi's own TS sources follow). Node 22.6+
 with ``--experimental-strip-types`` or Node 23.6+ (stripping by default)
 works; when neither is available the extension is skipped with a notice.
 
+Session naming, thinking changes and tool/state snapshots are bridged.
+Synchronous getters read a snapshot refreshed before setup and each callback;
+mutations return promises so callers can observe host validation failures.
 Not every TS API is bridged: TUI renderers, virtual models, MCP server
-registration, session-management actions and most state getters stay
-unimplemented. Unsupported methods (including ``pi.events``) exist on the
+registration, session-navigation actions and some state getters stay
+unimplemented. Unsupported methods exist on the
 ``pi`` object but raise a clear error when an extension calls them, instead
 of failing as opaque TypeErrors.
 """
@@ -39,6 +42,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from ..agent.types import AgentTool, AgentToolResult, BeforeToolCallResult
 from ..ai.types import ImageContent, TextContent
+from ..ai.models import ModelError
+from .config import Configuration
+from .model_registry import ModelRegistry
 
 if TYPE_CHECKING:
     from .extensions import ExtensionAPI
@@ -118,6 +124,8 @@ class TsExtensionBridge:
         self.command_handlers: Dict[str, str] = {}
         self.event_handlers: Dict[str, str] = {}
         self.keybinding_handlers: Dict[str, str] = {}
+        self.renderer_handlers: List[str] = []
+        self.virtual_model_handlers: Dict[tuple, str] = {}
         self.closed = False
 
     async def start(self) -> None:
@@ -129,7 +137,12 @@ class TsExtensionBridge:
             stderr=None,  # extension stderr goes straight to the terminal
             limit=16 * 1024 * 1024)
         self.reader_task = asyncio.create_task(self._read_loop())
-        await self._request("start", {"path": str(self.path)}, SETUP_TIMEOUT)
+        self.api.context.event_receivers.append(self._receive_bus_event)
+        try:
+            await self._request("start", {"path": str(self.path), "context": self._context_payload()}, SETUP_TIMEOUT)
+        except Exception:
+            await self.close()
+            raise
 
     async def _request(self, method: str, params: dict, timeout: float = CALL_TIMEOUT) -> Any:
         if self.process is None or self.process.stdin is None:
@@ -154,21 +167,22 @@ class TsExtensionBridge:
             while True:
                 line = await self.process.stdout.readline()
                 if not line:
+                    self._unsubscribe_bus()
                     self._fail_pending("TS extension process exited")
                     return
                 try:
                     message = json.loads(line)
                 except ValueError:
                     continue
-                if message.get("id") in self.pending:
+                if message.get("method") is None and message.get("id") in self.pending:
                     future = self.pending.pop(message["id"])
+                    if future.done():
+                        continue
                     if message.get("error") is not None:
                         future.set_exception(RuntimeError(str(message["error"])))
                     else:
                         future.set_result(message.get("result"))
                     continue
-                if message.get("method") is not None:
-                    await self._handle_child_request(message)
                 method = message.get("method")
                 if method == "toolUpdate":
                     callback = self.updates.get((message.get("params") or {}).get("toolCallId", ""))
@@ -176,10 +190,15 @@ class TsExtensionBridge:
                         outcome = callback(result_from_json(message["params"].get("result") or {}))
                         if asyncio.iscoroutine(outcome):
                             await outcome
+                    continue
+                if method is not None:
+                    await self._handle_child_request(message)
         except asyncio.CancelledError:
             raise
         except (OSError, ValueError):
             self._fail_pending("TS extension bridge failed")
+        finally:
+            self._unsubscribe_bus()
 
     def _fail_pending(self, reason: str) -> None:
         for future in self.pending.values():
@@ -216,6 +235,8 @@ class TsExtensionBridge:
                     parameters=params.get("parameters") or {"type": "object", "properties": {}},
                     output_schema=params.get("outputSchema"),
                     execute=self._tool_execute(handler_id, params["name"])))
+                if params.get("rendererId"):
+                    api.register_tool_renderer(self._tool_renderer(params["rendererId"]))
             elif method == "registerCommand":
                 handler_id = params["handlerId"]
                 self.command_handlers[params["name"]] = handler_id
@@ -223,6 +244,35 @@ class TsExtensionBridge:
                                      description=params.get("description", ""))
             elif method == "registerProvider":
                 api.register_provider(params["name"], params.get("config") or {})
+            elif method == "unregisterProvider":
+                api.unregister_provider(params["name"])
+            elif method == "registerFlag":
+                api.register_flag(params["name"], params.get("options") or {})
+            elif method == "registerToolRenderer":
+                handler_id = params["handlerId"]
+                self.renderer_handlers.append(handler_id)
+                api.register_tool_renderer(self._tool_renderer(handler_id))
+            elif method == "registerMessageRenderer":
+                api.register_message_renderer(params["customType"],
+                                              self._content_renderer(params["handlerId"], "message"))
+            elif method == "registerEntryRenderer":
+                api.register_entry_renderer(params["customType"],
+                                            self._content_renderer(params["handlerId"], "entry"))
+            elif method == "registerMarkdownTransformer":
+                api.register_markdown_transformer(self._markdown_transformer(params["handlerId"]))
+            elif method == "registerVirtualModel":
+                definition = dict(params.get("definition") or {})
+                key = (definition.get("provider"), definition.get("id"))
+                handler_id = params["handlerId"]
+                self.virtual_model_handlers[key] = handler_id
+                definition["route"] = self._virtual_model_route(handler_id)
+                api.register_virtual_model(definition)
+            elif method == "unregisterVirtualModel":
+                api.unregister_virtual_model(params["provider"], params["id"])
+            elif method == "registerMcpServer":
+                await api.register_mcp_server(params["name"], params.get("config") or {})
+            elif method == "unregisterMcpServer":
+                await api.unregister_mcp_server(params["name"])
             elif method == "registerKeybinding":
                 handler_id = params["handlerId"]
                 self.keybinding_handlers[params["action"]] = handler_id
@@ -242,11 +292,73 @@ class TsExtensionBridge:
                 return
             elif method == "sendMessage":
                 entry_id = api.send_message(params.get("customType", ""), params.get("content", ""),
-                                            bool(params.get("display", True)))
+                                            bool(params.get("display", True)), params.get("details"))
                 await self._reply(request, {"id": entry_id})
                 return
             elif method == "log":
                 api.log(str(params.get("message", "")))
+            elif method == "setActiveTools":
+                if api.context.agent.is_streaming:
+                    raise RuntimeError("Changing tools requires an idle agent")
+                self._context_payload()
+                names = params["names"]
+                if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+                    raise ValueError("Tool names must be a string array")
+                api.context.agent.tools = [tool for name, tool in api.context.tool_catalog.items() if name in names]
+                await self._reply(request, self._context_payload())
+                return
+            elif method == "refreshTools":
+                api.refresh_tools()
+                await self._reply(request, self._context_payload())
+                return
+            elif method == "setModel":
+                if api.context.agent.is_streaming:
+                    raise RuntimeError("Changing models requires an idle agent")
+                registry = ModelRegistry(api.context.config or Configuration(str(api.context.cwd)))
+                selected = params["model"]
+                model = registry.resolve(selected["provider"], selected["id"])
+                try:
+                    await model.get_api_key(model.provider)
+                except ModelError:
+                    await self._reply(request, False)
+                    return
+                api.context.agent.model = model
+                if api.context.session:
+                    api.context.session.append_model_change(model.provider, model.id)
+                await self._reply(request, True)
+                return
+            elif method == "setLabel":
+                session = api.context.session
+                if session is None:
+                    raise RuntimeError("Session persistence is disabled")
+                if params["entryId"] not in {entry.id for entry in session.entries}:
+                    raise ValueError("Unknown entry ID")
+                label = params.get("label")
+                if label is not None and not isinstance(label, str):
+                    raise ValueError("Label must be a string")
+                session.append_custom("label", {"entryId": params["entryId"], "label": label})
+            elif method == "events.emit":
+                channel = params.get("channel")
+                if not isinstance(channel, str):
+                    raise ValueError("Event channel must be a string")
+                for receiver in list(api.context.event_receivers):
+                    try:
+                        await receiver(channel, params.get("data"))
+                    except (ConnectionError, OSError, RuntimeError) as exc:
+                        api.log(f"Event delivery failed ({channel}): {exc}")
+            elif method == "setSessionName":
+                if api.context.session is None:
+                    raise RuntimeError("Session persistence is disabled")
+                api.context.session.rename(str(params["name"]))
+            elif method == "setThinkingLevel":
+                level = params["level"]
+                if level not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
+                    raise ValueError("Invalid thinking level")
+                if api.context.agent.is_streaming:
+                    raise RuntimeError("Changing thinking requires an idle agent")
+                api.context.agent.thinking_level = level
+                if api.context.session is not None:
+                    api.context.session.append_thinking_change(level)
             else:
                 await self._reply(request, error=f"unsupported bridge method: {method}")
                 return
@@ -281,7 +393,18 @@ class TsExtensionBridge:
 
     def _context_payload(self) -> dict:
         context = self.api.context
-        return {"cwd": str(context.cwd), "hasSession": context.session is not None}
+        context.tool_catalog.update({tool.name: tool for tool in context.agent.tools})
+        commands = {**context.commands, **self.api.commands}
+        mcp_servers = context.mcp.registered_extension_servers() if context.mcp is not None else []
+        return {"cwd": str(context.cwd), "hasSession": context.session is not None,
+                "settings": context.config.settings if context.config else {},
+                "commands": [{"name": name, "description": item[1], "source": "extension"} for name, item in commands.items()],
+                "sessionName": context.session.name if context.session else None,
+                "thinkingLevel": context.agent.thinking_level,
+                "activeTools": [tool.name for tool in context.agent.tools],
+                "allTools": [{"name": tool.name, "description": tool.description,
+                              "parameters": tool.parameters} for tool in context.tool_catalog.values()],
+                "mcpServers": mcp_servers}
 
     def _tool_execute(self, handler_id: str, name: str):
         async def execute(call_id: str, params: dict, signal=None, on_update=None) -> AgentToolResult:
@@ -299,6 +422,38 @@ class TsExtensionBridge:
                 raise RuntimeError(str(payload["error"]))
             return result_from_json(payload or {})
         return execute
+
+    def _tool_renderer(self, handler_id: str):
+        async def render(tool_name: str, phase: str, payload: dict, options: dict, width: int):
+            result = await self._request("render", {"handlerId": handler_id, "kind": "tool",
+                "toolName": tool_name, "phase": phase, "payload": to_jsonable(payload),
+                "options": to_jsonable(options), "width": width,
+                "context": {"cwd": str(self.api.context.cwd), **options}})
+            return result.get("lines") if isinstance(result, dict) else None
+        return render
+
+    def _content_renderer(self, handler_id: str, kind: str):
+        async def render(payload: dict, options: dict, width: int):
+            result = await self._request("render", {"handlerId": handler_id, "kind": kind,
+                "payload": to_jsonable(payload), "options": to_jsonable(options), "width": width})
+            return result.get("lines") if isinstance(result, dict) else None
+        return render
+
+    def _markdown_transformer(self, handler_id: str):
+        async def transform(markdown: str, context: dict):
+            result = await self._request("render", {"handlerId": handler_id, "kind": "markdown",
+                "markdown": markdown, "context": context})
+            return result.get("markdown", markdown) if isinstance(result, dict) else markdown
+        return transform
+
+    def _virtual_model_route(self, handler_id: str):
+        async def route(request: dict):
+            return await self._request("routeVirtualModel", {"handlerId": handler_id,
+                "request": to_jsonable(request), "context": self._context_payload()})
+        return route
+
+    async def set_flag_values(self, values: dict) -> None:
+        await self._request("setFlags", {"values": values})
 
     def _command_handler(self, handler_id: str):
         async def handler(arguments: str):
@@ -341,10 +496,23 @@ class TsExtensionBridge:
     async def dispatch(self, request: dict) -> None:
         await self._handle_child_request(request)
 
+    async def _receive_bus_event(self, channel: str, data: object) -> None:
+        if self.closed or self.process is None or self.process.stdin is None:
+            return
+        self.process.stdin.write((json.dumps({"method": "busEvent", "params": {
+            "channel": channel, "data": data}}, ensure_ascii=False) + "\n").encode())
+        await self.process.stdin.drain()
+
+    def _unsubscribe_bus(self) -> None:
+        receivers = self.api.context.event_receivers
+        if self._receive_bus_event in receivers:
+            receivers.remove(self._receive_bus_event)
+
     async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
+        self._unsubscribe_bus()
         if self.process is not None and self.process.stdin is not None and self.process.returncode is None:
             try:
                 self.process.stdin.write(b'{"method":"shutdown"}\n')

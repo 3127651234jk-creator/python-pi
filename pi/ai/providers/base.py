@@ -70,7 +70,9 @@ def apply_model_params(body: Dict[str, Any], model: Model, options: Optional[Sim
         if options.temperature is not None:
             explicit.add("temperature")
         if options.max_tokens:
-            explicit.add("max_tokens")
+            explicit.update(("max_tokens", "max_output_tokens", "max_completion_tokens"))
+        if options.reasoning is not None:
+            explicit.update(("reasoning", "reasoning_effort", "thinking"))
     for key, value in (model.params or {}).items():
         if key not in explicit:
             body[key] = value
@@ -239,6 +241,7 @@ async def _drive_provider_stream(
                             done_emitted = True
                             yield converted
                         elif isinstance(converted, StreamErrorEvent):
+                            done_emitted = True
                             stop_reason = converted.reason
                             error_message = converted.error.error_message
                             yield converted
