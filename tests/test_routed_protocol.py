@@ -138,6 +138,145 @@ def test_identity_mismatch():
     asyncio.run(check())
 
 
+async def until(predicate, timeout=2.0):
+    async def wait():
+        while not predicate():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(wait(), timeout)
+
+
+class SessionEndpoint:
+    def __init__(self, handle):
+        self.handle = handle
+        self.released = False
+
+    async def invoke_service(self, call, publish, cancelled):
+        return call["args"]
+
+    async def release(self):
+        self.released = True
+
+
+class SessionHandle:
+    def __init__(self, metadata):
+        self.metadata = metadata
+        self.endpoints = []
+        self.closed = False
+        self.terminated = asyncio.get_running_loop().create_future()
+
+    async def attach_client(self):
+        endpoint = SessionEndpoint(self)
+        self.endpoints.append(endpoint)
+        return endpoint
+
+    async def close(self):
+        self.closed = True
+
+
+class RemovalEndpoint:
+    def __init__(self, host, presentation=None):
+        self.host, self.presentation = host, presentation
+        self.released = False
+
+    async def invoke_service(self, call, publish, cancelled):
+        if call["member"] == "attach":
+            await self.presentation.attach_session(call["args"][0])
+        elif call["member"] == "detach":
+            await self.presentation.detach_session()
+        elif call["member"] == "remove":
+            await self.presentation.prepare_session_removal(call["args"][0])
+        else:
+            return call["args"]
+
+    async def release(self):
+        self.released = True
+
+
+class SessionHost:
+    """Host with real per-session handles, for removal and termination tests."""
+
+    def __init__(self):
+        self.endpoints = []
+        self.opened = []
+        self.handles = {}
+
+    async def attach_client(self, presentation=None):
+        endpoint = RemovalEndpoint(self, presentation)
+        self.endpoints.append(endpoint)
+        return endpoint
+
+    async def resolve_session(self, identifier):
+        return {"id": identifier}
+
+    async def open_session(self, metadata):
+        handle = SessionHandle(metadata)
+        self.opened.append(handle)
+        self.handles[metadata["id"]] = handle
+        return handle
+
+
+def test_removal_releases_every_attachment_and_evicts():
+    async def check():
+        host = SessionHost()
+        server = Server(host)
+        address = await server.start_tcp()
+        target = {"serverId": server.server_id}
+        first = Client(server.server_id)
+        second = Client(server.server_id)
+        try:
+            await first.connect_tcp(*address[:2])
+            await second.connect_tcp(*address[:2])
+            def call(member, *args):
+                return {"serviceId": "mgmt", "member": member, "args": list(args)}
+            await first.request(target, call("attach", "s1"))
+            await second.request(target, call("attach", "s1"))
+            routes = [first.attachment, second.attachment]
+            handle = host.handles["s1"]
+            await first.request(target, call("remove", "s1"))
+            await until(lambda: first.attachment is None and second.attachment is None)
+            assert handle.closed
+            assert all(endpoint.released for endpoint in handle.endpoints)
+            with pytest.raises(ServerError) as error:
+                await first.request(routes[0], call("echo"))
+            assert error.value.code == "invalid_target"
+            # The evicted session opens a fresh handle on the next attach.
+            await first.request(target, call("attach", "s1"))
+            assert host.handles["s1"] is not handle
+            assert len(host.opened) == 2
+        finally:
+            await first.close()
+            await second.close()
+            await server.close()
+    asyncio.run(asyncio.wait_for(check(), 10))
+
+
+def test_unexpected_termination_invalidates_session():
+    async def check():
+        host = SessionHost()
+        server = Server(host)
+        address = await server.start_tcp()
+        target = {"serverId": server.server_id}
+        client = Client(server.server_id)
+        try:
+            await client.connect_tcp(*address[:2])
+            def call(member, *args):
+                return {"serviceId": "mgmt", "member": member, "args": list(args)}
+            await client.request(target, call("attach", "s1"))
+            route = client.attachment
+            handle = host.handles["s1"]
+            handle.terminated.set_result(RuntimeError("worker died"))
+            await until(lambda: client.attachment is None)
+            with pytest.raises(ServerError) as error:
+                await client.request(route, call("echo"))
+            assert error.value.code == "invalid_target"
+            await client.request(target, call("attach", "s1"))
+            assert host.handles["s1"] is not handle
+        finally:
+            await client.close()
+            await server.close()
+    asyncio.run(asyncio.wait_for(check(), 10))
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node unavailable")
 def test_typescript_codec_interop(tmp_path):
     codec = (Path(__file__).resolve().parents[2] / "packages/protocol/src/cbor/index.ts").as_uri()

@@ -27,7 +27,7 @@ class ToolDiagnostic:
 class ToolExecutionResult:
     """What one tool invocation reports. Omitted content falls back to the retained ``output()`` text."""
 
-    content: Optional[list] = None  # [{type: "text", text: str}] content blocks
+    content: Optional[list] = None  # [{"type": "text", "text": str} | {"type": "image", "data": base64 str, "mime_type": str}] blocks
     is_error: bool = False
     details: Optional[dict] = None
     diagnostics: Optional[list] = None  # extra ToolDiagnostic beyond api.diagnostic()

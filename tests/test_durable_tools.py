@@ -8,6 +8,7 @@ bash output bounding beyond the conformance cases.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
 
@@ -122,16 +123,43 @@ def test_read_offset_beyond_end(env):
         run(read.execute({"path": "small.txt", "offset": 99}, api, Context()))
 
 
-def test_read_refuses_images(env):
-    # Minimal PNG: signature + IHDR length and type; detected, then refused with a diagnostic.
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 40
+TINY_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+)
+
+
+def test_read_returns_images(env):
+    # A valid PNG is returned as a text note plus an image block, like the coding-agent read tool.
+    pytest.importorskip("PIL")
+    png = base64.b64decode(TINY_PNG_BASE64)
     read = create_read_tool()
     api = RecordingApi(env)
     with open(os.path.join(env.cwd, "image.png"), "wb") as handle:
         handle.write(png)
     result = run(read.execute({"path": "image.png"}, api, Context()))
-    assert result.is_error is True
-    assert result.diagnostics[0].code == "unsupported_image"
+    assert result.is_error is False
+    blocks = result.content or []
+    assert blocks[0]["type"] == "text" and blocks[0]["text"].startswith("Read image file [image/png]")
+    image = next(block for block in blocks if block["type"] == "image")
+    assert image["mime_type"] == "image/png"
+    # A 1x1 image fits the resize limits, so the bytes pass through unchanged.
+    assert image["data"] == TINY_PNG_BASE64
+
+
+def test_read_reports_undecodable_image(env):
+    # Signature + IHDR header only: detected as a PNG, but it cannot be decoded, so the
+    # result is the omission note as ordinary text, like the coding-agent read tool.
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 40
+    read = create_read_tool()
+    api = RecordingApi(env)
+    with open(os.path.join(env.cwd, "broken.png"), "wb") as handle:
+        handle.write(png)
+    result = run(read.execute({"path": "broken.png"}, api, Context()))
+    assert result.is_error is False
+    blocks = result.content or []
+    assert len(blocks) == 1 and blocks[0]["type"] == "text"
+    assert blocks[0]["text"].startswith("Read image file [image/png]")
+    assert "[Image omitted:" in blocks[0]["text"]
 
 
 def test_edit_unique_and_overlapping(env):

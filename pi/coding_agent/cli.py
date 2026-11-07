@@ -1150,7 +1150,29 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         await mcp.close()
 
 
+def _route_durable_command(argv: List[str]) -> Optional[int]:
+    """Delegate the routed-protocol commands, so installed ``pi <command>`` works too."""
+    first = argv[0]
+    if first == "durable":
+        from ..durable.cli import main as routed_main
+
+        return routed_main(argv[1:])
+    if first == "durable-worker":
+        from ..durable.worker import main as routed_main
+
+        return routed_main(argv[1:])
+    if first == "server":
+        from ..durable.server import main as routed_main
+
+        return routed_main(argv[1:])
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    forwarded = list(sys.argv[1:]) if argv is None else list(argv)
+    routed = _route_durable_command(forwarded)
+    if routed is not None:
+        return routed
     try:
         return asyncio.run(async_main(argv))
     except KeyboardInterrupt:

@@ -87,7 +87,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     harness = Harness(session, model)
-    register_builtin_tasks(harness, tools=create_default_tools("."))
+    register_builtin_tasks(harness, tools={tool.name: tool for tool in create_default_tools(".")})
 
     if args.command == "create":
         print(await harness.create_conversation())

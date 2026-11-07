@@ -29,6 +29,13 @@ class Client:
     async def connect_unix(self, path, timeout=10):
         return await self._connect(lambda: asyncio.open_unix_connection(path), timeout)
 
+    async def connect_streams(self, reader, writer, timeout=10):
+        """Connect over an existing byte-stream pair, e.g. a worker process's stdio."""
+        async def factory():
+            return reader, writer
+
+        return await self._connect(factory, timeout)
+
     async def _connect(self, factory, timeout):
         if self.writer is not None:
             raise RuntimeError("Client is already connected")

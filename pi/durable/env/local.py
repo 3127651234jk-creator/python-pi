@@ -8,7 +8,10 @@ Porting deviations from the Node implementation:
 - positional reads on one reader serialize through a lock (``seek`` + ``read``
   share the handle's cursor, unlike Node's position reads);
 - ``file://`` paths are not resolved;
-- the legacy WSL ``bash -s`` stdin transport is kept.
+- the legacy WSL ``bash -s`` stdin transport is kept;
+- watching defaults to ``native`` on every platform, where Node polls on
+  Windows: the watcher holds no handle on a watched target itself there (see
+  ``watch.py``), so renaming watched paths and their parents keeps working.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ from . import (
     ok,
 )
 from .line_scan import LineScanner
-from .watch import PollingFileWatcher
+from .watch import DEFAULT_MAX_DIRECTORIES, DEFAULT_POLL_INTERVAL_MS, LocalFileWatcher
 
 MAX_TIMEOUT_MS = 2_147_483_647
 MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000
@@ -483,12 +486,16 @@ class LocalExecutionEnv:
         cwd: str,
         shell_path: Optional[str] = None,
         shell_env: Optional[Dict[str, str]] = None,
-        watch_interval_ms: int = 250,
+        watch_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
+        watch_mode: str = "auto",  # "auto" | "native" | "polling"
+        watch_max_directories: int = DEFAULT_MAX_DIRECTORIES,
     ) -> None:
         self.cwd = cwd
         self._shell_path = shell_path
         self._shell_env = shell_env
         self._watch_interval_ms = watch_interval_ms
+        self._watch_mode = watch_mode
+        self._watch_max_directories = watch_max_directories
         self._active_children: set = set()
 
     # -- paths ----------------------------------------------------------------
@@ -506,11 +513,13 @@ class LocalExecutionEnv:
         if aborted is not None:
             return aborted
         try:
-            watcher = PollingFileWatcher(
+            watcher = await LocalFileWatcher.open(
                 list(targets),
                 lambda path: resolve_path(self.cwd, path),
                 on_change,
-                interval_ms=self._watch_interval_ms,
+                mode=self._watch_mode,
+                poll_interval_ms=self._watch_interval_ms,
+                max_directories=self._watch_max_directories,
             )
         except Exception as exc:  # noqa: BLE001
             return err(to_file_error(exc))

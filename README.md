@@ -477,7 +477,7 @@ asyncio.run(main())
 
 | Python 模块 | TS 源 | 内容 |
 | --- | --- | --- |
-| `pi.durable.env` | `packages/durable/src/env` | 可移植执行环境契约（`ExecutionEnv`：文件系统 + shell + watch，`Result` 化错误）与本地实现 `LocalExecutionEnv`（asyncio + os，Windows 打开文件带 FILE_SHARE_DELETE，支持打开期间改名）；流式 UTF-8 解码（BOM/非法序列与一次性解码一致）、有界内存行扫描 `LineScanner`、轮询 `PollingFileWatcher`（TS 为原生 watcher + 轮询回退，Python 仅轮询，`mode="polling"`） |
+| `pi.durable.env` | `packages/durable/src/env` | 可移植执行环境契约（`ExecutionEnv`：文件系统 + shell + watch，`Result` 化错误）与本地实现 `LocalExecutionEnv`（asyncio + os，Windows 打开文件带 FILE_SHARE_DELETE，支持打开期间改名）；流式 UTF-8 解码（BOM/非法序列与一次性解码一致）、有界内存行扫描 `LineScanner`、`LocalFileWatcher`（`env/node-watch.ts` 的移植：原生事件只触发防抖重扫，上报 = 快照 diff ∪ 事件路径，原生失败落轮询并报 `overflow`；后端为标准库 ctypes——Windows `ReadDirectoryChangesW`、Linux inotify、macOS FSEvents。与 TS 的偏离：Windows 默认 native，句柄只开在 target 的最近存在祖先目录上（TS 因句柄阻塞祖先改名而在 Windows 轮询），另配 2s 重扫定时器自愈覆盖；`watch_mode="auto"/"native"/"polling"` 可强制） |
 | `pi.durable.tools` | `packages/durable/src/tools` | 持久化编码工具 `read`/`write`/`edit`/`bash`：跑在 `ExecutionEnv` 上而非宿主进程；read 截断走诊断（内容只有文件文本）、edit 精确唯一匹配（模糊归一 + 未改动行保留 + BOM/CRLF 保留）、bash 流式输出 + 尾窗口（跳过计数精确）+ 溢出落盘 + 超时/中止进程树终结；同文件 `edit`/`write` 经变更队列串行化 |
 | `pi.durable.testing` | `packages/durable/src/testing` | 一致性套件：`create_storage_conformance`（23 个用例 × 任意后端）、`create_env_conformance`（21 个用例 × 任意 ExecutionEnv）、`createExpectAssertions` 对应的 `ConformanceAssertions`、存储基准（`seed_storage_benchmark`/`measure_*_benchmarks`）与 pytest 适配（`runner.py`）；套件与测试运行器无关，`tests/test_durable_*_conformance.py` 驱动 |
 
@@ -534,7 +534,7 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 库调用可通过 `Agent(..., compaction=CompactionSettings(...))` 配置；从 `pi.agent.compaction` 导入 `CompactionSettings`。默认 `reserve_tokens=16384`、`keep_recent_tokens=20000`、`summary_tokens=2048`，可设置 `enabled=False` 关闭。未知模型应准确设置 `model.context_window`。Token 数使用 UTF-8 长度估算，并非模型的精确分词结果。
 
 - TS TUI 的全屏对话布局、富文本/图片渲染与工具输出折叠；Python 已有多行编辑、补全、选择器、主题及快捷键
-- codemode、协议/服务器等包；扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）
+- codemode 包；扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）。路由协议（pi.protocol/pi.server/pi.client）、Chord 服务层（pi.chord：契约绑定、$chord.service 控制调用、delta wire 编解码、provider/consumer，见 ROUTED_PROTOCOL.md）与 durable coding-agent 服务宿主（`pi server` 入口、每会话 worker 进程、退出监控、会话移除管理）已实现；Python 客户端 ↔ TS 服务端、TS 客户端 ↔ Python 服务端的真实互通由 tests/test_chord_interop.py 以 Node 直接加载 TS 源码验证
 - prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）与嵌套工具调用的记录/用量聚合（TS nested-tool-calls）
 - 其他 provider 的专属认证；已实现 Claude、Codex、Copilot 订阅登录、OpenRouter PKCE 及可配置标准设备码 OAuth
 - 模型目录只内置少量常见型号，任意 id 会以默认参数运行

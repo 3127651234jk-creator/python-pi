@@ -2,6 +2,10 @@
 
 Reads text files through the environment's ``BinaryReader``; remarks about
 truncation and continuation are diagnostics, the content is only file text.
+
+Deviation from the TS tool: supported image files are returned as image
+content blocks, processed like the coding-agent read tool (normalization and
+resize via ``pi.images``); the TS tool refuses them.
 """
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Optional
 
+from ...images import process_image
 from ..env import BinaryReader, Context, FileInfo, get_or_throw, range_decoder, starts_with_bom
 from ..output import character_end
 from ..truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationResult, format_size, truncate_head_of, utf8_byte_length
@@ -29,8 +34,9 @@ READ_SCHEMA = {
 READ_CHUNK = 64 * 1024
 
 READ_DESCRIPTION = (
-    f"Read the contents of a text file. Output is truncated to {DEFAULT_MAX_LINES} lines or "
-    f"{DEFAULT_MAX_BYTES // 1024}KB (whichever is hit first). Use offset/limit for large files. "
+    "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp); "
+    f"images are returned as image content blocks. For text files, output is truncated to {DEFAULT_MAX_LINES} lines "
+    f"or {DEFAULT_MAX_BYTES // 1024}KB (whichever is hit first). Use offset/limit for large files. "
     "When you need the full file, continue with offset until complete."
 )
 
@@ -111,18 +117,7 @@ async def _read_text(
 
     mime_type = await detect_supported_image_mime_type_of(_Source())
     if mime_type:
-        # Image content is not supported yet.
-        return ToolExecutionResult(
-            content=[],
-            is_error=True,
-            diagnostics=[
-                ToolDiagnostic(
-                    severity="error",
-                    code="unsupported_image",
-                    message=f"{path} is an image ({mime_type}); reading images is not supported",
-                )
-            ],
-        )
+        return await _read_image(reader, info, mime_type, context)
 
     start_line = max(0, offset - 1) if offset else 0
     start_line_display = start_line + 1
@@ -224,6 +219,33 @@ async def _read_text(
         content=[] if output_text == "" else [{"type": "text", "text": output_text}],
         details=details,
         diagnostics=diagnostics,
+    )
+
+
+async def _read_image(reader: BinaryReader, info: FileInfo, mime_type: str, context: Context) -> ToolExecutionResult:
+    """The coding-agent read result for an image file: a text note plus the processed image block."""
+    chunks: List[bytes] = []
+    position = 0
+    while position < info.size:
+        data: bytes = get_or_throw(await reader.read(position, min(READ_CHUNK, info.size - position), context))
+        if len(data) == 0:
+            break
+        chunks.append(data)
+        position += len(data)
+    processed = await process_image(b"".join(chunks), mime_type)
+    if not processed.ok:
+        # A failed conversion or resize is an ordinary result with the omission note, like the coding-agent tool.
+        return ToolExecutionResult(
+            content=[{"type": "text", "text": f"Read image file [{mime_type}]\n{processed.message}"}]
+        )
+    text = f"Read image file [{processed.mime_type}]"
+    if processed.hints:
+        text += "\n" + "\n".join(processed.hints)
+    return ToolExecutionResult(
+        content=[
+            {"type": "text", "text": text},
+            {"type": "image", "data": processed.data, "mime_type": processed.mime_type},
+        ],
     )
 
 
