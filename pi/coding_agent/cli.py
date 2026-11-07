@@ -72,7 +72,9 @@ CRASH_CONTEXT: dict = {}
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pi", description="pi-python coding agent")
     parser.add_argument("prompt", nargs="*", help="Prompt to run once (omit for interactive mode)")
-    parser.add_argument("--provider", help="anthropic | openai (OpenAI-compatible) | faux")
+    parser.add_argument("--provider", help="Provider id: openai, anthropic, openrouter, google, google-vertex, "
+                                           "openai-responses, azure-openai, azure-openai-responses, amazon-bedrock, "
+                                           "openai-codex, github-copilot, kimi-coding, xai, radius, faux or models.json entry")
     parser.add_argument("--model", help="Model id, e.g. gpt-4o-mini or claude-sonnet-4-5-20250929")
     parser.add_argument("--base-url", help="Override the provider API base URL")
     parser.add_argument("--api-key", help="API key (defaults to provider environment variables)")

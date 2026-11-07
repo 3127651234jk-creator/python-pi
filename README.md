@@ -1,13 +1,13 @@
 # pi-python
 
-pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不是 1:1 复刻整个 monorepo，而是用 Python 忠实还原 pi 的三层核心：Provider 流式协议、agent loop、以及四个编码工具，可直接运行。
+pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不是 1:1 复刻整个 monorepo，而是用 Python 忠实还原 pi 的三层核心：Provider 流式协议、agent loop、以及编码工具（`read`/`write`/`edit`/`bash` 加 `grep`/`find`/`ls`/`powershell`），可直接运行。
 
 ## 与 TS 版的对应关系
 
 | Python 模块 | TS 源 | 内容 |
 | --- | --- | --- |
 | `pi.ai.types` | `packages/ai/src/types.ts` | 四角色消息模型（system/user/assistant/toolResult）、内容块、Usage、事件协议 |
-| `pi.ai.providers` | `packages/ai/src/api/*`、`providers/*` | `anthropic-messages` 与 `openai-completions`（覆盖所有 OpenAI 兼容端点）的 SSE 流式适配 + `faux` 脚本化测试 provider |
+| `pi.ai.providers` | `packages/ai/src/api/*`、`providers/*` | `anthropic-messages`、`openai-completions`、`openai-responses`、`google-generative-ai`、`google-vertex`、`azure-openai`、`azure-openai-responses`、`bedrock-converse-stream`、`pi-messages`（Radius 网关）的流式适配 + `faux` 脚本化测试 provider |
 | `pi.ai.utils` | `packages/ai/src/utils` | `normalize_context`（系统消息重放折叠）、`get_tool_state_changes`（工具集增量声明）、JSON Schema 参数校验 |
 | `pi.agent.agent_loop` | `packages/agent/src/agent-loop.ts` | 主循环：steering/follow-up 队列、顺序/并行工具执行、`beforeToolCall`/`afterToolCall` 钩子、截断消息失败、错误/中止处理 |
 | `pi.agent.agent` | `packages/agent/src/agent.ts` | 有状态 Agent：transcript、队列、事件订阅、prompt/abort |
@@ -15,6 +15,8 @@ pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不�
 | `pi.coding_agent.system_prompt` | `coding-agent/src/core/system-prompt.ts` | 分节系统提示词 + AGENTS.md 项目上下文 |
 | `pi.coding_agent.session` | `coding-agent/src/core/session-manager.ts` | JSONL 会话树、分支、切换、命名、导出、`--continue` 恢复 |
 | `pi.coding_agent.cli` | `coding-agent/src/cli` | 单次模式 + 交互 REPL + 斜杠命令 + Ctrl+C 中止 |
+| `pi.coding_agent.codemode` | `packages/codemode` | codemode 工具：模型编写的 Python 在隔离子进程中经 Agent 管线组合调用其他工具，含按 token 预算的延迟暴露 |
+| `pi.coding_agent.catalog_sync` / `pi.coding_agent.radius_catalog` | models.dev 目录 + `packages/ai/src/providers/radius-config.ts` | 在线模型目录同步与 Radius 网关发现，缓存叠加进模型注册表 |
 | `pi.evals.harness` | `packages/evals/src/harness.ts` | 隔离评测 harness：临时工作区、凭据注入、会话录制、用量统计、POSIX 工具沙箱、文档变体 |
 | `pi.evals.plan` | `packages/evals/src/plan.ts` | 发现用例解析与 (case, variant, run) 任务计划 |
 | `pi.evals.report` | `packages/evals/src/report.ts` | 观察读取、成对配对、lift/标记/运营总量与文本报告 |
@@ -48,58 +50,86 @@ python -m pi --provider anthropic "explain pyproject.toml"
 python -m pi --provider faux "hello"
 ```
 
-常用参数：`--provider anthropic|openai|faux`、`--model <id>`、`--base-url`、`--api-key`、`--thinking off|low|medium|high`、`-c` 继续上次会话、`--no-session` 不落盘。
+常用参数：`--provider <id>`、`--model <id>`、`--base-url`、`--api-key`、`--thinking off|minimal|low|medium|high|xhigh|max`、`-c` 继续上次会话、`--no-session` 不落盘、`--sync-models` 同步在线模型目录。
 
-CLI 还内置 `openrouter`，并可从 `models.json` 注册其他兼容 provider。
+CLI 还内置 `openai`、`anthropic`、`openrouter`、`google`、`openai-responses`、`google-vertex`、`azure-openai`、`azure-openai-responses`、`amazon-bedrock`、`openai-codex`、`github-copilot`、`kimi-coding`、`xai`、`radius`、`faux`，并可从 `models.json` 注册其他兼容 provider。
 
 环境变量也可用 `PI_PY_PROVIDER` / `PI_PY_MODEL` / `PI_PY_API_KEY` / `PI_PY_BASE_URL`。
 
-交互模式（不带 prompt 参数）支持斜杠命令：
+交互模式（不带 prompt 参数）支持斜杠命令（`/help` 显示完整列表）：
 
 ```text
-/model <id>   切换模型
-/clear        清空对话（保留系统提示词）
-/new          新建会话
-/resume       列出会话（显示 ID、名称和消息数）
-/resume <id>  切换会话，也可提供完整文件路径
-/session      查看当前会话路径、名称、活动节点和消息数
-/name <name>  命名当前会话
-/tree         显示全部分支与消息 ID，* 标记活动节点
-/tree <id>    回到指定消息之后；下一次输入创建新分支
-/fork <id>    将指定消息及其祖先复制为独立会话
-/clone        将当前活动分支复制为独立会话
+/model <id>    切换模型
+/models        列出模型与能力参数
+/thinking [level]  查看或设置 thinking 级别
+/clear         清空对话（保留系统提示词）
+/compact [instructions]  立即摘要较早的上下文
+/image [model] <prompt>  经 openrouter-images 生成图片
+/sync-models   刷新在线模型目录缓存
+/evals <file>  对当前 agent 运行评测用例
+/package [install <source>|update <name>|remove <name>|list]  管理资源包
+/new           新建会话
+/resume        列出会话（显示 ID、名称和消息数）
+/resume <id>   切换会话，也可提供完整文件路径
+/session       查看当前会话路径、名称、活动节点和消息数
+/name <name>   命名当前会话
+/tree          显示全部分支与消息 ID，* 标记活动节点
+/tree <id>     回到指定消息之后；下一次输入创建新分支
+/fork <id>     将指定消息及其祖先复制为独立会话
+/clone         将当前活动分支复制为独立会话
 /export <path.jsonl|path.html|path.md>  导出当前活动分支
-/usage        说明
-/trust        保存当前目录的项目信任决策
-/bug [hint]   上传或导出 bug 报告（环境元数据 + 失败诊断，脱敏）
+/export-ts <path.jsonl>  按 TS pi 会话格式导出活动分支
+/usage         累计 token 用量与成本
+/trust         保存当前目录的项目信任决策
+/bug [hint]    上传或导出 bug 报告（环境元数据 + 失败诊断，脱敏）
 /help /exit
-Ctrl+C        中止当前运行
+Ctrl+C         中止当前运行
 ```
 
 ## 原生模型协议
 
-除原有 Chat Completions 和 Anthropic Messages 外，已接入三个专用 API：
+除原有 Chat Completions 和 Anthropic Messages 外，已接入以下专用 API：
 
 | provider | API | 认证 |
 | --- | --- | --- |
 | `openai-responses` | `openai-responses` | `OPENAI_API_KEY`、`--api-key` 或该 provider 的已保存凭据 |
 | `google` | `google-generative-ai` | `GEMINI_API_KEY`、`--api-key` 或已保存凭据 |
+| `google-vertex` | `google-vertex` | Google Cloud 服务账号：`GOOGLE_APPLICATION_CREDENTIALS` 指向 JSON 密钥；`GOOGLE_OAUTH_ACCESS_TOKEN` 可直接提供已签发的 token |
 | `amazon-bedrock` | `bedrock-converse-stream` | boto3 的 AWS 凭据链，支持环境变量、profile 和角色凭据 |
+| `azure-openai` | `azure-openai`（Chat Completions 传输） | `AZURE_OPENAI_API_KEY`（`api-key` 头）或 Entra ID（`AZURE_ACCESS_TOKEN`，Bearer） |
+| `azure-openai-responses` | `azure-openai-responses` | 同上 |
+| `radius` | `pi-messages`（Radius 网关协议） | `python -m pi --login radius`（浏览器或设备码 OAuth）或 `RADIUS_API_KEY` |
 
 ```bash
 python -m pi --provider openai-responses --model gpt-4o-mini "hello"
 python -m pi --provider google --model gemini-2.5-flash "hello"
 pip install -e ".[bedrock]"
 python -m pi --provider amazon-bedrock --model anthropic.claude-3-5-sonnet-20241022-v2:0 "hello"
+python -m pi --provider google-vertex --model gemini-2.5-flash "hello"
+python -m pi --provider azure-openai --model gpt-4o "hello"
 ```
 
 示例型号用于展示参数，不保证账号、地区或上游当前开放访问。Bedrock 使用 `AWS_REGION` / `AWS_DEFAULT_REGION`，未设置时默认为 `us-east-1`；`--base-url` 可覆盖端点。AWS 密钥不写入 Pi 的 `auth.json`。Bedrock 的可选 boto3 版本固定为兼容 Python 3.9 的 `1.40.75`。
 
-三种适配均支持流式文本、工具调用、输入图片、工具结果、停止原因及用量映射。Responses 支持 reasoning summary 和加密 reasoning 条目回放，并支持内置托管工具（`Tool.hosted`，如 `{"type": "web_search"}`）：调用输出项原文保存在 `ToolCall.raw_item` 中，后续请求原样回放；Gemini 保存工具调用的 thought signature，以便恢复会话后回传。Bedrock 支持 ConverseStream reasoning 内容回放，Claude 模型配置 `reasoning=true` 后可使用 thinking budget；其他模型专用推理参数经 `models.json` 的 `params` 逐键注入 Converse 请求（与内建键一层合并，显式选项优先），`top_k` 按家族自动路由（Nova 为 `additionalModelRequestFields.inferenceConfig.topK`，其余为扁平 `additionalModelRequestFields.top_k`）。
+各协议的差异：
 
-`models.json` 的 `api` 现在还可指定上述三个新 API，适用于自定义端点；内置 `openai` 默认协议仍为 Chat Completions。未知的原生 provider 模型 ID 可以使用，但需要在 `models.json` 中补准确的上下文窗口、输出限制和能力参数。
+- Vertex 复用 Gemini `generateContent` 的请求构造与 SSE 转换，改用服务账号签名 RS256 JWT 换取 OAuth token（纯标准库实现，无额外依赖）；项目与区域取 `GOOGLE_CLOUD_PROJECT` / `VERTEX_PROJECT` / `GCP_PROJECT` 与 `GOOGLE_CLOUD_REGION` / `VERTEX_REGION`（默认 `us-central1`），端点在请求时构造。
+- Azure 端点取 `AZURE_OPENAI_ENDPOINT` 或 `AZURE_OPENAI_RESOURCE_NAME`（拼为 `https://<资源名>.openai.azure.com`），部署名走 URL 路径；`api-version` 来自 models.json `params` 的 `api_version` 或 `AZURE_OPENAI_API_VERSION`（Chat Completions 默认 `2024-10-21`，Responses 默认 `v1`）。Entra 认证使用 `AZURE_ACCESS_TOKEN`。
+- Radius（`pi-messages`）是 camelCase 转录与 SSE 事件的网关协议；网关默认 `https://radius.pi.dev`，可经 `RADIUS_GATEWAY` 或凭据记录覆盖，令牌过期自动刷新。
+- 三种 Responses 适配（openai-responses、openai-codex-responses、azure-openai-responses）支持 reasoning summary 和加密 reasoning 条目回放，并支持内置托管工具（`Tool.hosted`，如 `{"type": "web_search"}`）：调用输出项原文保存在 `ToolCall.raw_item` 中，后续请求原样回放；Gemini 保存工具调用的 thought signature，以便恢复会话后回传。Bedrock 支持 ConverseStream reasoning 内容回放，Claude 模型配置 `reasoning=true` 后可使用 thinking budget；其他模型专用推理参数经 `models.json` 的 `params` 逐键注入 Converse 请求（与内建键一层合并，显式选项优先），`top_k` 按家族自动路由（Nova 为 `additionalModelRequestFields.inferenceConfig.topK`，其余为扁平 `additionalModelRequestFields.top_k`）。
 
-实现参考 [OpenAI Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)、[Google generateContent](https://ai.google.dev/api/generate-content) 和 [AWS ConverseStream](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-runtime/client/converse_stream.html)。验证使用模拟 SSE 和 AWS 事件流，未执行真实付费请求。当前不包含 Vertex AI、Azure 专用认证或自动模型目录同步。音视频输入（`AudioContent`/`VideoContent`，`@file` 附件按扩展名识别）按 provider 支持情况转换：Gemini 音频与视频均走 `inlineData`；OpenAI 系仅音频且只接受 wav/mp3；Anthropic 与 Bedrock Converse 不支持并会报错。
+全部适配均支持流式文本、工具调用、输入图片、工具结果、停止原因及用量映射。`models.json` 的 `api` 可指定上述任一原生 API，适用于自定义端点；内置 `openai` 默认协议仍为 Chat Completions。未知的原生 provider 模型 ID 可以使用，但需要在 `models.json` 中补准确的上下文窗口、输出限制和能力参数。
+
+实现参考 [OpenAI Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)、[Google generateContent](https://ai.google.dev/api/generate-content) 和 [AWS ConverseStream](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-runtime/client/converse_stream.html)。验证使用模拟 SSE 和 AWS 事件流，未执行真实付费请求。音视频输入（`AudioContent`/`VideoContent`，`@file` 附件按扩展名识别）按 provider 支持情况转换：Gemini 音频与视频均走 `inlineData`；OpenAI 系仅音频且只接受 wav/mp3；Anthropic 与 Bedrock Converse 不支持并会报错。
+
+## 模型目录同步
+
+模型目录由三部分合并：内置目录、用户/扩展定义（`models.json` 优先于扩展注册）、在线目录缓存。在线同步有两个来源：
+
+- models.dev 公共目录：覆盖 `anthropic`、`openai`、`google`、`google-vertex`、`azure-openai`、`amazon-bedrock`、`openrouter` 七个 provider，为用户与扩展都未显式配置的 provider 补充型号（上下文窗口、输出限制、价格）。触发方式为 `--sync-models` 参数、交互 `/sync-models` 命令或 RPC `sync_models`；结果缓存在 agent 目录的 `models-cache.json`，有效期 7 天，过期前 reload 直接读缓存。
+- Radius 网关发现：启动时尽力刷新（`PI_OFFLINE=1` 或 `sync_catalog: false` 跳过；`/login radius` 成功后也会刷新一次），从网关 `/v1/config` 读取模型与 `baseUrl`，缓存在 `radius-cache.json`；发现的型号叠加到 `radius` provider，用户在 `models.json` 声明的同 id 条目仍优先。
+
+settings 的 `sync_catalog: false` 同时关闭两个缓存叠加（缓存文件保留）。与 TS 版的差异：TS 在每次启动时刷新 models.dev 目录，Python 版仅在显式触发或缓存有效期内叠加。
 
 ## 终端界面
 
@@ -196,7 +226,7 @@ def setup(api):
 
 响应格式为 `{"type":"response","id":"1","command":"get_state","success":true,"data":{...}}`。失败时 `success=false` 并携带 `error`；非法 JSON 返回 `command=parse`，服务继续处理下一行。`prompt` 响应只表示接受请求，完成要等待 `agent_settled`。运行中可读取状态、发送 `steer` / `follow_up` 或 `abort`；第二个普通 prompt 会被拒绝。关闭 stdin 请求退出，服务中止活动运行并清理 MCP 连接。
 
-当前支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_state`、`get_messages`、`get_tools`、`get_available_models`、`set_model`、`set_thinking_level`、`new_session`、`switch_session`、`fork`、`clone`、`get_tree`、`get_entries`、`set_session_name`、`export`。会话命令要求启用持久化；修改模型和会话要求 Agent 空闲。参数分别使用 `message`、`model`/`provider`、`level`、`path`、`entry_id` 或 `name`。`export` 根据路径扩展名导出 JSONL、HTML 或 Markdown。
+当前支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_state`、`get_messages`、`get_tools`、`get_available_models`、`set_model`、`set_thinking_level`、`new_session`、`switch_session`、`fork`、`clone`、`get_tree`、`get_entries`、`set_session_name`、`export`、`sync_models`、`reload_extensions`。会话命令要求启用持久化；修改模型、会话和 `sync_models` 要求 Agent 空闲。参数分别使用 `message`、`model`/`provider`、`level`、`path`、`entry_id` 或 `name`。`export` 根据路径扩展名导出 JSONL、HTML 或 Markdown。
 
 事件和消息字段采用 Python 的 snake_case，例如 `assistant_message_event`、`tool_call_id`。这是 Python 版协议的核心子集，不保证与 TS 全部命令及 camelCase 字段兼容，也不提供网络监听服务或扩展 UI 协议。
 
@@ -240,7 +270,26 @@ Python CLI 自动读取用户目录的 `mcp.json` 和项目 `.pi/mcp.json`。项
 
 服务工具以 `mcp__服务__工具_哈希` 名称直接注册给模型，支持工具列表分页、JSON Schema 参数、文本/图片、`structuredContent` 和 `isError`。配置或连接失败会输出诊断，其他服务仍可使用。`/mcp` 显示状态，`/mcp reconnect` 或 `/reload` 重连并重新发现工具；退出时关闭连接并终止本地进程树。工具调用不自动重试，避免重复副作用。
 
-扩展可用 `registerMcpServer`、`unregisterMcpServer` 和 `getMcpServers` 动态管理同一运行时的服务；变更会重建连接并刷新 Agent 工具。文件配置优先于同名扩展注册。当前尚不包含 codemode/deferred exposure 和 TS 版的项目信任交互。
+扩展可用 `registerMcpServer`、`unregisterMcpServer` 和 `getMcpServers` 动态管理同一运行时的服务；变更会重建连接并刷新 Agent 工具。文件配置优先于同名扩展注册。
+
+## Codemode
+
+`packages/codemode` 的移植版（`pi.coding_agent.codemode`）。settings 中配置后启用：
+
+```json
+{
+  "codemode": {
+    "enabled": true,
+    "timeout_ms": 120000
+  }
+}
+```
+
+启用后 Agent 多出一个 `codemode` 工具：模型写一段 Python，代码在隔离的 `python -I` 子进程中运行，只能通过 JSON 行协议调用宿主；宿主再经 Agent 正常管线执行工具调用，因此校验、钩子与权限检查全部生效。子进程不提供网络、进程或定时器原语。工具目录覆盖启用时已注册的全部工具（含 MCP 工具）。
+
+脚本契约：`tools.<name>(args)` 阻塞调用单个工具；`tools.<name>.start(args)` / `pi.call(...)` 启动调用返回句柄，`wait(handle)` / `wait_all(...)` / `wait_any(...)` 组合并发；`ALL_TOOLS` 列出全部工具；`text(value)` / `image(dataUri)` / `print(...)` / `console.*` 追加输出项；`exit(value)` 立即结束；`store(key, value)` / `load(key)` 跨调用保存小体积 JSON 值（成功脚本以 `codemode-store` 会话条目持久化，失败脚本保留输出但不落盘）；可选首行 `# @options: {"timeout_ms": .., "max_output_tokens": ..}` 控制超时与输出预算。
+
+延迟暴露（deferred exposure）：工具目录按 MCP 命名空间分组、按 token 预算截取（默认 3000 token，超出部分不内联列出）；未列出的工具经 `search_tools(query, {limit, namespace})`、`describe_tool(name)`、`describe_namespace(name)` 按需查找。输出超过 `max_output_tokens`（默认 10000）时保留首尾并截断，完整输出落盘到临时文件。
 
 ## Skills 与提示词模板
 
@@ -282,7 +331,9 @@ Review the changes. Focus on ${1:-correctness and tests}.
 
 用户或项目 `settings.json` 可以添加 `skills`、`prompts` 路径数组，接受目录或单独 Markdown 文件；相对路径以该设置文件所在目录为基准。设置 `include_default_resources: false` 可关闭默认目录发现，仅加载显式路径。`enable_skill_commands: false` 只隐藏 `/help` 中的 skill 命令，手工输入仍可调用。
 
-同名资源保留首次发现的条目并输出警告。优先次序为显式项目路径、显式用户路径、项目默认目录、用户默认目录及 Agent Skills 目录。无效 YAML、缺少描述的 skill、空正文和模板占用内置命令等情况会跳过并输出诊断。当前不包含 npm/git 资源包安装或 TUI 补全。
+同名资源保留首次发现的条目并输出警告。优先次序为显式项目路径、显式用户路径、项目默认目录、用户默认目录及 Agent Skills 目录。无效 YAML、缺少描述的 skill、空正文和模板占用内置命令等情况会跳过并输出诊断。
+
+扩展、skills、prompts 和 themes 可从 npm tarball（`npm:<pkg>[@version]`）或 git 仓库（`git:<url>[#ref]`）安装到 agent 目录的默认发现位置：`/package install <source>`、`/package update <name>`、`/package remove <name>`、`/package list`。安装从不执行生命周期脚本（npm 包按普通归档解包，git 包仅 clone/update），安装记录保存在 `packages.json`；安装、更新和移除会即时刷新当前会话的资源目录。
 
 ## 内置搜索与 PowerShell 工具
 
@@ -305,7 +356,7 @@ Review the changes. Focus on ${1:-correctness and tests}.
 
 | 文件 | 内容 |
 | --- | --- |
-| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention、default_project_trust、enable_install_telemetry |
+| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention、default_project_trust、enable_install_telemetry、sync_catalog、codemode |
 | `models.json` | 自定义 provider、模型元数据与覆盖 |
 | `auth.json` | API key、OAuth access/refresh token 和过期时间 |
 | `trust.json` | 项目信任决策（`{规范化路径: true/false}`，沿父目录就近生效） |
@@ -350,12 +401,17 @@ OpenRouter 登录会打印授权链接，需在本机浏览器打开；程序等
 python -m pi --login claude --oauth
 python -m pi --login codex
 python -m pi --login copilot
+python -m pi --login openai --oauth
+python -m pi --login kimi-coding
+python -m pi --login xai
+python -m pi --login radius
 python -m pi --provider anthropic "hello"
 python -m pi --provider openai-codex "hello"
 python -m pi --provider github-copilot "hello"
+python -m pi --provider radius "hello"
 ```
 
-Claude 使用 PKCE 授权链接并要求粘贴授权码；Codex 和 Copilot 使用设备码。适配包含令牌自动刷新、Claude OAuth 请求头与工具名转换、Codex 账户标识及 Responses 请求、Copilot 服务端点及请求来源头。以上流程已通过离线模拟测试，未验证真实账号授权或订阅可用性。
+Claude 使用 PKCE 授权链接并要求粘贴授权码；Codex 和 Copilot 使用设备码；`--login openai --oauth` 走 Sign in with ChatGPT（不带 `--oauth` 时保存 API key；`chatgpt` / `openai-chatgpt` 为同一目标的别名）；Kimi 与 xAI 使用各自的设备码流程；Radius 可选浏览器回调或设备码，登录成功后立即刷新一次网关模型目录。适配包含令牌自动刷新、Claude OAuth 请求头与工具名转换、Codex 账户标识及 Responses 请求、Copilot 服务端点及请求来源头。以上流程已通过离线模拟测试，未验证真实账号授权或订阅可用性。
 
 `models.json` 示例（字段使用 Python 的 snake_case）：
 
@@ -382,7 +438,7 @@ Claude 使用 PKCE 授权链接并要求粘贴授权码；Codex 和 Copilot 使�
 }
 ```
 
-启动：`python -m pi --provider local --model coder`。支持的 API 为 `openai-completions`、`anthropic-messages` 和测试用 `faux`。同名 provider/model 条目会覆盖对应元数据；其他内置模型仍保留。模型输入类型支持 `text`、`image`，价格单位为美元/百万 token；元数据应与上游实际能力一致。
+启动：`python -m pi --provider local --model coder`。支持的 API 为「原生模型协议」列出的全部 API 加测试用 `faux`。同名 provider/model 条目会覆盖对应元数据；其他内置模型仍保留。模型输入类型支持 `text`、`image`，价格单位为美元/百万 token；元数据应与上游实际能力一致。
 
 provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 header 值支持 `$NAME` / `${NAME}` 环境变量插值，不执行 shell 命令。标准设备码服务需添加 `oauth` 对象，包含 HTTPS `device_url`、`token_url`、`client_id` 和可选 `scope`；生成的 access token 必须能直接用于该兼容端点的 Bearer 认证。
 
@@ -395,18 +451,19 @@ provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 head
 /login openai                   保存 API key
 /login openrouter oauth         OAuth 登录
 /logout openrouter              移除本地凭据
+/sync-models                    刷新在线模型目录缓存
 /settings                       查看合并后的默认设置
 /settings thinking "high"       保存用户默认值
 /reload                         重载配置、目录及当前模型
 ```
 
-`/settings` 保存用户默认值，下次启动生效；`/reload` 可立即应用 thinking 和压缩配置。项目同名设置仍优先。模型目录目前为内置小型目录加用户定义，不含 TS 版的在线目录更新或所有专用 provider。
+`/settings` 保存用户默认值，下次启动生效；`/reload` 可立即应用 thinking 和压缩配置。项目同名设置仍优先。模型目录的构成与在线同步见上文「模型目录同步」。
 
 会话文件写在 `./.pi/sessions/*.jsonl`。启动时可指定 `--session <路径或ID>`、`--session-dir <目录>`、`--name <名称>`；`-c` 恢复最近会话。
 
 新记录通过 `id`、`parent_id` 连接成树，另以追加记录保存活动节点和名称。切换分支不会删除原分支，重启后保留最后选择的节点；只有活动分支会送入模型。节点 ID 支持唯一前缀。为避免不完整的工具协议，不能切换或复制到尚缺工具结果的节点。
 
-`/fork` 不带 ID 时复制当前分支；指定 ID 时复制至该消息之后，可在新会话中继续提问。当前为命令行文本操作，不含 TS 版的交互选择器、回填编辑器或离开分支时的自动摘要。JSONL 为 Python 自有格式，可重新加载，不保证与 TS 会话文件互通。HTML 为转义后的静态文本。导出不会覆盖已有文件。
+`/fork` 不带 ID 时复制当前分支；指定 ID 时复制至该消息之后，可在新会话中继续提问。当前为命令行文本操作，不含 TS 版的交互选择器、回填编辑器或离开分支时的自动摘要。JSONL 为 Python 自有格式，可重新加载，不支持读取 TS 会话文件；`/export-ts <path.jsonl>` 可将活动分支导出为 TS pi 会话格式。HTML 为转义后的静态文本。导出不会覆盖已有文件。
 
 ## 评测系统（documentation-lift evals）
 
@@ -533,8 +590,8 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 
 库调用可通过 `Agent(..., compaction=CompactionSettings(...))` 配置；从 `pi.agent.compaction` 导入 `CompactionSettings`。默认 `reserve_tokens=16384`、`keep_recent_tokens=20000`、`summary_tokens=2048`，可设置 `enabled=False` 关闭。未知模型应准确设置 `model.context_window`。Token 数使用 UTF-8 长度估算，并非模型的精确分词结果。
 
-- TS TUI 的全屏对话布局、富文本/图片渲染与工具输出折叠；Python 已有多行编辑、补全、选择器、主题及快捷键
-- codemode 包；扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）。路由协议（pi.protocol/pi.server/pi.client）、Chord 服务层（pi.chord：契约绑定、$chord.service 控制调用、delta wire 编解码、provider/consumer，见 ROUTED_PROTOCOL.md）与 durable coding-agent 服务宿主（`pi server` 入口、每会话 worker 进程、退出监控、会话移除管理）已实现；Python 客户端 ↔ TS 服务端、TS 客户端 ↔ Python 服务端的真实互通由 tests/test_chord_interop.py 以 Node 直接加载 TS 源码验证
+- TS TUI 的富文本与图片内联渲染；Python 已有全屏对话布局（`--tui fullscreen`）、多行编辑、补全、选择器、主题、快捷键及 ANSI Markdown 与工具输出折叠
+- 扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）。路由协议（pi.protocol/pi.server/pi.client）、Chord 服务层（pi.chord：契约绑定、$chord.service 控制调用、delta wire 编解码、provider/consumer，见 ROUTED_PROTOCOL.md）与 durable coding-agent 服务宿主（`pi server` 入口、每会话 worker 进程、退出监控、会话移除管理）已实现；Python 客户端 ↔ TS 服务端、TS 客户端 ↔ Python 服务端的真实互通由 tests/test_chord_interop.py 以 Node 直接加载 TS 源码验证
 - prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）与嵌套工具调用的记录/用量聚合（TS nested-tool-calls）
-- 其他 provider 的专属认证；已实现 Claude、Codex、Copilot 订阅登录、OpenRouter PKCE 及可配置标准设备码 OAuth
-- 模型目录只内置少量常见型号，任意 id 会以默认参数运行
+- 其他 provider 的专属认证；已实现 Claude、Codex、Copilot、Kimi、xAI、Radius 登录，OpenAI 的 Sign in with ChatGPT、OpenRouter PKCE 及可配置标准设备码 OAuth
+- models.dev 在线目录仅在显式触发（`--sync-models` / `/sync-models` / `sync_models`）时刷新，Radius 发现在启动或登录后刷新；TS 版每次启动都会刷新目录。未收录的模型 id 以默认参数运行
