@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from ..models import Model
 from ..types import (
     AssistantMessage,
+    AudioContent,
     DoneEvent,
     ImageContent,
     StreamErrorEvent,
@@ -34,6 +35,7 @@ from ..types import (
     ToolResultMessage,
     TranscriptContext,
     UserMessage,
+    VideoContent,
     get_system_message_text,
 )
 from ..utils import normalize_context
@@ -70,8 +72,12 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
         body["tools"] = [
             {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}
             for t in tools
+            if not t.hosted
         ]
         body["tool_choice"] = "auto"
+        if not body["tools"]:
+            del body["tools"]
+            del body["tool_choice"]
     if options and options.max_tokens:
         body["max_tokens"] = options.max_tokens
     else:
@@ -124,6 +130,10 @@ def convert_messages(system: Optional[SystemMessage], messages: List[Any]) -> Li
     return api_messages
 
 
+# Chat Completions audio input accepts only these formats, keyed by MIME type.
+_AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3"}
+
+
 def _user_content(message: UserMessage) -> Any:
     if isinstance(message.content, str):
         return message.content
@@ -136,6 +146,13 @@ def _user_content(message: UserMessage) -> Any:
                     "image_url": {"url": f"data:{block.mime_type};base64,{block.data}"},
                 }
             )
+        elif isinstance(block, AudioContent):
+            fmt = _AUDIO_FORMATS.get(block.mime_type.split(";")[0].strip().lower())
+            if fmt is None:
+                raise ValueError(f"Unsupported audio type {block.mime_type}: OpenAI accepts audio/wav and audio/mpeg")
+            parts.append({"type": "input_audio", "input_audio": {"data": block.data, "format": fmt}})
+        elif isinstance(block, VideoContent):
+            raise ValueError("OpenAI Chat Completions does not support video input")
         else:
             parts.append({"type": "text", "text": block.text})
     return parts
@@ -147,7 +164,7 @@ def _assistant_message(message: AssistantMessage) -> Dict[str, Any]:
     for block in message.content:
         if isinstance(block, TextContent):
             text_parts.append(block.text)
-        elif isinstance(block, ToolCall):
+        elif isinstance(block, ToolCall) and block.raw_item is None:
             tool_calls.append(
                 {
                     "id": block.id,

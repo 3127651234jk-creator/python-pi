@@ -95,11 +95,11 @@ python -m pi --provider amazon-bedrock --model anthropic.claude-3-5-sonnet-20241
 
 示例型号用于展示参数，不保证账号、地区或上游当前开放访问。Bedrock 使用 `AWS_REGION` / `AWS_DEFAULT_REGION`，未设置时默认为 `us-east-1`；`--base-url` 可覆盖端点。AWS 密钥不写入 Pi 的 `auth.json`。Bedrock 的可选 boto3 版本固定为兼容 Python 3.9 的 `1.40.75`。
 
-三种适配均支持流式文本、工具调用、输入图片、工具结果、停止原因及用量映射。Responses 支持 reasoning summary 和加密 reasoning 条目回放；Gemini 保存工具调用的 thought signature，以便恢复会话后回传。Bedrock 支持 ConverseStream reasoning 内容回放，Claude 模型配置 `reasoning=true` 后可使用 thinking budget；其他模型专用推理参数尚未统一。
+三种适配均支持流式文本、工具调用、输入图片、工具结果、停止原因及用量映射。Responses 支持 reasoning summary 和加密 reasoning 条目回放，并支持内置托管工具（`Tool.hosted`，如 `{"type": "web_search"}`）：调用输出项原文保存在 `ToolCall.raw_item` 中，后续请求原样回放；Gemini 保存工具调用的 thought signature，以便恢复会话后回传。Bedrock 支持 ConverseStream reasoning 内容回放，Claude 模型配置 `reasoning=true` 后可使用 thinking budget；其他模型专用推理参数经 `models.json` 的 `params` 逐键注入 Converse 请求（与内建键一层合并，显式选项优先），`top_k` 按家族自动路由（Nova 为 `additionalModelRequestFields.inferenceConfig.topK`，其余为扁平 `additionalModelRequestFields.top_k`）。
 
 `models.json` 的 `api` 现在还可指定上述三个新 API，适用于自定义端点；内置 `openai` 默认协议仍为 Chat Completions。未知的原生 provider 模型 ID 可以使用，但需要在 `models.json` 中补准确的上下文窗口、输出限制和能力参数。
 
-实现参考 [OpenAI Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)、[Google generateContent](https://ai.google.dev/api/generate-content) 和 [AWS ConverseStream](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-runtime/client/converse_stream.html)。验证使用模拟 SSE 和 AWS 事件流，未执行真实付费请求。当前不包含 Vertex AI、Azure 专用认证、Responses 内置托管工具、音视频输入或自动模型目录同步。
+实现参考 [OpenAI Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)、[Google generateContent](https://ai.google.dev/api/generate-content) 和 [AWS ConverseStream](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-runtime/client/converse_stream.html)。验证使用模拟 SSE 和 AWS 事件流，未执行真实付费请求。当前不包含 Vertex AI、Azure 专用认证或自动模型目录同步。音视频输入（`AudioContent`/`VideoContent`，`@file` 附件按扩展名识别）按 provider 支持情况转换：Gemini 音频与视频均走 `inlineData`；OpenAI 系仅音频且只接受 wav/mp3；Anthropic 与 Bedrock Converse 不支持并会报错。
 
 ## 终端界面
 

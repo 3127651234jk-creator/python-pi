@@ -12,11 +12,53 @@ try:
 except ImportError:
     boto3 = None
 
-from ..types import TextContent, ImageContent, ThinkingContent, ToolCall, ToolResultMessage, StreamStartEvent, StreamErrorEvent, get_system_message_text
+from ..types import TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, ToolCall, ToolResultMessage, StreamStartEvent, StreamErrorEvent, get_system_message_text
 from ..utils import normalize_context
 from ...util import AbortError
 from .base import ProviderState, SimpleStreamOptions, usage_from_counts, thinking_budget
 from .blocks import BlockEvents
+
+# Converse top-level keys the adapter always builds itself.
+_STRUCTURAL_KEYS = ("modelId", "messages", "system")
+
+
+def _is_nova(model_id: str) -> bool:
+    lowered = model_id.lower()
+    return lowered.startswith("amazon.") and "nova" in lowered
+
+
+def _apply_model_params(body: dict, model, options) -> None:
+    """Merge ``Model.params`` into the Converse request.
+
+    Top-level keys pass through verbatim (``inferenceConfig``,
+    ``additionalModelRequestFields``, ``guardrailConfig``, ...) and merge one
+    level deep with built keys so params extend rather than replace. The
+    ``top_k`` shorthand routes to the family-specific field: Nova nests it as
+    ``additionalModelRequestFields.inferenceConfig.topK``, everything else takes
+    the flat ``additionalModelRequestFields.top_k``. Options the caller set
+    explicitly (temperature, max tokens, reasoning) win over params.
+    """
+    params = model.params or {}
+    for key, value in params.items():
+        if key in _STRUCTURAL_KEYS or key == "top_k":
+            continue
+        current = body.get(key)
+        body[key] = {**current, **value} if isinstance(current, dict) and isinstance(value, dict) else value
+    config = body.get("inferenceConfig")
+    if isinstance(config, dict) and options is not None:
+        # Explicit caller options keep precedence over params.
+        if options.temperature is not None:
+            config["temperature"] = options.temperature
+        if options.max_tokens:
+            config["maxTokens"] = options.max_tokens
+    top_k = params.get("top_k")
+    if top_k is not None:
+        fields = body.setdefault("additionalModelRequestFields", {})
+        if isinstance(fields, dict):
+            if _is_nova(model.id):
+                fields.setdefault("inferenceConfig", {})["topK"] = top_k
+            else:
+                fields["top_k"] = top_k
 
 
 def build_request(model, context, options):
@@ -36,7 +78,11 @@ def build_request(model, context, options):
                     content.append({"text": block.text})
                 elif isinstance(block, ImageContent):
                     content.append({"image": {"format": block.mime_type.split("/")[-1].replace("jpg", "jpeg"), "source": {"bytes": base64.b64decode(block.data)}}})
+                elif isinstance(block, (AudioContent, VideoContent)):
+                    raise ValueError("Bedrock Converse does not support audio or video input")
                 elif isinstance(block, ToolCall):
+                    if block.raw_item is not None:
+                        continue  # Hosted calls are provider-executed; not replayable on Bedrock.
                     content.append({"toolUse": {"toolUseId": block.id, "name": block.name, "input": block.arguments}})
                 elif isinstance(block, ThinkingContent) and block.thinking_signature:
                     content.append({"reasoningContent": {"reasoningText": {"text": block.thinking, "signature": block.thinking_signature}}})
@@ -49,18 +95,21 @@ def build_request(model, context, options):
     body = {"modelId": model.id, "messages": output, "inferenceConfig": {"maxTokens": options.max_tokens or model.max_tokens}}
     if options.temperature is not None:
         body["inferenceConfig"]["temperature"] = options.temperature
+    _apply_model_params(body, model, options)
     if model.reasoning and "anthropic." in model.id and options.reasoning not in (None, "off"):
         budget = min(thinking_budget(options.reasoning), body["inferenceConfig"]["maxTokens"] - 1024)
         if budget < 1024:
             raise ValueError("Bedrock thinking requires an output budget of at least 2048 tokens")
-        body["additionalModelRequestFields"] = {"thinking": {"type": "enabled", "budget_tokens": budget}}
+        body.setdefault("additionalModelRequestFields", {})["thinking"] = {"type": "enabled", "budget_tokens": budget}
         body["inferenceConfig"].pop("temperature", None)
     if system:
         body["system"] = [{"text": get_system_message_text(system)}]
         if cache_point:
             body["system"].append(dict(cache_point))
-        if system.tools_added:
-            body["toolConfig"] = {"tools": [{"toolSpec": {"name": t.name, "description": t.description, "inputSchema": {"json": t.parameters}}} for t in system.tools_added]}
+        tools = [{"toolSpec": {"name": t.name, "description": t.description, "inputSchema": {"json": t.parameters}}}
+                 for t in (system.tools_added or []) if not t.hosted]
+        if tools:
+            body["toolConfig"] = {"tools": tools}
     if cache_point and output and output[-1]["role"] == "user":
         output[-1]["content"].append(dict(cache_point))
     return body

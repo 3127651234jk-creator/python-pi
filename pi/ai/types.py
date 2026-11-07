@@ -62,6 +62,21 @@ class Usage:
         return cls()
 
 
+def combine_usage(first: Usage, second: Usage) -> Usage:
+    """Sum of two usages, keeping optional token splits when either side reports them."""
+    return Usage(
+        input=first.input + second.input,
+        output=first.output + second.output,
+        cache_read=first.cache_read + second.cache_read,
+        cache_write=first.cache_write + second.cache_write,
+        cache_write_1h=first.cache_write_1h + second.cache_write_1h,
+        reasoning=None if first.reasoning is None and second.reasoning is None
+        else (first.reasoning or 0) + (second.reasoning or 0),
+        cost={key: first.cost.get(key, 0.0) + second.cost.get(key, 0.0)
+              for key in set(first.cost) | set(second.cost)},
+    )
+
+
 @dataclass
 class TextContent:
     type: str = field(default="text", init=False)
@@ -84,21 +99,44 @@ class ImageContent:
 
 
 @dataclass
+class AudioContent:
+    type: str = field(default="audio", init=False)
+    data: str  # base64
+    mime_type: str
+
+
+@dataclass
+class VideoContent:
+    type: str = field(default="video", init=False)
+    data: str  # base64
+    mime_type: str
+
+
+@dataclass
 class ToolCall:
     type: str = field(default="toolCall", init=False)
     id: str
     name: str
     arguments: Dict[str, Any]
     thought_signature: Optional[str] = None
+    # Hosted (provider-executed) tool call: the raw provider output item,
+    # replayed verbatim on subsequent requests. None for client-executed calls.
+    raw_item: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class Tool:
-    """A tool declaration sent to the model (name/description/JSON schema)."""
+    """A tool declaration sent to the model (name/description/JSON schema).
+
+    ``hosted`` marks a provider-executed tool: the dict is passed through
+    verbatim as the provider's tool payload (e.g. ``{"type": "web_search"}``
+    for the Responses API); name/description are client-side labels only.
+    """
 
     name: str
     description: str
     parameters: Dict[str, Any]
+    hosted: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -119,7 +157,7 @@ class SystemMessage:
 @dataclass
 class UserMessage:
     role: str = field(default="user", init=False)
-    content: Union[str, List[Union[TextContent, ImageContent]]]
+    content: Union[str, List[Union[TextContent, ImageContent, AudioContent, VideoContent]]]
     timestamp: int
 
 
@@ -156,6 +194,7 @@ class ToolResultMessage:
 Message = Union[SystemMessage, UserMessage, AssistantMessage, ToolResultMessage]
 AssistantContent = Union[TextContent, ThinkingContent, ToolCall]
 ToolResultContent = Union[TextContent, ImageContent]
+UserContent = Union[TextContent, ImageContent, AudioContent, VideoContent]
 
 
 @dataclass

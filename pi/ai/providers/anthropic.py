@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from ..models import Model
 from ..types import (
     AssistantMessage,
+    AudioContent,
     DoneEvent,
     ImageContent,
     StreamErrorEvent,
@@ -33,6 +34,7 @@ from ..types import (
     ToolResultMessage,
     TranscriptContext,
     UserMessage,
+    VideoContent,
     get_system_message_text,
 )
 from ..utils import normalize_context
@@ -79,8 +81,11 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
         body["tools"] = [
             {"name": tool.name, "description": tool.description, "input_schema": tool.parameters}
             for tool in tools
+            if not tool.hosted
         ]
-        if cache_control:
+        if not body["tools"]:
+            del body["tools"]
+        elif cache_control:
             body["tools"][-1]["cache_control"] = cache_control
     if cache_control:
         _tag_last_message(body["messages"], cache_control)
@@ -175,6 +180,8 @@ def _user_content(message: UserMessage) -> Any:
     for block in message.content:
         if isinstance(block, ImageContent):
             blocks.append(_image_block(block))
+        elif isinstance(block, (AudioContent, VideoContent)):
+            raise ValueError("Anthropic Messages does not support audio or video input")
         else:
             blocks.append({"type": "text", "text": block.text})
     return blocks
@@ -202,8 +209,9 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
                         "signature": block.thinking_signature,
                     }
                 )
-        elif isinstance(block, ToolCall):
+        elif isinstance(block, ToolCall) and block.raw_item is None:
             blocks.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.arguments})
+        # Hosted tool calls have no Anthropic replay shape and are dropped.
     if not blocks:
         blocks = [{"type": "text", "text": "(empty)"}]
     return blocks

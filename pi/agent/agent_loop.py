@@ -203,7 +203,9 @@ async def run_loop(
                 await emit(AgentEndEvent(messages=new_messages))
                 return
 
-            tool_calls = [c for c in message.content if isinstance(c, ToolCall)]
+            # Hosted (provider-executed) calls carry their result server-side
+            # and replay via raw_item; the loop neither executes nor answers them.
+            tool_calls = [c for c in message.content if isinstance(c, ToolCall) and c.raw_item is None]
 
             tool_results: List[ToolResultMessage] = []
             has_more_tool_calls = False
@@ -287,7 +289,10 @@ def declare_tool_changes(context: AgentContext, pending_messages: List[Any]) -> 
         baseline = pending_messages
 
     declared = get_current_tools([*context.messages, *baseline])
-    executable = [AgentTool(name=t.name, description=t.description, parameters=t.parameters) for t in (context.tools or [])]
+    # Rebuild declaration-only tools (dropping execute callables), preserving
+    # hosted tool payloads so they re-declare with their provider shape.
+    executable = [AgentTool(name=t.name, description=t.description, parameters=t.parameters,
+                            hosted=getattr(t, "hosted", None)) for t in (context.tools or [])]
     changes = get_tool_state_changes(declared, executable)
     unchanged = not changes.tools_added and not changes.tools_removed
 
@@ -429,7 +434,7 @@ async def execute_tool_calls(
 ) -> Dict[str, Any]:
     from .types import ToolExecutionStartEvent
 
-    tool_calls = [c for c in assistant_message.content if isinstance(c, ToolCall)]
+    tool_calls = [c for c in assistant_message.content if isinstance(c, ToolCall) and c.raw_item is None]
     tools = current_context.tools or []
 
     def find_tool(name: str) -> Optional[AgentTool]:
@@ -603,6 +608,12 @@ async def prepare_tool_call(
         return {
             "kind": "immediate",
             "result": create_error_tool_result(f"Tool {tool_call.name} not found"),
+            "is_error": True,
+        }
+    if tool.execute is None:
+        return {
+            "kind": "immediate",
+            "result": create_error_tool_result(f"Tool {tool_call.name} has no executor"),
             "is_error": True,
         }
 

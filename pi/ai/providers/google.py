@@ -5,7 +5,7 @@ import time
 import uuid
 from urllib.parse import quote
 
-from ..types import TextContent, ImageContent, ThinkingContent, ToolCall, ToolResultMessage, get_system_message_text
+from ..types import TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, ToolCall, ToolResultMessage, get_system_message_text
 from ..utils import normalize_context
 from .base import SimpleStreamOptions, run_provider_stream, usage_from_counts, thinking_budget, apply_model_params
 from .blocks import BlockEvents
@@ -23,9 +23,11 @@ def build_request(model, context, options):
             for block in [TextContent(text=message.content)] if isinstance(message.content, str) else message.content:
                 if isinstance(block, TextContent):
                     parts.append({"text": block.text})
-                elif isinstance(block, ImageContent):
+                elif isinstance(block, (ImageContent, AudioContent, VideoContent)):
                     parts.append({"inlineData": {"mimeType": block.mime_type, "data": block.data}})
                 elif isinstance(block, ToolCall):
+                    if block.raw_item is not None:
+                        continue  # Hosted calls are provider-executed; not replayable on Gemini.
                     part = {"functionCall": {"id": block.id, "name": block.name, "args": block.arguments}}
                     if block.thought_signature:
                         part["thoughtSignature"] = block.thought_signature
@@ -45,8 +47,10 @@ def build_request(model, context, options):
         body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget(options.reasoning), "includeThoughts": True}
     if system:
         body["systemInstruction"] = {"parts": [{"text": get_system_message_text(system)}]}
-        if system.tools_added:
-            body["tools"] = [{"functionDeclarations": [{"name": t.name, "description": t.description, "parametersJsonSchema": t.parameters} for t in system.tools_added]}]
+        functions = [{"name": t.name, "description": t.description, "parametersJsonSchema": t.parameters}
+            for t in (system.tools_added or []) if not t.hosted]
+        if functions:
+            body["tools"] = [{"functionDeclarations": functions}]
     # Model-specific params tune generationConfig (top_k, temperature, ...).
     explicit = set()
     if options.temperature is not None:

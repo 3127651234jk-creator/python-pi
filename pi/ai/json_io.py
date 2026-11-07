@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from .types import (
     AssistantMessage,
+    AudioContent,
     ImageContent,
     SystemMessage,
     TextContent,
@@ -22,6 +23,7 @@ from .types import (
     ToolResultMessage,
     Usage,
     UserMessage,
+    VideoContent,
 )
 
 
@@ -64,14 +66,15 @@ def message_from_json(data: Dict[str, Any]) -> Any:
                     )
                 )
             elif kind == "toolCall":
-                blocks.append(ToolCall(id=block["id"], name=block["name"], arguments=block.get("arguments", {}), thought_signature=block.get("thought_signature")))
+                blocks.append(ToolCall(id=block["id"], name=block["name"], arguments=block.get("arguments", {}),
+                    thought_signature=block.get("thought_signature"), raw_item=block.get("raw_item")))
         usage_data = data.get("usage") or {}
         return AssistantMessage(
             content=blocks,
             api=data.get("api", ""),
             provider=data.get("provider", ""),
             model=data.get("model", ""),
-            usage=_usage_from_json(usage_data),
+            usage=usage_from_json(usage_data),
             stop_reason=data.get("stop_reason", "stop"),
             timestamp=data.get("timestamp", 0),
             response_model=data.get("response_model"),
@@ -82,12 +85,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             end_turn=data.get("end_turn"),
         )
     if role == "toolResult":
-        blocks = []
-        for block in data.get("content", []):
-            if block.get("type") == "image":
-                blocks.append(ImageContent(data=block.get("data", ""), mime_type=block.get("mime_type", "")))
-            else:
-                blocks.append(TextContent(text=block.get("text", "")))
+        blocks = [_block_from_json(block) for block in data.get("content", [])]
         usage_data = data.get("usage")
         return ToolResultMessage(
             tool_call_id=data.get("tool_call_id", ""),
@@ -96,7 +94,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             is_error=data.get("is_error", False),
             timestamp=data.get("timestamp", 0),
             details=data.get("details"),
-            usage=_usage_from_json(usage_data) if usage_data else None,
+            usage=usage_from_json(usage_data) if usage_data else None,
         )
     raise ValueError(f"Unknown message role: {role!r}")
 
@@ -106,21 +104,26 @@ def messages_from_json(items: List[Dict[str, Any]]) -> List[Any]:
 
 
 def _tool_from_json(data: Dict[str, Any]) -> Tool:
-    return Tool(name=data["name"], description=data.get("description", ""), parameters=data.get("parameters", {}))
+    return Tool(name=data["name"], description=data.get("description", ""), parameters=data.get("parameters", {}),
+        hosted=data.get("hosted"))
 
 
-def _usage_from_json(data: Dict[str, Any]) -> Usage:
+def usage_from_json(data: Dict[str, Any]) -> Usage:
     fields = {k: v for k, v in data.items() if k in Usage.__dataclass_fields__}
     return Usage(**fields)
+
+
+_MEDIA_BLOCK_TYPES = {"image": ImageContent, "audio": AudioContent, "video": VideoContent}
+
+
+def _block_from_json(block: Dict[str, Any]) -> Any:
+    cls = _MEDIA_BLOCK_TYPES.get(block.get("type"))
+    if cls is not None:
+        return cls(data=block.get("data", ""), mime_type=block.get("mime_type", ""))
+    return TextContent(text=block.get("text", ""))
 
 
 def _content_from_json(content: Any) -> Any:
     if isinstance(content, str):
         return content
-    blocks = []
-    for block in content:
-        if block.get("type") == "image":
-            blocks.append(ImageContent(data=block.get("data", ""), mime_type=block.get("mime_type", "")))
-        else:
-            blocks.append(TextContent(text=block.get("text", "")))
-    return blocks
+    return [_block_from_json(block) for block in content]

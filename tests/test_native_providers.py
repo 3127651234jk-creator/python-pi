@@ -6,17 +6,23 @@ import httpx
 import pytest
 
 from pi.ai.models import Model, resolve_model
-from pi.ai.types import (TextContent, ToolCall, Tool, SystemMessage, UserMessage,
-    ToolResultMessage, TranscriptContext, DoneEvent, StreamErrorEvent)
+from pi.ai.types import (TextContent, ImageContent, AudioContent, VideoContent, ToolCall, Tool,
+    SystemMessage, UserMessage, AssistantMessage, ToolResultMessage, TranscriptContext,
+    DoneEvent, StreamErrorEvent, Usage)
 from pi.ai.json_io import to_json, message_from_json
 from pi.ai.providers.base import SimpleStreamOptions
-from pi.ai.providers import openai_responses, google, amazon_bedrock, openai_completions
+from pi.ai.providers import openai_responses, google, amazon_bedrock, openai_completions, anthropic
 from pi.coding_agent.config import Configuration
 from pi.coding_agent.model_registry import ModelRegistry
 
 
 def context():
     return TranscriptContext([SystemMessage(content="system", timestamp=0, tools_added=[Tool("echo", "Echo", {"type": "object"})]), UserMessage(content="hello", timestamp=0)])
+
+
+def assistant(content, api="openai-responses"):
+    return AssistantMessage(content=content, api=api, provider="test", model="test",
+        usage=Usage(), stop_reason="stop", timestamp=0)
 
 
 @pytest.mark.parametrize("entra", [False, True])
@@ -210,3 +216,227 @@ def test_native_http_error_and_premature_end(monkeypatch, module, api):
         fn = module.stream_google if module is google else module.stream_openai_responses
         return [event async for event in fn(Model("test", "test", api, "test", "https://example.test"), context())]
     assert isinstance(asyncio.run(check())[-1], StreamErrorEvent)
+
+
+# ---------------------------------------------------------------------------
+# Responses hosted tools
+# ---------------------------------------------------------------------------
+
+
+def hosted_context():
+    return TranscriptContext([SystemMessage(content="system", timestamp=0,
+        tools_added=[Tool("web_search", "Web search", {}, hosted={"type": "web_search", "search_context_size": "medium"})]),
+        UserMessage(content="hello", timestamp=0)])
+
+
+def test_hosted_tool_declaration_and_raw_item_replay():
+    model = Model("test", "test", "openai-responses", "test", "https://example.test")
+    body = openai_responses.build_request(model, hosted_context(), SimpleStreamOptions())
+    assert body["tools"] == [{"type": "web_search", "search_context_size": "medium"}]
+
+    raw_item = {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}}
+    replay = TranscriptContext([*hosted_context().messages,
+        assistant([ToolCall(id="ws_1", name="web_search", arguments={}, raw_item=raw_item),
+                   TextContent(text="answer")])])
+    body = openai_responses.build_request(model, replay, SimpleStreamOptions())
+    assert raw_item in body["input"]
+    assert not any(isinstance(item, dict) and item.get("type") == "function_call" for item in body["input"])
+
+
+def test_hosted_tool_sse_capture(monkeypatch):
+    payload = [
+        {"type": "response.output_text.delta", "output_index": 0, "delta": "Searching"},
+        {"type": "response.output_item.added", "output_index": 1, "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"}},
+        {"type": "response.web_search_call.in_progress", "output_index": 1},
+        {"type": "response.output_item.done", "output_index": 1, "item": {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}}},
+        {"type": "response.completed", "response": {"id": "response", "usage": {"input_tokens": 10, "output_tokens": 5}}},
+    ]
+    captured = {}
+    async def send(self, request, **kwargs):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, request=request, content="".join("data: " + json.dumps(item) + "\n\n" for item in payload).encode())
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    model = Model(id="test", name="test", api="openai-responses", provider="test", base_url="https://example.test", api_key="key")
+    async def check():
+        return [event async for event in openai_responses.stream_openai_responses(model, hosted_context())]
+    events = asyncio.run(check())
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    # Hosted-only output: the loop has nothing to execute.
+    assert done.reason == "stop"
+    assert done.message.stop_reason == "stop"
+    call = next(block for block in done.message.content if isinstance(block, ToolCall))
+    assert call.name == "web_search" and call.raw_item["id"] == "ws_1"
+    # Captured item replays verbatim on the next request.
+    replay = TranscriptContext([*hosted_context().messages, done.message])
+    assert openai_responses.build_request(model, replay, SimpleStreamOptions())["input"][-1] == call.raw_item
+
+
+def test_hosted_and_function_calls_stop_reason(monkeypatch):
+    payload = [
+        {"type": "response.output_item.done", "output_index": 0, "item": {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}}},
+        {"type": "response.output_item.added", "output_index": 1, "item": {"type": "function_call", "call_id": "call", "name": "echo", "arguments": ""}},
+        {"type": "response.function_call_arguments.done", "output_index": 1, "arguments": '{"text":"hi"}'},
+        {"type": "response.completed", "response": {"id": "response", "usage": {"input_tokens": 10, "output_tokens": 5}}},
+    ]
+    async def send(self, request, **kwargs):
+        return httpx.Response(200, request=request, content="".join("data: " + json.dumps(item) + "\n\n" for item in payload).encode())
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    model = Model(id="test", name="test", api="openai-responses", provider="test", base_url="https://example.test", api_key="key")
+    async def check():
+        return [event async for event in openai_responses.stream_openai_responses(model, hosted_context())]
+    events = asyncio.run(check())
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.reason == "toolUse"
+
+
+def test_hosted_tools_filtered_from_other_providers():
+    system = SystemMessage(content="s", timestamp=0,
+        tools_added=[Tool("web_search", "Web search", {}, hosted={"type": "web_search"}),
+                     Tool("echo", "Echo", {"type": "object"})])
+    ctx = TranscriptContext([system, UserMessage(content="hello", timestamp=0)])
+    hosted_call = ToolCall(id="ws_1", name="web_search", arguments={}, raw_item={"type": "web_search_call", "id": "ws_1"})
+
+    claude = Model("test", "test", "anthropic-messages", "test", "https://example.test")
+    body = anthropic.build_request(claude, ctx, SimpleStreamOptions())
+    assert [t["name"] for t in body["tools"]] == ["echo"]
+    assert anthropic.convert_messages([assistant([hosted_call, TextContent(text="a")], api="anthropic-messages")]) == [
+        {"role": "assistant", "content": [{"type": "text", "text": "a"}]}]
+
+    body = openai_completions.build_request(Model("test", "test", "openai-completions", "test", "https://example.test"), ctx, SimpleStreamOptions())
+    assert body["tools"] == [{"type": "function", "function": {"name": "echo", "description": "Echo", "parameters": {"type": "object"}}}]
+    assert "tool_calls" not in openai_completions._assistant_message(assistant([hosted_call]))
+
+    body = google.build_request(Model("test", "test", "google-generative-ai", "test", "https://example.test"), ctx, SimpleStreamOptions())
+    assert body["tools"] == [{"functionDeclarations": [{"name": "echo", "description": "Echo", "parametersJsonSchema": {"type": "object"}}]}]
+    assert google.build_request(Model("test", "test", "google-generative-ai", "test", "https://example.test"),
+        TranscriptContext([assistant([hosted_call])]), SimpleStreamOptions())["contents"] == []
+
+    body = amazon_bedrock.build_request(Model("anthropic.claude-sonnet-4-5", "t", "bedrock-converse-stream", "amazon-bedrock", "https://bedrock"), ctx, SimpleStreamOptions())
+    assert body["toolConfig"]["tools"][0]["toolSpec"]["name"] == "echo"
+    assert amazon_bedrock.build_request(Model("anthropic.claude-sonnet-4-5", "t", "bedrock-converse-stream", "amazon-bedrock", "https://bedrock"),
+        TranscriptContext([assistant([hosted_call])]), SimpleStreamOptions())["messages"] == []
+
+
+# ---------------------------------------------------------------------------
+# Audio / video input
+# ---------------------------------------------------------------------------
+
+
+def media_context(*blocks):
+    return TranscriptContext([UserMessage(content=list(blocks), timestamp=0)])
+
+
+def test_openai_audio_input_parts():
+    model = Model("test", "test", "openai-completions", "test", "https://example.test")
+    body = openai_completions.build_request(model, media_context(AudioContent(data="AAA", mime_type="audio/wav")), SimpleStreamOptions())
+    assert body["messages"][0]["content"] == [{"type": "input_audio", "input_audio": {"data": "AAA", "format": "wav"}}]
+    body = openai_completions.build_request(model, media_context(AudioContent(data="AAA", mime_type="audio/mpeg")), SimpleStreamOptions())
+    assert body["messages"][0]["content"][0]["input_audio"]["format"] == "mp3"
+    with pytest.raises(ValueError, match="audio/wav and audio/mpeg"):
+        openai_completions.build_request(model, media_context(AudioContent(data="AAA", mime_type="audio/ogg")), SimpleStreamOptions())
+
+    model = Model("test", "test", "openai-responses", "test", "https://example.test")
+    body = openai_responses.build_request(model, media_context(AudioContent(data="AAA", mime_type="audio/wav")), SimpleStreamOptions())
+    assert body["input"][0]["content"] == [{"type": "input_audio", "input_audio": {"data": "AAA", "format": "wav"}}]
+    with pytest.raises(ValueError, match="video"):
+        openai_responses.build_request(model, media_context(VideoContent(data="AAA", mime_type="video/mp4")), SimpleStreamOptions())
+    with pytest.raises(ValueError, match="video"):
+        openai_completions.build_request(Model("test", "test", "openai-completions", "test", "https://example.test"),
+            media_context(VideoContent(data="AAA", mime_type="video/mp4")), SimpleStreamOptions())
+
+
+def test_google_media_input_parts():
+    model = Model("test", "test", "google-generative-ai", "test", "https://example.test")
+    body = google.build_request(model, media_context(AudioContent(data="AAA", mime_type="audio/wav"), VideoContent(data="BBB", mime_type="video/mp4")), SimpleStreamOptions())
+    assert body["contents"][0]["parts"] == [
+        {"inlineData": {"mimeType": "audio/wav", "data": "AAA"}},
+        {"inlineData": {"mimeType": "video/mp4", "data": "BBB"}},
+    ]
+
+
+@pytest.mark.parametrize("api", ["anthropic-messages", "bedrock-converse-stream"])
+def test_unsupported_media_rejected(api):
+    model = Model("test", "test", api, "test", "https://example.test")
+    builder = anthropic.build_request if api == "anthropic-messages" else amazon_bedrock.build_request
+    with pytest.raises(ValueError, match="audio or video"):
+        builder(model, media_context(AudioContent(data="AAA", mime_type="audio/wav")), SimpleStreamOptions())
+    with pytest.raises(ValueError, match="audio or video"):
+        builder(model, media_context(VideoContent(data="AAA", mime_type="video/mp4")), SimpleStreamOptions())
+
+
+# ---------------------------------------------------------------------------
+# Bedrock per-model inference parameters
+# ---------------------------------------------------------------------------
+
+
+def bedrock_model(model_id="amazon.nova-pro-v1:0", **kwargs):
+    return Model(id=model_id, name="t", api="bedrock-converse-stream", provider="amazon-bedrock",
+                 base_url="https://bedrock.us-east-1.amazonaws.com", **kwargs)
+
+
+def test_bedrock_params_merge_and_precedence():
+    model = bedrock_model(params={"inferenceConfig": {"topP": 0.9, "temperature": 0.1}, "guardrailConfig": {"guardrailIdentifier": "g1"}})
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions())
+    # Params extend the built config without dropping maxTokens.
+    assert body["inferenceConfig"] == {"maxTokens": body["inferenceConfig"]["maxTokens"], "topP": 0.9, "temperature": 0.1}
+    assert body["guardrailConfig"] == {"guardrailIdentifier": "g1"}
+    # Explicit caller options win over params.
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(temperature=0.5, max_tokens=4096))
+    assert body["inferenceConfig"]["temperature"] == 0.5
+    assert body["inferenceConfig"]["maxTokens"] == 4096
+    assert body["inferenceConfig"]["topP"] == 0.9
+
+
+def test_bedrock_top_k_routing_per_family():
+    nova = bedrock_model("amazon.nova-pro-v1:0", params={"top_k": 40})
+    body = amazon_bedrock.build_request(nova, context(), SimpleStreamOptions())
+    assert body["additionalModelRequestFields"] == {"inferenceConfig": {"topK": 40}}
+    # A Nova top_k shorthand merges with other model-specific fields.
+    nova.params = {"top_k": 40, "additionalModelRequestFields": {"topP": 0.9}}
+    body = amazon_bedrock.build_request(nova, context(), SimpleStreamOptions())
+    assert body["additionalModelRequestFields"]["inferenceConfig"] == {"topK": 40}
+    assert body["additionalModelRequestFields"]["topP"] == 0.9
+
+    claude = bedrock_model("anthropic.claude-sonnet-4-5", params={"top_k": 200})
+    body = amazon_bedrock.build_request(claude, context(), SimpleStreamOptions())
+    assert body["additionalModelRequestFields"] == {"top_k": 200}
+
+
+def test_bedrock_thinking_param_precedence():
+    claude = bedrock_model("anthropic.claude-sonnet-4-5", reasoning=True,
+        params={"additionalModelRequestFields": {"thinking": {"type": "enabled", "budget_tokens": 4096}, "top_k": 10}})
+    # Without an explicit reasoning level, params-provided thinking passes through.
+    body = amazon_bedrock.build_request(claude, context(), SimpleStreamOptions())
+    assert body["additionalModelRequestFields"]["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert body["additionalModelRequestFields"]["top_k"] == 10
+    # With reasoning set, the derived budget overrides only the thinking key.
+    body = amazon_bedrock.build_request(claude, context(), SimpleStreamOptions(reasoning="high", max_tokens=32768))
+    assert body["additionalModelRequestFields"]["thinking"]["budget_tokens"] == 16384
+    assert body["additionalModelRequestFields"]["top_k"] == 10
+    assert "temperature" not in body["inferenceConfig"]
+
+
+# ---------------------------------------------------------------------------
+# JSON round-trip for the new block and tool fields
+# ---------------------------------------------------------------------------
+
+
+def test_json_round_trip_new_blocks():
+    message = assistant([
+        ToolCall(id="ws_1", name="web_search", arguments={}, raw_item={"type": "web_search_call", "id": "ws_1"}),
+        ToolCall(id="call", name="echo", arguments={"text": "hi"}, thought_signature="sig"),
+    ])
+    restored = message_from_json(to_json(message))
+    assert restored.content[0].raw_item == {"type": "web_search_call", "id": "ws_1"}
+    assert restored.content[1].thought_signature == "sig"
+    assert restored.content[1].raw_item is None
+
+    user = UserMessage(content=[TextContent(text="look"), ImageContent(data="A", mime_type="image/png"),
+        AudioContent(data="B", mime_type="audio/wav"), VideoContent(data="C", mime_type="video/mp4")], timestamp=0)
+    restored = message_from_json(to_json(user))
+    assert restored.content[2] == AudioContent(data="B", mime_type="audio/wav")
+    assert restored.content[3] == VideoContent(data="C", mime_type="video/mp4")
+
+    system = SystemMessage(content="", timestamp=0, tools_added=[Tool("web_search", "Web", {}, hosted={"type": "web_search"})])
+    restored = message_from_json(to_json(system))
+    assert restored.tools_added[0].hosted == {"type": "web_search"}

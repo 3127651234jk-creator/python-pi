@@ -5,11 +5,25 @@ import time
 import os
 from urllib.parse import urlencode
 
-from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, ThinkingContent, get_system_message_text, get_message_text
+from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, get_system_message_text, get_message_text
 from ..utils import normalize_context
 from .base import SimpleStreamOptions, apply_model_params, run_provider_stream, usage_from_counts
 from .blocks import BlockEvents
 from .copilot import copilot_headers
+
+# Output item types with a dedicated replay shape; anything else arriving on
+# response.output_item.done is a provider-executed (hosted) tool call.
+_NON_HOSTED_ITEM_TYPES = ("message", "reasoning", "function_call")
+
+# Chat/Responses audio input accepts only these formats, keyed by MIME type.
+_AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3"}
+
+
+def _audio_part(block: AudioContent) -> dict:
+    fmt = _AUDIO_FORMATS.get(block.mime_type.split(";")[0].strip().lower())
+    if fmt is None:
+        raise ValueError(f"Unsupported audio type {block.mime_type}: OpenAI accepts audio/wav and audio/mpeg")
+    return {"type": "input_audio", "input_audio": {"data": block.data, "format": fmt}}
 
 
 def build_request(model, context, options):
@@ -18,15 +32,28 @@ def build_request(model, context, options):
     for message in messages:
         if isinstance(message, UserMessage):
             blocks = [TextContent(text=message.content)] if isinstance(message.content, str) else message.content
-            items.append({"role": "user", "content": [
-                {"type": "input_image", "image_url": f"data:{b.mime_type};base64,{b.data}"} if isinstance(b, ImageContent)
-                else {"type": "input_text", "text": b.text} for b in blocks]})
+            content = []
+            for b in blocks:
+                if isinstance(b, ImageContent):
+                    content.append({"type": "input_image", "image_url": f"data:{b.mime_type};base64,{b.data}"})
+                elif isinstance(b, AudioContent):
+                    content.append(_audio_part(b))
+                elif isinstance(b, VideoContent):
+                    raise ValueError("OpenAI Responses does not support video input")
+                else:
+                    content.append({"type": "input_text", "text": b.text})
+            items.append({"role": "user", "content": content})
         elif isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextContent):
                     items.append({"role": "assistant", "content": [{"type": "output_text", "text": block.text}]})
                 elif isinstance(block, ToolCall):
-                    items.append({"type": "function_call", "call_id": block.id, "name": block.name, "arguments": json.dumps(block.arguments)})
+                    if block.raw_item is not None:
+                        # Hosted (provider-executed) call: replay the raw output
+                        # item verbatim for stateless chaining.
+                        items.append(block.raw_item)
+                    else:
+                        items.append({"type": "function_call", "call_id": block.id, "name": block.name, "arguments": json.dumps(block.arguments)})
                 elif isinstance(block, ThinkingContent) and block.thinking_signature and message.api in ("openai-responses", "openai-codex-responses", "azure-openai-responses"):
                     items.append(json.loads(block.thinking_signature))
         elif isinstance(message, ToolResultMessage):
@@ -38,7 +65,9 @@ def build_request(model, context, options):
     if system:
         body["instructions"] = get_system_message_text(system)
         if system.tools_added:
-            body["tools"] = [{"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": False} for t in system.tools_added]
+            body["tools"] = [t.hosted if t.hosted else
+                {"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": False}
+                for t in system.tools_added]
     if model.reasoning and options.reasoning and options.reasoning != "off":
         body["reasoning"] = {"effort": options.reasoning, "summary": "auto"}
     if options.temperature is not None:
@@ -49,7 +78,8 @@ def build_request(model, context, options):
         body["parallel_tool_calls"] = True
         body["text"] = {"verbosity": "low"}
         for tool in body.get("tools", []):
-            tool["strict"] = None
+            if tool.get("type") == "function":
+                tool["strict"] = None
     apply_model_params(body, model, options)
     if model.api == "azure-openai-responses":
         body.pop("api_version", None)
@@ -88,6 +118,8 @@ async def stream_openai_responses(model, context, options=None):
                 events = blocks.text(("thinking", key), "", thinking=True)
                 index = blocks.indices[("thinking", key)]
             state.partial.content[index].thinking_signature = json.dumps(item)
+        elif kind == "response.output_item.done" and data["item"]["type"] not in _NON_HOSTED_ITEM_TYPES:
+            events = blocks.hosted_call(("hosted", key), data["item"])
         elif kind in ("response.completed", "response.incomplete"):
             response = data["response"]
             usage = response.get("usage") or {}
@@ -96,7 +128,8 @@ async def stream_openai_responses(model, context, options=None):
                 reasoning=(usage.get("output_tokens_details") or {}).get("reasoning_tokens")))
             state.partial.usage.cost = model.calculate_cost(state.partial.usage)
             state.set_response(response.get("id"), response.get("model"))
-            reason = "length" if kind == "response.incomplete" else "toolUse" if any(isinstance(b, ToolCall) for b in state.partial.content) else "stop"
+            executed = any(isinstance(b, ToolCall) and b.raw_item is None for b in state.partial.content)
+            reason = "length" if kind == "response.incomplete" else "toolUse" if executed else "stop"
             events = blocks.finish(reason)
         elif kind in ("error", "response.failed"):
             raise RuntimeError(str(data.get("error") or data.get("response", {}).get("error") or data.get("message", "Responses request failed")))
