@@ -353,6 +353,45 @@ def test_stream_without_finish_reason_infers_the_stop_reason(monkeypatch):
     assert done.message.stop_reason == "stop"
 
 
+@pytest.mark.parametrize("reason", ["stop", "tool_calls", "length"])
+def test_finish_reason_without_done_sentinel(monkeypatch, reason):
+    from pi.ai.providers import openai_completions
+
+    _canned_send(monkeypatch, [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",
+            "function": {"name": "read", "arguments": '{"path":"x"}'}}]},
+            "finish_reason": reason}]},
+    ])
+
+    async def run():
+        return [event async for event in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    assert isinstance(events[-1], DoneEvent)
+    assert events[-1].reason == {"tool_calls": "toolUse"}.get(reason, reason)
+    assert events[-1].message.content[0].arguments == {"path": "x"}
+
+
+def test_bare_eof_does_not_complete_partial_tool_call(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    _canned_send(monkeypatch, [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",
+            "function": {"name": "read", "arguments": '{"path":'}}]},
+            "finish_reason": None}]},
+    ])
+
+    async def run():
+        return [event async for event in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    assert isinstance(events[-1], StreamErrorEvent)
+    assert "without a completion marker" in events[-1].error.error_message
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
 def test_stream_without_finish_reason_still_parses_tool_arguments(monkeypatch):
     from pi.ai.providers import openai_completions
 

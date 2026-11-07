@@ -318,6 +318,13 @@ async def _drive_provider_stream(
                             yield converted
                     if done_emitted:
                         break
+                if not done_emitted:
+                    # A finish reason is authoritative even when a gateway omits
+                    # the final sentinel. Bare EOF may be a truncated tool call.
+                    if _terminated(state.partial.stop_reason):
+                        stop_reason = state.partial.stop_reason
+                    else:
+                        error_message = "Provider stream ended without a completion marker"
     except AbortError:
         stop_reason = "aborted"
         error_message = "Request aborted"
