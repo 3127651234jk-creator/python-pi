@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import time
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import httpx
 from ..models import Model
 from ..types import (
     AssistantMessage,
+    AssistantMessageDiagnostic,
     DoneEvent,
     StreamErrorEvent,
     StreamStartEvent,
@@ -36,6 +38,16 @@ class SimpleStreamOptions:
     # Prompt-caching breakpoint TTL: "5m" or "1h" enables provider cache
     # markers (Anthropic cache_control, Bedrock cachePoint); None disables.
     cache_retention: Optional[str] = None
+    # pi-messages wire options: session affinity, tool choice, debug metadata.
+    session_id: Optional[str] = None
+    tool_choice: Optional[Any] = None  # "auto" | "none" | "required" | {"type": "function", "function": {...}}
+    debug: bool = False
+    # Hooks, sync or awaitable (port of TS StreamOptions onPayload/onResponse/
+    # onProviderStreamEvent): inspect or replace the request payload, observe
+    # the raw HTTP response, and observe raw provider events pre-conversion.
+    on_payload: Optional[Callable[[Dict[str, Any], Model], Any]] = None
+    on_response: Optional[Callable[[Dict[str, Any]], Any]] = None
+    on_provider_stream_event: Optional[Callable[[Any], Any]] = None
 
 
 StreamFn = Callable[[Model, TranscriptContext, Optional[SimpleStreamOptions]], AsyncIterator[Any]]
@@ -127,6 +139,15 @@ def make_partial(model: Model, timestamp: int) -> AssistantMessage:
     )
 
 
+async def _call_hook(hook: Optional[Callable[[Any], Any]], value: Any) -> None:
+    """Invoke an options hook, awaiting async ones (TS awaits onPayload/onResponse)."""
+    if hook is None:
+        return
+    result = hook(value)
+    if inspect.isawaitable(result):
+        await result
+
+
 async def run_provider_stream(
     model: Model,
     request_factory: Callable[[], Dict[str, Any]],
@@ -135,13 +156,16 @@ async def run_provider_stream(
     convert_events: Callable[[Optional[str], Any, "ProviderState"], AsyncIterator[Any]],
     options: Optional[SimpleStreamOptions],
     timestamp: int,
+    *,
+    on_response_error: Optional[Callable[[int, str, str, str], Tuple[str, Optional[AssistantMessageDiagnostic]]]] = None,
 ) -> AsyncIterator[Any]:
     """Public entry: dispatches through a telemetry span when configured."""
     options = options or SimpleStreamOptions()
     telemetry = options.telemetry_context
     if telemetry is None:
         async for event in _drive_provider_stream(
-            model, request_factory, endpoint_path, headers_factory, convert_events, options, timestamp
+            model, request_factory, endpoint_path, headers_factory, convert_events, options, timestamp,
+            on_response_error=on_response_error,
         ):
             yield event
         return
@@ -157,7 +181,8 @@ async def run_provider_stream(
     async def body(span):
         try:
             async for event in _drive_provider_stream(
-                model, request_factory, endpoint_path, headers_factory, convert_events, options, timestamp
+                model, request_factory, endpoint_path, headers_factory, convert_events, options, timestamp,
+                on_response_error=on_response_error,
             ):
                 if event.type in ("start", "done", "error"):
                     span.add_event(
@@ -196,11 +221,15 @@ async def _drive_provider_stream(
     convert_events: Callable[[Optional[str], Any, "ProviderState"], AsyncIterator[Any]],
     options: Optional[SimpleStreamOptions],
     timestamp: int,
+    *,
+    on_response_error: Optional[Callable[[int, str, str, str], Tuple[str, Optional[AssistantMessageDiagnostic]]]] = None,
 ) -> AsyncIterator[Any]:
     """Shared HTTP/SSE driver for streaming providers.
 
     ``convert_events`` maps one provider SSE event to zero or more pi events.
     It receives a mutable ``ProviderState`` for the in-progress partial message.
+    ``on_response_error`` lets an adapter customize the HTTP >= 400 error message
+    and attach a redacted diagnostic to the resulting error message.
     """
 
     from ..types import DoneEvent, StreamErrorEvent, StreamStartEvent
@@ -211,6 +240,7 @@ async def _drive_provider_stream(
     started = False
     stop_reason: str = "error"
     error_message: Optional[str] = None
+    response_diagnostic: Optional[AssistantMessageDiagnostic] = None
     done_emitted = False
     response: Optional[httpx.Response] = None
 
@@ -218,16 +248,32 @@ async def _drive_provider_stream(
         if signal is not None:
             signal.throw_if_aborted()
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
+            payload = request_factory()
+            if inspect.isawaitable(payload):
+                payload = await payload
+            if options.on_payload is not None:
+                replacement = options.on_payload(payload, model)
+                if inspect.isawaitable(replacement):
+                    replacement = await replacement
+                if replacement is not None:
+                    payload = replacement
             req = client.build_request(
                 "POST",
                 model.base_url + endpoint_path,
-                json=request_factory(),
+                json=payload,
                 headers=headers_factory(),
             )
             response = await client.send(req, stream=True)
+            if options.on_response is not None:
+                await _call_hook(options.on_response,
+                                 {"status": response.status_code, "headers": dict(response.headers)})
             if response.status_code >= 400:
                 body = (await response.aread()).decode("utf-8", errors="replace")
-                error_message = f"HTTP {response.status_code} from {model.provider}: {body[:2000]}"
+                if on_response_error is not None:
+                    error_message, response_diagnostic = on_response_error(
+                        response.status_code, response.reason_phrase, str(req.url), body)
+                else:
+                    error_message = f"HTTP {response.status_code} from {model.provider}: {body[:2000]}"
                 stop_reason = "error"
             else:
                 started = True
@@ -235,6 +281,8 @@ async def _drive_provider_stream(
                 async for event_name, data in iter_sse(response):
                     if signal is not None and signal.aborted:
                         raise AbortError()
+                    if options.on_provider_stream_event is not None:
+                        await _call_hook(options.on_provider_stream_event, data)
                     async for converted in convert_events(event_name, data, state):
                         if isinstance(converted, DoneEvent):
                             stop_reason = converted.reason
@@ -275,6 +323,8 @@ async def _drive_provider_stream(
         error = make_partial(model, timestamp)
         error.stop_reason = stop_reason  # type: ignore[assignment]
         error.error_message = error_message or "Unknown provider error"
+        if response_diagnostic is not None:
+            error.diagnostics = [response_diagnostic]
         yield StreamErrorEvent(reason=stop_reason, error=error)  # type: ignore[arg-type]
     elif not done_emitted:
         error = state.snapshot()

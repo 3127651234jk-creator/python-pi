@@ -12,7 +12,9 @@ from typing import Any, Dict, List
 
 from .types import (
     AssistantMessage,
+    AssistantMessageDiagnostic,
     AudioContent,
+    DiagnosticErrorInfo,
     ImageContent,
     SystemMessage,
     TextContent,
@@ -56,7 +58,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
         for block in data.get("content", []):
             kind = block.get("type")
             if kind == "text":
-                blocks.append(TextContent(text=block.get("text", "")))
+                blocks.append(TextContent(text=block.get("text", ""), text_signature=block.get("text_signature")))
             elif kind == "thinking":
                 blocks.append(
                     ThinkingContent(
@@ -83,6 +85,9 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             error_message=data.get("error_message"),
             raw_stop_reason=data.get("raw_stop_reason"),
             end_turn=data.get("end_turn"),
+            provider_thinking_level=data.get("provider_thinking_level"),
+            diagnostics=[_diagnostic_from_json(item) for item in (data.get("diagnostics") or [])
+                         if isinstance(item, dict)] or None,
         )
     if role == "toolResult":
         blocks = [_block_from_json(block) for block in data.get("content", [])]
@@ -106,6 +111,21 @@ def messages_from_json(items: List[Dict[str, Any]]) -> List[Any]:
 def _tool_from_json(data: Dict[str, Any]) -> Tool:
     return Tool(name=data["name"], description=data.get("description", ""), parameters=data.get("parameters", {}),
         hosted=data.get("hosted"))
+
+
+def _diagnostic_from_json(data: Dict[str, Any]) -> AssistantMessageDiagnostic:
+    error = data.get("error")
+    return AssistantMessageDiagnostic(
+        type=data.get("type", ""),
+        timestamp=data.get("timestamp", 0),
+        error=DiagnosticErrorInfo(
+            message=error.get("message", ""),
+            name=error.get("name"),
+            stack=error.get("stack"),
+            code=error.get("code"),
+        ) if isinstance(error, dict) else None,
+        details=data.get("details"),
+    )
 
 
 def usage_from_json(data: Dict[str, Any]) -> Usage:

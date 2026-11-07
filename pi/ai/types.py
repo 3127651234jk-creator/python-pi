@@ -7,6 +7,8 @@ dataclasses; system messages carry the prompt and tool declarations.
 
 from __future__ import annotations
 
+import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -81,6 +83,7 @@ def combine_usage(first: Usage, second: Usage) -> Usage:
 class TextContent:
     type: str = field(default="text", init=False)
     text: str
+    text_signature: Optional[str] = None
 
 
 @dataclass
@@ -162,6 +165,26 @@ class UserMessage:
 
 
 @dataclass
+class DiagnosticErrorInfo:
+    """Redacted exception information carried by a message diagnostic."""
+
+    message: str
+    name: Optional[str] = None
+    stack: Optional[str] = None
+    code: Optional[Union[str, int]] = None
+
+
+@dataclass
+class AssistantMessageDiagnostic:
+    """Redacted provider/runtime diagnostic for failures and recoveries."""
+
+    type: str
+    timestamp: int
+    error: Optional[DiagnosticErrorInfo] = None
+    details: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class AssistantMessage:
     role: str = field(default="assistant", init=False)
     content: List[Union[TextContent, ThinkingContent, ToolCall]]
@@ -177,6 +200,43 @@ class AssistantMessage:
     error_message: Optional[str] = None
     raw_stop_reason: Optional[str] = None
     end_turn: Optional[bool] = None
+    provider_thinking_level: Optional[str] = None
+    diagnostics: Optional[List[AssistantMessageDiagnostic]] = None
+
+
+def format_thrown_value(value: Any) -> str:
+    if isinstance(value, BaseException):
+        return str(value) or value.__class__.__name__
+    return str(value)
+
+
+def extract_diagnostic_error(error: Any) -> DiagnosticErrorInfo:
+    """Extract redacted exception information (port of extractDiagnosticError)."""
+    if not isinstance(error, BaseException):
+        return DiagnosticErrorInfo(name="ThrownValue", message=format_thrown_value(error))
+    code = getattr(error, "code", None)
+    stack = "".join(traceback.format_exception(type(error), error, error.__traceback__)) if error.__traceback__ else None
+    return DiagnosticErrorInfo(
+        name=error.__class__.__name__,
+        message=str(error) or error.__class__.__name__,
+        stack=stack,
+        code=code if isinstance(code, (str, int)) and not isinstance(code, bool) else None,
+    )
+
+
+def create_assistant_message_diagnostic(
+    diagnostic_type: str, error: Any = None, details: Optional[Dict[str, Any]] = None
+) -> AssistantMessageDiagnostic:
+    return AssistantMessageDiagnostic(
+        type=diagnostic_type,
+        timestamp=int(time.time() * 1000),
+        error=extract_diagnostic_error(error),
+        details=details,
+    )
+
+
+def append_assistant_message_diagnostic(message: AssistantMessage, diagnostic: AssistantMessageDiagnostic) -> None:
+    message.diagnostics = [*(message.diagnostics or []), diagnostic]
 
 
 @dataclass
