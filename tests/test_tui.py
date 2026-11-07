@@ -6,10 +6,11 @@ from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.styles import Style
 
 from pi.agent.agent import Agent
 from pi.ai.models import resolve_model
-from pi.coding_agent.tui import AgentCompleter, TerminalUI, _overlay_bounds
+from pi.coding_agent.tui import AgentCompleter, TerminalUI, _TextDialog, _overlay_bounds
 from pi.coding_agent.ts_extension import CustomViewFrame
 from pi.coding_agent.config import validate_settings
 
@@ -66,6 +67,19 @@ def test_selector_confirmation_and_cancel():
         asyncio.run(check(pipe))
 
 
+def test_selector_starts_on_the_given_default():
+    async def check(pipe):
+        with create_app_session(input=pipe, output=DummyOutput()):
+            ui = TerminalUI(Agent(resolve_model("faux")), lambda: [])
+            task = asyncio.create_task(
+                ui.choose("Advanced settings?", [("yes", "Yes"), ("no", "No")], default="no"))
+            await asyncio.sleep(0.05)
+            pipe.send_text("\r")
+            assert await asyncio.wait_for(task, 3) == "no"
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
 def test_selector_arrows_and_escape():
     async def check(pipe):
         with create_app_session(input=pipe, output=DummyOutput()):
@@ -99,6 +113,39 @@ def test_text_dialog_submit_default_and_cancel():
             await asyncio.sleep(0.1)
             pipe.send_text("\x1b")
             assert await asyncio.wait_for(task, 3) is None
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
+def test_text_dialog_rejects_invalid_value_in_place():
+    def provider_rule(value):
+        text = value.strip()
+        if ":" in text:
+            raise ValueError("Provider ID must match ^[a-z][a-z0-9-]{0,63}$")
+        return text
+
+    async def check(pipe):
+        with create_app_session(input=pipe, output=DummyOutput()):
+            dialog = _TextDialog("Provider ID", "", False, Style.from_dict({}), provider_rule)
+            task = asyncio.create_task(dialog.run())
+            await asyncio.sleep(0.1)
+            pipe.send_text("cn:deepseek-v4.1-flash\r")
+            await asyncio.sleep(0.1)
+            # Enter on an invalid value keeps the dialog open, keeps the text
+            # and reports the rule instead of closing and re-prompting empty.
+            assert not task.done()
+            error = dialog.textfield.buffer.validation_error
+            assert error is not None and "Provider ID" in error.message
+            assert dialog.app.layout.current_buffer is dialog.textfield.buffer
+            pipe.send_text("\x1b")
+            assert await asyncio.wait_for(task, 3) is None
+
+            dialog = _TextDialog("Provider ID", "  my-gateway  ", False,
+                                 Style.from_dict({}), provider_rule)
+            task = asyncio.create_task(dialog.run())
+            await asyncio.sleep(0.1)
+            pipe.send_text("\r")
+            assert await asyncio.wait_for(task, 3) == "my-gateway"
     with create_pipe_input() as pipe:
         asyncio.run(check(pipe))
 

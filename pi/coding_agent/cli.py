@@ -15,7 +15,7 @@ import sys
 import json
 import getpass
 from contextlib import nullcontext, redirect_stdout
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 import httpx
 
 from ..ai.models import ModelError, resolve_image_model, resolve_model
@@ -207,6 +207,10 @@ class CliRenderer:
             if isinstance(inner, TextDeltaEvent) and not self.markdown and not transformed:
                 print(inner.delta, end="", flush=True)
         elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+            if event.message.stop_reason == "error":
+                # Provider failures arrive as a message with stop_reason "error";
+                # without this line the REPL returns to the prompt silently.
+                print(f"\nerror: {event.message.error_message or 'Unknown provider error'}", flush=True)
             transformed = self.extensions is not None and any(
                 api.markdown_transformers for api in self.extensions.extensions)
             if self.markdown or transformed:
@@ -916,15 +920,22 @@ class TextWizardIO:
             print(f"error: enter a number between 1 and {len(values)}")
 
     async def text_input(self, title: str, default: str = "", password: bool = False,
-                         allow_cancel_word: bool = True) -> Optional[str]:
-        if password:
-            raw = await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, f"{title}: ")
-        else:
-            shown = f" [{default}]" if default else ""
-            raw = await asyncio.get_running_loop().run_in_executor(None, input, f"{title}{shown}: ")
-        if allow_cancel_word and raw.strip() == ":cancel":
-            return None
-        return raw
+                         allow_cancel_word: bool = True,
+                         validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
+        while True:
+            if password:
+                raw = await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, f"{title}: ")
+            else:
+                shown = f" [{default}]" if default else ""
+                raw = await asyncio.get_running_loop().run_in_executor(None, input, f"{title}{shown}: ")
+            if allow_cancel_word and raw.strip() == ":cancel":
+                return None
+            if validate is None:
+                return raw
+            try:
+                return validate(raw)
+            except ValueError as exc:
+                print(f"error: {exc}")
 
     async def confirm(self, title: str, default: bool) -> Optional[bool]:
         result = await self.choose(title, [("yes", "Yes"), ("no", "No")], default="yes" if default else "no")
@@ -941,15 +952,17 @@ class TUIWizardIO:
         self.ui = ui
 
     async def choose(self, title: str, values, default: Optional[str] = None) -> Optional[str]:
-        return await self.ui.choose(title, values)
+        return await self.ui.choose(title, values, default=default)
 
     async def text_input(self, title: str, default: str = "", password: bool = False,
-                         allow_cancel_word: bool = True) -> Optional[str]:
+                         allow_cancel_word: bool = True,
+                         validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
         # The dialogs cancel through Escape or Ctrl+C; ":cancel" is text-only.
-        return await self.ui.input(title, default=default, password=password)
+        return await self.ui.input(title, default=default, password=password, validate=validate)
 
     async def confirm(self, title: str, default: bool) -> Optional[bool]:
-        result = await self.ui.choose(title, [("yes", "Yes"), ("no", "No")])
+        result = await self.ui.choose(title, [("yes", "Yes"), ("no", "No")],
+                                      default="yes" if default else "no")
         return None if result is None else result == "yes"
 
     def say(self, message: str) -> None:

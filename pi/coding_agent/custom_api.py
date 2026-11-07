@@ -69,7 +69,8 @@ class WizardIO(Protocol):
 
     async def choose(self, title: str, values: List[Tuple[str, str]], default: Optional[str] = None) -> Optional[str]: ...
 
-    async def text_input(self, title: str, default: str = "", password: bool = False, allow_cancel_word: bool = True) -> Optional[str]: ...
+    async def text_input(self, title: str, default: str = "", password: bool = False, allow_cancel_word: bool = True,
+                         validate: Optional[Callable[[str], str]] = None) -> Optional[str]: ...
 
     async def confirm(self, title: str, default: bool) -> Optional[bool]: ...
 
@@ -348,26 +349,27 @@ async def _review(io: WizardIO, form: CustomApiForm) -> Optional[str]:
 
 async def _prompt_validated(io: WizardIO, title: str, current: str, validate: Callable[[str], str],
                             password: bool = False, allow_cancel_word: bool = True) -> str:
-    """Re-prompt the same field on validation failure, explaining the reason."""
+    """Re-prompt the same field on validation failure, explaining the reason.
+
+    ``validate`` is handed to the input surface so the terminal dialog can
+    reject the value without closing (keeping the text and showing the rule);
+    the loop below covers the plain REPL and any other WizardIO implementation.
+    """
     while True:
-        raw = await io.text_input(title, current, password=password, allow_cancel_word=allow_cancel_word)
-        if raw is None:
-            raise Cancelled()
         try:
+            raw = await io.text_input(title, current, password=password,
+                                      allow_cancel_word=allow_cancel_word, validate=validate)
+            if raw is None:
+                raise Cancelled()
             return validate(raw)
         except ValueError as exc:
             io.say(f"error: {exc}")
 
 
 async def _prompt_int(io: WizardIO, title: str, current: int) -> int:
-    while True:
-        raw = await io.text_input(title, str(current))
-        if raw is None:
-            raise Cancelled()
-        try:
-            return validate_positive_int(raw, title)
-        except ValueError as exc:
-            io.say(f"error: {exc}")
+    text = await _prompt_validated(io, title, str(current),
+                                   lambda value: str(validate_positive_int(value, title)))
+    return int(text)
 
 
 async def _collect_fields(io: WizardIO, form: CustomApiForm, registry: ModelRegistry, config: Configuration) -> None:

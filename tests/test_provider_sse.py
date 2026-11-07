@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from pi.ai.models import Model
+from pi.ai.providers.base import trust_env_for_url
 from pi.ai.types import (
     DoneEvent,
     StreamErrorEvent,
@@ -225,6 +226,94 @@ def test_openai_stream_mapping(monkeypatch):
     body = captured["body"]
     assert body["stream"] is True
     assert body["messages"][0] == {"role": "user", "content": "hi"}
+
+
+def test_trust_env_for_url_only_bypasses_loopback():
+    assert trust_env_for_url("http://localhost:7863/v1") is False
+    assert trust_env_for_url("http://api.localhost:7863/v1") is False
+    assert trust_env_for_url("http://127.0.0.1:7863/v1") is False
+    assert trust_env_for_url("http://127.0.0.5:7863/v1") is False
+    assert trust_env_for_url("http://[::1]:7863/v1") is False
+    assert trust_env_for_url("https://api.openai.com/v1") is True
+    assert trust_env_for_url("http://192.168.1.10:7863/v1") is True
+
+
+def test_loopback_provider_client_bypasses_the_system_proxy(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    seen = {}
+    real_client = httpx.AsyncClient
+
+    class RecordingClient(real_client):
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+        async def send(self, request, stream=False):
+            class FakeResponse:
+                status_code = 200
+
+                async def aiter_lines(self):
+                    for line in ('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
+                                 'data: [DONE]\n\n').splitlines():
+                        yield line
+
+                async def aread(self):
+                    return b""
+
+                async def aclose(self):
+                    return None
+
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", RecordingClient)
+
+    def model(base_url):
+        return Model(id="m", name="m", api="openai-completions", provider="local",
+                     base_url=base_url, api_key="k", max_tokens=10)
+
+    async def run(base_url):
+        return [event async for event in openai_completions.stream_openai_completions(
+            model(base_url), user_context())]
+
+    asyncio.run(run("http://localhost:7863/v1"))
+    assert seen["trust_env"] is False
+    asyncio.run(run("https://api.example.com/v1"))
+    assert seen["trust_env"] is True
+
+
+def test_openai_http_error_with_empty_body_still_explains_itself(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    async def fake_send(self, request, stream=False):
+        class FakeResponse:
+            status_code = 502
+            reason_phrase = "Bad Gateway"
+
+            async def aiter_lines(self):
+                return
+                yield
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                return None
+
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+
+    async def run():
+        return [e async for e in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, StreamErrorEvent)
+    assert "HTTP 502" in error.error.error_message
+    assert "empty response body" in error.error.error_message
 
 
 def test_anthropic_http_error_yields_error_event(monkeypatch):

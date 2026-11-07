@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import inspect
+import ipaddress
 import json
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -23,6 +25,23 @@ from ..types import (
     Usage,
 )
 from ...util import AbortError, AbortSignal
+
+
+def trust_env_for_url(url: str) -> bool:
+    """Whether httpx may read proxy settings (env vars and the Windows registry).
+
+    httpx applies the system proxy to every address, so a proxy configured for
+    outbound traffic also answers requests to a local gateway (typically with
+    502 Bad Gateway). Loopback endpoints are contacted directly; everything
+    else keeps the environment behaviour.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
 
 
 @dataclass
@@ -247,7 +266,8 @@ async def _drive_provider_stream(
     try:
         if signal is not None:
             signal.throw_if_aborted()
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0),
+                                    trust_env=trust_env_for_url(model.base_url)) as client:
             payload = request_factory()
             if inspect.isawaitable(payload):
                 payload = await payload
@@ -273,7 +293,8 @@ async def _drive_provider_stream(
                     error_message, response_diagnostic = on_response_error(
                         response.status_code, response.reason_phrase, str(req.url), body)
                 else:
-                    error_message = f"HTTP {response.status_code} from {model.provider}: {body[:2000]}"
+                    detail = body.strip()[:2000] or "(empty response body)"
+                    error_message = f"HTTP {response.status_code} from {model.provider}: {detail}"
                 stop_reason = "error"
             else:
                 started = True

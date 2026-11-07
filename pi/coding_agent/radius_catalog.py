@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from ..ai.providers.base import trust_env_for_url
 from .config import read_json, write_json
 from .subscription_auth import DEFAULT_RADIUS_GATEWAY, normalize_radius_gateway
 
@@ -95,7 +96,7 @@ async def fetch_radius_gateway_config(gateway: str, api_key: Optional[str] = Non
     headers = {"accept": "application/json"}
     if api_key:
         headers["authorization"] = "Bearer " + api_key
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env_for_url(gateway)) as client:
         response = await client.get(gateway + "/v1/config", headers=headers)
     if response.status_code >= 400:
         raise ValueError(f"Could not load Radius config from {gateway}: "

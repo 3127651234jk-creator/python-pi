@@ -23,7 +23,8 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.utils import get_cwidth
-from prompt_toolkit.widgets import Button, Dialog, TextArea
+from prompt_toolkit.validation import ValidationError, Validator
+from prompt_toolkit.widgets import Button, Dialog, TextArea, ValidationToolbar
 
 from ..agent.agent import Agent
 
@@ -318,11 +319,12 @@ class _ChoiceDialog:
 
     FOCUS_ORDER = ("list", "ok", "cancel")
 
-    def __init__(self, title, values, style) -> None:
+    def __init__(self, title, values, style, default=None) -> None:
         self.title = _dialog_text(title) or "Select"
         self.values = list(values)
         self.style = style
-        self.index = 0
+        self.index = next((index for index, (value, _label) in enumerate(self.values)
+                           if value == default), 0)
         self.top = 0
         self.focus = "list"
         self._hit: dict = {}
@@ -515,6 +517,24 @@ class _ChoiceDialog:
         return await app.run_async()
 
 
+class _FormValidator(Validator):
+    """Adapt a form rule to prompt_toolkit.
+
+    The rule returns the normalized value and raises ``ValueError`` with a
+    user-facing message; the message is rendered inside the dialog instead of
+    being printed behind it while the dialog reopens.
+    """
+
+    def __init__(self, check: Callable[[str], str]) -> None:
+        self.check = check
+
+    def validate(self, document: Document) -> None:
+        try:
+            self.check(document.text)
+        except ValueError as exc:
+            raise ValidationError(message=str(exc))
+
+
 class _TextDialog:
     """Centered card-style single-line input used by :meth:`TerminalUI.input`.
 
@@ -522,11 +542,15 @@ class _TextDialog:
     carries no history, so password entry never lands in an input history.
     """
 
-    def __init__(self, title, default: str, password: bool, style) -> None:
-        self.textfield = TextArea(text=default, multiline=False, password=password)
+    def __init__(self, title, default: str, password: bool, style, validate=None) -> None:
+        self.validate = validate
+        self.textfield = TextArea(
+            text=default, multiline=False, password=password,
+            validator=_FormValidator(validate) if validate else None)
         cancel_button = Button(text="Cancel", handler=self._cancel)
         ok_button = Button(text="OK", handler=self._accept)
-        dialog = Dialog(title=_dialog_text(title), body=HSplit([self.textfield]),
+        body = HSplit([self.textfield, ValidationToolbar()] if validate else [self.textfield])
+        dialog = Dialog(title=_dialog_text(title), body=body,
                         buttons=[ok_button, cancel_button], with_background=True)
         bindings = KeyBindings()
 
@@ -546,6 +570,14 @@ class _TextDialog:
                                mouse_support=True, style=style, full_screen=True)
 
     def _accept(self) -> None:
+        if self.validate is not None:
+            if not self.textfield.buffer.validate():
+                # Keep the value on screen and show the reason under the field.
+                self.app.layout.focus(self.textfield)
+                self.app.invalidate()
+                return
+            get_app().exit(result=self.validate(self.textfield.text))
+            return
         get_app().exit(result=self.textfield.text)
 
     def _cancel(self) -> None:
@@ -1026,17 +1058,21 @@ class TerminalUI:
                 task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
 
-    async def choose(self, title: str, values: List[Tuple[str, str]]) -> Optional[str]:
+    async def choose(self, title: str, values: List[Tuple[str, str]],
+                     default: Optional[str] = None) -> Optional[str]:
         if not values:
             return None
         with create_app_session(input=self.session.app.input, output=self.session.app.output):
-            return await _ChoiceDialog(title, values, self.style).run()
+            return await _ChoiceDialog(title, values, self.style, default).run()
 
-    async def input(self, title: str, default: str = "", password: bool = False) -> Optional[str]:
+    async def input(self, title: str, default: str = "", password: bool = False,
+                    validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
         """Modal single-line text entry; None when cancelled. The buffer keeps
-        no history, so password entry never lands in an input history."""
+        no history, so password entry never lands in an input history. With
+        ``validate`` the dialog rejects an invalid value in place, keeps the
+        text and shows the rule's error message."""
         with create_app_session(input=self.session.app.input, output=self.session.app.output):
-            return await _TextDialog(title, default, password, self.style).run()
+            return await _TextDialog(title, default, password, self.style, validate).run()
 
     async def run(self, coroutine):
         task = asyncio.create_task(coroutine)

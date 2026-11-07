@@ -52,11 +52,15 @@ class ScriptedIO:
     async def choose(self, title, values, default=None):
         return self._next(title)
 
-    async def text_input(self, title, default="", password=False, allow_cancel_word=True):
+    async def text_input(self, title, default="", password=False, allow_cancel_word=True, validate=None):
         self.prompts.append((title, default, password))
         answer = self.answers.pop(0)
         answer = answer(self) if callable(answer) else answer
-        return None if answer == ":cancel" and allow_cancel_word else answer
+        if answer is None:
+            return None
+        if answer == ":cancel" and allow_cancel_word:
+            return None
+        return validate(answer) if validate is not None else answer
 
     async def confirm(self, title, default):
         return self._next(title)
@@ -243,6 +247,22 @@ def test_wizard_reprompts_field_after_validation_failure(config):
     inputs = [prompt for prompt in io.prompts if isinstance(prompt, tuple) and prompt[0] == "Provider ID"]
     assert len(inputs) == 2
     assert any("error:" in message for message in io.messages)
+
+
+def test_wizard_hands_field_rules_to_the_input_surface(config):
+    registry = ModelRegistry(config)
+    io = ScriptedIO(happy_answers())
+    seen = []
+    original = io.text_input
+
+    async def recording(title, default="", password=False, allow_cancel_word=True, validate=None):
+        seen.append((title, validate is not None))
+        return await original(title, default, password, allow_cancel_word, validate)
+
+    io.text_input = recording
+    assert asyncio.run(run_custom_api_wizard(config, registry, io)) is not None
+    assert ("Provider ID", True) in seen and ("Model ID", True) in seen
+    assert ("Base URL", False) in seen  # its own loop handles confirmations
 
 
 def test_wizard_advanced_settings_flow(config):
