@@ -32,6 +32,7 @@ from ..agent.types import (
     TurnEndEvent,
 )
 from .catalog_sync import fetch_catalog, save_cache
+from .radius_catalog import refresh_radius_catalog
 from .codemode import create_codemode_tool
 from .crash_log import clear_crash_log, crash_log_path, read_crash_log, record_crash, take_unnotified_crash
 from .diagnostics import Diagnostic, deduplicate_diagnostics, report_diagnostics, settings_diagnostics
@@ -496,9 +497,16 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                 try:
                     providers = await fetch_catalog()
                     save_cache(registry.config.agent_dir, providers)
+                    radius_count = 0
+                    try:
+                        radius_count = await refresh_radius_catalog(registry)
+                    except (OSError, ValueError, httpx.HTTPError) as exc:
+                        print(f"warning: Radius model discovery failed: {exc}", file=sys.stderr)
                     registry.reload()
                     total = sum(len(entry["models"]) for entry in providers.values())
                     print(f"synced {total} models across {len(providers)} providers")
+                    if radius_count:
+                        print(f"synced {radius_count} Radius models from the gateway")
                 except (OSError, ValueError, httpx.HTTPError) as exc:
                     print(f"error: {exc}")
                 continue
@@ -773,6 +781,12 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
         credential = {"type": "api_key", "key": key.strip()}
     registry.auth.set(provider, credential)
     print(f"credentials saved for {provider}")
+    if provider == "radius":
+        try:
+            count = await refresh_radius_catalog(registry)
+            print(f"synced {count} models from the Radius gateway")
+        except (OSError, ValueError, httpx.HTTPError) as exc:
+            print(f"warning: could not sync the Radius model catalog: {exc}")
 
 
 async def _choose_console(title: str, values):
@@ -962,6 +976,16 @@ def sync_mcp_tools(agent: Agent, mcp: McpManager) -> None:
     agent.tools[:] = [tool for tool in agent.tools if not getattr(tool, "_mcp_managed", False)] + list(mcp.tools)
 
 
+async def refresh_radius_models(registry: ModelRegistry) -> None:
+    """Best-effort Radius gateway model discovery; failures keep the cached catalog."""
+    if os.environ.get("PI_OFFLINE") or registry.config.settings.get("sync_catalog") is False:
+        return
+    try:
+        await refresh_radius_catalog(registry)
+    except (OSError, ValueError, httpx.HTTPError) as exc:
+        print(f"warning: Radius model discovery failed: {exc}", file=sys.stderr)
+
+
 async def async_main(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     filtered_argv, extension_flag_values = split_extension_flags(raw_argv, build_parser())
@@ -1004,9 +1028,16 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         if args.sync_models:
             providers = await fetch_catalog()
             save_cache(registry.config.agent_dir, providers)
+            radius_count = 0
+            try:
+                radius_count = await refresh_radius_catalog(registry)
+            except (OSError, ValueError, httpx.HTTPError) as exc:
+                print(f"warning: Radius model discovery failed: {exc}", file=sys.stderr)
             registry.reload()
             total = sum(len(entry["models"]) for entry in providers.values())
             print(f"synced {total} models across {len(providers)} providers")
+            if radius_count:
+                print(f"synced {radius_count} Radius models from the gateway")
             return 0
         if args.login:
             await authenticate(registry, args.login, args.oauth)
@@ -1014,6 +1045,9 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         if args.logout:
             registry.auth.logout(args.logout)
             return 0
+        # Startup model discovery (TS refreshes on every startup; PI_OFFLINE and
+        # sync_catalog: false skip it, and failures fall back to the cache).
+        await refresh_radius_models(registry)
         if args.list_models:
             print_models(registry)
             return 0

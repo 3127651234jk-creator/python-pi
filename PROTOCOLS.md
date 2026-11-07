@@ -23,18 +23,29 @@ $env:RADIUS_API_KEY = "..."
 python -m pi --provider radius --model MODEL_ID "hello"
 ```
 
-Existing Radius login credentials also work. Specify a model ID or configure
-models in `models.json`; automatic Radius gateway model discovery is not
-implemented. Configure accurate capability and context limits for your model.
+Existing Radius login credentials also work. Model discovery fetches the
+gateway catalog from `/v1/config`: at startup, after Radius login, and on
+`--sync-models` / `/sync-models` (skipped with `PI_OFFLINE` or
+`sync_catalog: false`; failures fall back to the cached catalog in
+`radius-cache.json`, and `RADIUS_GATEWAY` overrides the gateway). Discovered
+models carry the gateway-advertised `baseUrl`, capability flags, context and
+output limits, costs, and thinking-level map; model IDs configured in
+`models.json` keep their explicit settings.
 
 Custom providers can set `api` to `pi-messages` with a `base_url` and model list.
 The adapter sends `{model, context, options}` to `/messages`, serializes the
-transcript with TS camelCase fields, and accepts text, thinking, tool calls,
-usage, response IDs and terminal done/error events. Gateway costs are preserved.
-Missing terminal events produce an error while preserving partial content.
-Cache TTLs map `5m` to `short` and `1h` to `long`.
+transcript with TS camelCase fields (including text and thinking signatures,
+provider thinking levels and diagnostics), and accepts text, thinking, tool
+calls, usage, response IDs, gateway rewrite diagnostics and terminal
+done/error events; unknown event types are forwarded instead of failing.
+Gateway costs are preserved. Missing terminal events produce an error while
+preserving partial content. Cache TTLs map `5m` to `short` and `1h` to `long`,
+with the legacy `PI_CACHE_RETENTION=long` opt-in; `sessionId`, `toolChoice`
+and `debug` (`?debug=1`) request options are supported, plus the TS
+`onPayload` / `onResponse` / `onProviderStreamEvent` hooks. Non-2xx responses
+surface a `pi_messages_response_failure` diagnostic on the error message.
 
-Limitations: gateway rewrite diagnostics, text signatures, provider thinking
-metadata, debug/session/tool-choice options and full TS sampling controls are
-not represented by this adapter. Verification uses offline HTTP/SSE fixtures;
-no real Azure or Radius account requests have been performed.
+Limitations: the shared driver has no per-request timeout/retry controls, and
+a stream that ends without a terminal event reports the generic driver error
+message rather than the TS wording. Verification uses offline HTTP/SSE
+fixtures; no real Azure or Radius account requests have been performed.

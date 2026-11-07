@@ -10,6 +10,7 @@ from ..ai.models import Model, ModelCost, ModelError, list_catalog, resolve_mode
 from .auth import AuthStore
 from .catalog_sync import sync_overlay
 from .config import Configuration, read_json
+from .radius_catalog import radius_overlay
 from .subscription_auth import COPILOT_HEADERS, copilot_endpoint
 
 
@@ -84,6 +85,15 @@ class ModelRegistry:
             extra = [entry for entry in overlay.get("models", []) if entry.get("id") not in known]
             if extra:
                 merged[name] = {**merged.get(name, {}), "models": merged.get(name, {}).get("models", []) + extra}
+        # Discovered Radius gateway models overlay the provider (including a user
+        # models.json configuration) with real capability and cost data; ids the
+        # user declared keep their explicit settings.
+        for name, overlay in radius_overlay(self.config.agent_dir, self.config.settings.get("sync_catalog", True)).items():
+            entry = merged.get(name, {})
+            known = {model.get("id") for model in entry.get("models", [])}
+            extra = [model for model in overlay["models"] if isinstance(model, dict) and model.get("id") not in known]
+            if extra:
+                merged[name] = {**entry, "models": entry.get("models", []) + extra}
         for name, provider in providers.items():
             if not isinstance(name, str) or not name or not isinstance(provider, dict):
                 raise ModelError("Each provider must be an object")
@@ -132,10 +142,15 @@ class ModelRegistry:
             for entry in entries:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
                     raise ModelError("Model requires a nonempty id")
-                if set(entry) - {"id", "name", "reasoning", "context_window", "max_tokens", "input", "costs", "params"}:
+                if set(entry) - {"id", "name", "reasoning", "context_window", "max_tokens", "input", "costs", "params", "base_url", "thinking_level_map"}:
                     raise ModelError("Unknown model capability field")
                 if "params" in entry and (not isinstance(entry["params"], dict) or not all(isinstance(k, str) for k in entry["params"])):
                     raise ModelError("Model params must be an object with string keys")
+                if "base_url" in entry and (not isinstance(entry["base_url"], str) or not entry["base_url"]):
+                    raise ModelError("Model base_url must be a nonempty string")
+                if "thinking_level_map" in entry and (not isinstance(entry["thinking_level_map"], dict)
+                        or not all(isinstance(k, str) for k in entry["thinking_level_map"])):
+                    raise ModelError("Model thinking_level_map must be an object with string keys")
                 identifier = name + "/" + entry["id"]
                 base = models.get(identifier) or Model(id=entry["id"], name=entry["id"], api=api, provider=name, base_url="")
                 changes = {k: v for k, v in entry.items() if k not in ("id", "costs")}
@@ -155,7 +170,12 @@ class ModelRegistry:
             for identifier, model in list(models.items()):
                 if model.provider != name:
                     continue
-                base_url = provider.get("base_url", model.base_url)
+                # pi-messages models keep a catalog-provided base_url (e.g. the
+                # baseUrl a Radius gateway advertises) over the provider default.
+                if api == "pi-messages" and model.base_url:
+                    base_url = model.base_url
+                else:
+                    base_url = provider.get("base_url", model.base_url)
                 if stream_simple is None and (api not in ("faux", "google-vertex", "azure-openai", "azure-openai-responses") or base_url):
                     validate_url(base_url)
                 models[identifier] = replace(model, api=api, base_url=base_url.rstrip("/"), api_key=None)
@@ -194,6 +214,10 @@ class ModelRegistry:
             else:
                 raise ModelError(f"Unknown model: {provider}/{model_id}")
         endpoint = base_url or settings.get("base_url", model.base_url)
+        # pi-messages models keep their catalog-provided endpoint (e.g. the
+        # baseUrl a Radius gateway advertises) unless the caller overrides it.
+        if base_url is None and settings.get("api", model.api) == "pi-messages" and model.base_url:
+            endpoint = model.base_url
         if settings.get("api", model.api) == "azure-openai" and not endpoint:
             endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
         if settings.get("api", model.api) == "azure-openai-responses":

@@ -95,6 +95,9 @@ class Model:
     params: Dict[str, Any] = field(default_factory=dict, repr=False)
     auth_type: str = field(default="api_key", repr=False)
     get_api_key: Optional[Callable[[str], Awaitable[Optional[str]]]] = field(default=None, repr=False, compare=False)
+    # Provider-specific thinking-level mapping (pi level -> provider level or None),
+    # carried verbatim from catalogs such as the Radius gateway /v1/config response.
+    thinking_level_map: Optional[Dict[str, Optional[str]]] = None
 
     def calculate_cost(self, usage) -> Dict[str, float]:
         m = 1_000_000.0
