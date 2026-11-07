@@ -66,6 +66,22 @@ def test_selector_confirmation_and_cancel():
         asyncio.run(check(pipe))
 
 
+def test_selector_arrows_and_escape():
+    async def check(pipe):
+        with create_app_session(input=pipe, output=DummyOutput()):
+            ui = TerminalUI(Agent(resolve_model("faux")), lambda: [])
+            task = asyncio.create_task(ui.choose("Models", [("a", "Model A"), ("b", "Model B")]))
+            await asyncio.sleep(0.05)
+            pipe.send_text("\x1b[B\r")
+            assert await asyncio.wait_for(task, 3) == "b"
+            task = asyncio.create_task(ui.choose("Models", [("a", "Model A")]))
+            await asyncio.sleep(0.05)
+            pipe.send_text("\x1b")
+            assert await asyncio.wait_for(task, 3) is None
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
 def test_abort_during_run():
     async def check(pipe):
         agent = Agent(resolve_model("faux"))

@@ -10,13 +10,13 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, create_app_session
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
 from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
@@ -32,10 +32,58 @@ DEFAULT_KEYBINDINGS = {
     "complete": ["tab"],
 }
 THEMES = {
-    "dark": {"prompt": "bold ansicyan", "bottom-toolbar": "bg:#202530 #dddddd", "completion-menu.completion.current": "bg:#227799 #ffffff"},
-    "light": {"prompt": "bold ansiblue", "bottom-toolbar": "bg:#dddddd #222222", "completion-menu.completion.current": "bg:#227799 #ffffff"},
-    "mono": {"prompt": "bold", "bottom-toolbar": "reverse", "completion-menu.completion.current": "reverse"},
+    "dark": {
+        "prompt": "bold ansicyan", "bottom-toolbar": "bg:#202530 #dddddd",
+        "completion-menu.completion.current": "bg:#227799 #ffffff",
+    },
+    "light": {
+        "prompt": "bold ansiblue", "bottom-toolbar": "bg:#dddddd #222222",
+        "completion-menu.completion.current": "bg:#227799 #ffffff",
+        "dialog": "bg:#f7f8fb #23262f",
+        "dialog.border": "bg:#f7f8fb #b6bdd0",
+        "dialog.title": "bg:#f7f8fb #1d5fd0 bold",
+        "dialog.hint": "bg:#f7f8fb #6f7689",
+        "dialog.key": "bg:#f7f8fb #34417a bold",
+        "dialog.dim": "bg:#f7f8fb #c3c9d8",
+        "dialog.marker": "bg:#f7f8fb #6f7689",
+        "dialog.text": "bg:#f7f8fb #23262f",
+        "dialog.selected": "bg:#dbe6ff #0d1c3d bold",
+        "dialog.selected.marker": "bg:#dbe6ff #1d5fd0 bold",
+        "dialog.button": "bg:#e8ebf4 #23262f",
+        "dialog.button.focused": "bg:#1d5fd0 #ffffff bold",
+    },
+    "mono": {
+        "prompt": "bold", "bottom-toolbar": "reverse",
+        "completion-menu.completion.current": "reverse",
+        "dialog": "", "dialog.border": "", "dialog.title": "bold",
+        "dialog.hint": "", "dialog.key": "bold", "dialog.dim": "",
+        "dialog.marker": "", "dialog.text": "",
+        "dialog.selected": "reverse", "dialog.selected.marker": "reverse bold",
+        "dialog.button": "", "dialog.button.focused": "reverse bold",
+    },
 }
+
+# Dialog palette shared by the styled picker. Themes may override these classes;
+# user themes written before the picker existed fall back to the dark palette.
+DIALOG_STYLES = {
+    "dialog": "bg:#191c26 #c6cbe0",
+    "dialog.border": "bg:#191c26 #3f4866",
+    "dialog.title": "bg:#191c26 #8ab4ff bold",
+    "dialog.hint": "bg:#191c26 #6b7391",
+    "dialog.key": "bg:#191c26 #aab4d4 bold",
+    "dialog.dim": "bg:#191c26 #2c3349",
+    "dialog.marker": "bg:#191c26 #6b7391",
+    "dialog.text": "bg:#191c26 #c6cbe0",
+    "dialog.selected": "bg:#26304a #eef2ff bold",
+    "dialog.selected.marker": "bg:#26304a #8ab4ff bold",
+    "dialog.button": "bg:#222738 #c6cbe0",
+    "dialog.button.focused": "bg:#8ab4ff #14171f bold",
+}
+
+
+def _theme_styles(theme: dict) -> dict:
+    """Theme classes with the dialog palette filled in as defaults."""
+    return {**DIALOG_STYLES, **theme}
 
 
 def load_themes(agent_dir) -> dict:
@@ -225,6 +273,247 @@ def _overlay_bounds(frame, width: int, height: int) -> dict:
     return {"row": row, "col": col, "width": box_width, "height": box_height}
 
 
+def _dialog_text(value) -> str:
+    """Single-line label text: control characters would break the dialog layout."""
+    return "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in str(value))
+
+
+def _clip_text(text: str, width: int) -> str:
+    """Truncate to ``width`` columns, appending an ellipsis when cut."""
+    if width <= 0:
+        return ""
+    if get_cwidth(text) <= width:
+        return text
+    out, used = [], 0
+    for char in text:
+        size = get_cwidth(char)
+        if used + size > width - 1:
+            break
+        out.append(char)
+        used += size
+    return "".join(out) + "…"
+
+
+def _fit_fragments(fragments, width: int):
+    """Clip a formatted-text run to ``width`` display columns."""
+    out, used = [], 0
+    for style, text in fragments:
+        room = width - used
+        if room <= 0:
+            break
+        piece = _clip_text(text, room)
+        out.append((style, piece))
+        used += get_cwidth(piece)
+    return out
+
+
+class _ChoiceDialog:
+    """Centered card-style single-choice picker used by :meth:`TerminalUI.choose`.
+
+    Keys mirror the old ``radiolist_dialog``: arrows move inside the list, Tab
+    cycles list -> OK -> Cancel, Enter confirms the focused target and Escape
+    cancels. Mouse clicks work too.
+    """
+
+    FOCUS_ORDER = ("list", "ok", "cancel")
+
+    def __init__(self, title, values, style) -> None:
+        self.title = _dialog_text(title) or "Select"
+        self.values = list(values)
+        self.style = style
+        self.index = 0
+        self.top = 0
+        self.focus = "list"
+        self._hit: dict = {}
+        self._bindings = self._create_bindings()
+
+    def _create_bindings(self) -> KeyBindings:
+        bindings = KeyBindings()
+
+        def move(step: int) -> None:
+            self.focus = "list"
+            self.index = max(0, min(len(self.values) - 1, self.index + step))
+
+        def cycle(step: int) -> None:
+            position = self.FOCUS_ORDER.index(self.focus)
+            self.focus = self.FOCUS_ORDER[(position + step) % len(self.FOCUS_ORDER)]
+
+        @bindings.add("up")
+        def _up(event) -> None:
+            move(-1)
+
+        @bindings.add("down")
+        def _down(event) -> None:
+            move(1)
+
+        @bindings.add("pageup")
+        def _page_up(event) -> None:
+            move(-5)
+
+        @bindings.add("pagedown")
+        def _page_down(event) -> None:
+            move(5)
+
+        @bindings.add("home")
+        def _home(event) -> None:
+            move(-len(self.values))
+
+        @bindings.add("end")
+        def _end(event) -> None:
+            move(len(self.values))
+
+        @bindings.add("tab")
+        def _tab(event) -> None:
+            cycle(1)
+
+        @bindings.add("s-tab")
+        def _shift_tab(event) -> None:
+            cycle(-1)
+
+        @bindings.add("left")
+        @bindings.add("right")
+        def _nudge_focus(event) -> None:
+            if self.focus in ("ok", "cancel"):
+                self.focus = "cancel" if self.focus == "ok" else "ok"
+
+        @bindings.add("enter")
+        def _enter(event) -> None:
+            if self.focus == "cancel":
+                self._finish(None)
+            else:
+                self._finish(self.values[self.index][0])
+
+        @bindings.add("escape")
+        @bindings.add("c-c")
+        def _cancel(event) -> None:
+            self._finish(None)
+
+        @bindings.add(Keys.Vt100MouseEvent)
+        def _mouse(event) -> None:
+            size = get_app().output.get_size()
+            payload = _mouse_event_from_sequence(event.data, size.columns, size.rows)
+            if payload is None or payload["type"] != "press":
+                return
+            row, col = payload["y"], payload["x"]
+            hit = self._hit
+            if hit.get("list_top") is not None and hit["list_top"] <= row < hit["list_bottom"]:
+                self.focus = "list"
+                self.index = min(len(self.values) - 1, self.top + row - hit["list_top"])
+            elif hit.get("ok_row") == row and hit["ok_start"] <= col < hit["ok_end"]:
+                self._finish(self.values[self.index][0])
+            elif hit.get("cancel_row") == row and hit["cancel_start"] <= col < hit["cancel_end"]:
+                self._finish(None)
+
+        return bindings
+
+    def _finish(self, result) -> None:
+        get_app().exit(result=result)
+
+    def _content_line(self, fragments, content_width: int, pad_style: str = "class:dialog"):
+        used = sum(get_cwidth(text) for _, text in fragments)
+        line = [("class:dialog.border", "│"), (pad_style, " ")]
+        line.extend(fragments)
+        line.append((pad_style, " " * max(0, content_width + 1 - used)))
+        line.append(("class:dialog.border", "│"))
+        return line
+
+    def _render(self):
+        size = get_app().output.get_size()
+        columns, rows = max(20, size.columns), max(10, size.rows)
+
+        labels = [_dialog_text(label) for _, label in self.values]
+        hint = [
+            ("class:dialog.key", "↑↓"), ("class:dialog.hint", " select   "),
+            ("class:dialog.key", "Tab"), ("class:dialog.hint", " focus   "),
+            ("class:dialog.key", "Enter"), ("class:dialog.hint", " confirm   "),
+            ("class:dialog.key", "Esc"), ("class:dialog.hint", " cancel"),
+        ]
+        hint_width = sum(get_cwidth(text) for _, text in hint)
+        content_width = max(46, get_cwidth(self.title) + 1,
+                            max((get_cwidth(label) for label in labels), default=0) + 5,
+                            hint_width + 2)
+        content_width = min(content_width, 76, columns - 4)
+        width = content_width + 4
+
+        visible = max(1, min(len(self.values), rows - 9))
+        if self.index < self.top:
+            self.top = self.index
+        elif self.index >= self.top + visible:
+            self.top = self.index - visible + 1
+        self.top = max(0, min(self.top, len(self.values) - visible))
+
+        lines = [[("class:dialog.border", "╭" + "─" * (width - 2) + "╮")]]
+        lines.append(self._content_line([], content_width))
+        count = f"{self.index + 1}/{len(self.values)}" if len(self.values) > visible else ""
+        title = _clip_text(self.title, content_width - (get_cwidth(count) + 2 if count else 0))
+        title_fragments = [("class:dialog.title", title)]
+        if count:
+            title_fragments.append(("class:dialog", " " * (content_width - get_cwidth(title) - get_cwidth(count))))
+            title_fragments.append(("class:dialog.hint", count))
+        lines.append(self._content_line(title_fragments, content_width))
+        lines.append(self._content_line([("class:dialog.dim", "─" * content_width)], content_width))
+        lines.append(self._content_line([], content_width))
+
+        for offset, label in enumerate(labels[self.top:self.top + visible]):
+            selected = self.top + offset == self.index
+            marker_style = "class:dialog.selected.marker" if selected else "class:dialog.marker"
+            text_style = "class:dialog.selected" if selected else "class:dialog.text"
+            text = _clip_text(label, content_width - 4)
+            lines.append(self._content_line(
+                [(marker_style, " ●  " if selected else " ○  "), (text_style, text)],
+                content_width, pad_style=text_style))
+
+        lines.append(self._content_line([], content_width))
+        if hint_width > content_width:
+            hint = _fit_fragments(hint, content_width)
+        lines.append(self._content_line(hint, content_width))
+
+        ok_style = "class:dialog.button.focused" if self.focus == "ok" else "class:dialog.button"
+        cancel_style = "class:dialog.button.focused" if self.focus == "cancel" else "class:dialog.button"
+        ok_text, cancel_text = "[ OK ]", "[ Cancel ]"
+        buttons_width = get_cwidth(ok_text) + 2 + get_cwidth(cancel_text)
+        lines.append(self._content_line([
+            ("class:dialog", " " * max(0, content_width - buttons_width)),
+            (ok_style, ok_text), ("class:dialog", "  "), (cancel_style, cancel_text),
+        ], content_width))
+        lines.append([("class:dialog.border", "╰" + "─" * (width - 2) + "╯")])
+
+        left = max(0, (columns - width) // 2)
+        top = max(0, (rows - len(lines)) // 2)
+        list_top = top + 5
+        ok_row = top + len(lines) - 2
+        ok_start = left + 2 + content_width - buttons_width
+        self._hit = {
+            "list_top": list_top, "list_bottom": list_top + visible,
+            "ok_row": ok_row, "ok_start": ok_start, "ok_end": ok_start + get_cwidth(ok_text),
+            "cancel_row": ok_row, "cancel_start": ok_start + get_cwidth(ok_text) + 2,
+            "cancel_end": ok_start + buttons_width,
+        }
+
+        screen = [[("", " " * columns)] for _ in range(top)]
+        for line in lines:
+            screen.append([("", " " * left)] + line
+                          + [("", " " * max(0, columns - left - width))])
+        while len(screen) < rows:
+            screen.append([("", " " * columns)])
+
+        formatted = []
+        for number, line in enumerate(screen):
+            if number:
+                formatted.append(("", "\n"))
+            formatted.extend(line)
+        return formatted
+
+    async def run(self):
+        app = Application(
+            layout=Layout(HSplit([
+                Window(FormattedTextControl(self._render), wrap_lines=False, dont_extend_height=True),
+            ])),
+            key_bindings=self._bindings, full_screen=True, mouse_support=True, style=self.style,
+        )
+        return await app.run_async()
+
+
 class TerminalUI:
     def __init__(self, agent: Agent, commands: Callable[[], List[str]], settings: Optional[dict] = None,
                  input=None, output=None, extra_bindings: Optional[List[tuple]] = None,
@@ -250,7 +539,7 @@ class TerminalUI:
         self.header_lines: List[str] = []
         self.footer_lines: List[str] = []
         self.markdown_transform = None
-        self.style = Style.from_dict(self.themes[self.settings.get("theme", "dark")])
+        self.style = Style.from_dict(_theme_styles(self.themes[self.settings.get("theme", "dark")]))
         bindings = KeyBindings()
         keys = {**DEFAULT_KEYBINDINGS, **self.settings.get("keybindings", {})}
 
@@ -410,7 +699,7 @@ class TerminalUI:
     def set_theme(self, name: str):
         if name not in self.themes:
             raise ValueError(f"Unknown theme: {name}")
-        self.style = Style.from_dict(self.themes[name])
+        self.style = Style.from_dict(_theme_styles(self.themes[name]))
         self.session.style = self.style
 
     async def read(self, running=False):
@@ -700,8 +989,7 @@ class TerminalUI:
         if not values:
             return None
         with create_app_session(input=self.session.app.input, output=self.session.app.output):
-            return await radiolist_dialog(title=title, text="Use arrow keys; Tab moves to OK/Cancel; Enter confirms.",
-                                          values=values, style=self.style).run_async()
+            return await _ChoiceDialog(title, values, self.style).run()
 
     async def run(self, coroutine):
         task = asyncio.create_task(coroutine)
