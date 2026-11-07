@@ -166,7 +166,9 @@ settings 的 `sync_catalog: false` 同时关闭两个缓存叠加（缓存文件
 }
 ```
 
-快捷键使用 prompt_toolkit 的键名，空格分隔组合序列；每项覆盖对应默认值，重启后生效。重复绑定会报错。`--tui fullscreen` 使用固定对话区，文本模式支持 ANSI Markdown 和工具输出折叠；当前尚未实现图片内联显示。已用受控输入验证编辑、选择器和中止操作，尚未完成所有实际终端的人工验证。
+快捷键使用 prompt_toolkit 的键名，空格分隔组合序列；每项覆盖对应默认值，重启后生效。重复绑定会报错。`--tui fullscreen` 使用固定对话区，支持 ANSI Markdown、工具输出折叠和图片显示。
+
+图片来自工具结果（例如 `read` 读取图片文件）、助手消息和随 prompt 附加的图片。Kitty、Ghostty、WezTerm、Warp 使用 Kitty 图形协议，iTerm2 使用 OSC 1337；Kitty 收到非 PNG 数据时先用 Pillow 转码。全屏对话区由 prompt_toolkit 重绘、无法透传图形协议序列，因此改用 24 位色半块字符渲染（每个单元格上下两个像素）；协议路径用于不经过 prompt_toolkit 重绘的输出，即 `--tui off`、单次执行，以及 `--tui on` 时编辑器上方的流式输出。终端不支持图片、真彩色或图像解码失败时回退为 `[Image: ...]` 文本。`PI_IMAGE_PROTOCOL=kitty|iterm2|none`、`PI_TRUE_COLOR=0|1`、`PI_HYPERLINKS=0|1` 可覆盖自动检测。已用受控输入验证编辑、选择器和中止操作，尚未完成所有实际终端的人工验证。
 
 ## Python 扩展
 
@@ -208,7 +210,17 @@ def setup(api):
 
 扩展同时作用于文本、JSON 和 RPC 模式。RPC `get_commands` 列出扩展命令，空闲时可调用 `reload_extensions`；通过 `prompt` 发送 `/命令`，纯本地处理返回 `disposition=handled`，此时不产生新的 `agent_settled`。
 
-扩展是本机 Python 代码，以 Pi 进程权限运行，没有沙箱或项目授权界面。扩展 factory、回调和注册工具内的普通 `print` 重定向到 stderr，推荐使用 `api.log`；自行创建的后台任务仍须自行管理输出和生命周期。TS/JS 扩展可通过 Node 桥接（`pi.coding_agent.ts_extension`，需 PATH 中的 Node 22.6+）加载。桥接支持工具、消息和会话条目渲染器、Markdown transformer、虚拟模型、动态 MCP、Provider 注销、`refreshTools`、事件总线、状态 getter 和扩展 CLI flag。渲染函数在 Node 侧执行，组件的 `render(width)` 结果作为终端行返回；依赖鼠标、焦点或原生 TS TUI 实例的交互组件仍不适用。
+扩展是本机 Python 代码，以 Pi 进程权限运行，没有沙箱或项目授权界面。扩展 factory、回调和注册工具内的普通 `print` 重定向到 stderr，推荐使用 `api.log`；自行创建的后台任务仍须自行管理输出和生命周期。TS/JS 扩展可通过 Node 桥接（`pi.coding_agent.ts_extension`，需 PATH 中的 Node 22.6+）加载。桥接支持工具、消息和会话条目渲染器、Markdown transformer、虚拟模型、动态 MCP、Provider 注销、`refreshTools`、事件总线、状态 getter 和扩展 CLI flag。渲染函数在 Node 侧执行，组件的 `render(width)` 结果作为终端行返回。
+
+`ctx.ui.custom(factory, options)` 的交互组件保留在 Node 进程中：Python 侧显示组件每次 `render(width)` 的行，`tui.requestRender()` 触发重绘，键盘输入原样转发给 `handleInput`（同一批到达的 ESC+字母会合并为 alt 组合），SGR/X10 鼠标事件转换为 TS 的 `TuiMouseEvent` 后转发给 `handleMouse`（含 press/release/click/drag/wheel）。`keybindings.matches(data, action)` 支持 `tui.select.*`、`tui.input.*` 和常用的 `app.*` 默认按键；组件调用 `done(result)` 后视图关闭并让 `ui.custom` 的 promise 取得结果。
+
+`options.overlay` 为真时按 `overlayOptions`（`width`/`minWidth`/`maxHeight`/`anchor`/`offsetX`/`offsetY`/`row`/`col`/`margin`/`visible`）把组件放进浮动框；`onHandle` 提供 `hide`/`setHidden`/`isHidden`/`focus`/`unfocus`/`isFocused`/`getBounds`。限制：浮动框背景是空白而不是实时 transcript；`hide()` 会关闭视图并让 `ui.custom` 以 `undefined` 结束（TS 中 promise 保持 pending）；`setHidden(true)` 只隐藏浮动框，按键仍由组件接收。
+
+`ctx.ui.setWidget(key, lines | factory, options)`、`setHeader(factory)` 和 `setFooter(factory)` 也走桥接：工厂在 Node 中按终端宽度渲染，`tui.requestRender()` 重新渲染并推送新行。widget 按 key 覆盖，`placement` 为 `aboveEditor`/`belowEditor`；这些区域只在 `--tui fullscreen` 中显示。
+
+`ctx.ui.setEditorComponent(factory)` 把输入编辑器换成扩展组件：每次读取输入时显示 transcript 和编辑器行，按键与鼠标转发给组件，`onSubmit` 的文本作为本次输入返回，`Escape`/`Ctrl+D` 在组件未自行定义时映射为中止/退出。该模式使用独立的输入视图，`--tui on` 下也会临时占用全屏。
+
+RPC/JSON 模式没有交互宿主，`ui.custom` 立即返回 `undefined`（与 TS RPC 一致），widget/header/footer 和编辑器接管被忽略。代理运行中打开自定义视图会暂停编辑器输入循环，关闭后恢复。
 
 扩展 flag 与 TS CLI 一样使用未知长参数的两阶段解析。`--flag` 传入布尔值，`--flag=value` 或 `--flag value` 传入字符串；扩展加载后校验名称和类型，未注册参数会报错。
 
@@ -590,7 +602,7 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 
 库调用可通过 `Agent(..., compaction=CompactionSettings(...))` 配置；从 `pi.agent.compaction` 导入 `CompactionSettings`。默认 `reserve_tokens=16384`、`keep_recent_tokens=20000`、`summary_tokens=2048`，可设置 `enabled=False` 关闭。未知模型应准确设置 `model.context_window`。Token 数使用 UTF-8 长度估算，并非模型的精确分词结果。
 
-- TS TUI 的富文本与图片内联渲染；Python 已有全屏对话布局（`--tui fullscreen`）、多行编辑、补全、选择器、主题、快捷键及 ANSI Markdown 与工具输出折叠
+- TS TUI 的通用组件布局（转录区内任意组件的横向组合、焦点栈与滚动视口）；Python 已有全屏对话布局（`--tui fullscreen`）、多行编辑、补全、选择器、主题、快捷键、ANSI Markdown、工具输出折叠、终端图片显示（Kitty/iTerm2 协议，全屏模式为半块字符）、扩展 `ctx.ui.custom` 交互视图（按键/鼠标转发、overlay 几何与 handle）、widget/header/footer 组件工厂及 `setEditorComponent` 编辑器接管
 - 扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）。路由协议（pi.protocol/pi.server/pi.client）、Chord 服务层（pi.chord：契约绑定、$chord.service 控制调用、delta wire 编解码、provider/consumer，见 ROUTED_PROTOCOL.md）与 durable coding-agent 服务宿主（`pi server` 入口、每会话 worker 进程、退出监控、会话移除管理）已实现；Python 客户端 ↔ TS 服务端、TS 客户端 ↔ Python 服务端的真实互通由 tests/test_chord_interop.py 以 Node 直接加载 TS 源码验证
 - prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）与嵌套工具调用的记录/用量聚合（TS nested-tool-calls）
 - 其他 provider 的专属认证；已实现 Claude、Codex、Copilot、Kimi、xAI、Radius 登录，OpenAI 的 Sign in with ChatGPT、OpenRouter PKCE 及可配置标准设备码 OAuth

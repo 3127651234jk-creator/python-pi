@@ -49,6 +49,12 @@ class ExtensionUI:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.sink = None  # async callable(request: dict) -> response value
+        # async callable(session) -> result; hosts ctx.ui.custom components.
+        self.custom_host = None
+        # sync callable() -> (columns, rows); sizes widget/header/footer views.
+        self.size_provider = None
+        # async/sync callable(session | None) -> None; installs ctx.ui.setEditorComponent.
+        self.editor_host = None
 
     async def _request(self, method: str, **params):
         if self.sink is not None:
@@ -74,10 +80,20 @@ class ExtensionUI:
     async def set_status(self, text: str) -> None:
         await self._request("setStatus", text=text)
 
-    async def set_widget(self, placement: str, lines: List[str]) -> None:
-        if placement not in ("above", "below"):
+    async def set_widget(self, placement: str, lines: List[str], key: str = "") -> None:
+        if placement in ("below", "belowEditor"):
+            placement = "below"
+        elif placement in ("above", "aboveEditor"):
+            placement = "above"
+        else:
             raise ValueError("widget placement must be above or below")
-        await self._request("setWidget", placement=placement, lines=list(lines))
+        await self._request("setWidget", placement=placement, lines=list(lines), key=key)
+
+    async def set_header(self, lines: List[str]) -> None:
+        await self._request("setHeader", lines=list(lines))
+
+    async def set_footer(self, lines: List[str]) -> None:
+        await self._request("setFooter", lines=list(lines))
 
     async def set_title(self, title: str) -> None:
         await self._request("setTitle", title=title)
@@ -318,6 +334,9 @@ class ExtensionManager:
         self.old_before, self.old_after = agent.before_tool_call, agent.after_tool_call
         self.old_prepare_request = agent.prepare_request
         self.output = None
+        self.custom_host = None
+        self.size_provider = None
+        self.editor_host = None
 
     def refresh_tools(self) -> None:
         """Publish tools registered after setup without changing the active set otherwise."""
@@ -546,6 +565,9 @@ class ExtensionManager:
         if set(api.commands) & set(self.commands):
             raise ValueError("Extension command name collision")
         api.sealed = True
+        api.ui.custom_host = self.custom_host
+        api.ui.size_provider = self.size_provider
+        api.ui.editor_host = self.editor_host
         self.extensions.append(api)
         self.agent.tools.extend(api.tools)
         self.commands.update(api.commands)
@@ -650,3 +672,23 @@ class ExtensionManager:
         """Route extension UI requests through a client (RPC mode)."""
         for api in self.extensions:
             api.ui.sink = sink
+
+    def set_editor_host(self, host) -> None:
+        """Install extension ``ctx.ui.setEditorComponent`` editors on the TUI."""
+        self.editor_host = host
+        for api in self.extensions:
+            api.ui.editor_host = host
+
+    def set_custom_host(self, host, size=None) -> None:
+        """Route ``ctx.ui.custom`` components to an interactive host.
+
+        Existing and later-loaded extensions both see the host. ``size`` is a
+        sync callable returning the terminal ``(columns, rows)`` used to render
+        widget/header/footer component factories. Without a host the bridge
+        resolves ``ui.custom`` immediately, like the TS RPC host.
+        """
+        self.custom_host = host
+        self.size_provider = size
+        for api in self.extensions:
+            api.ui.custom_host = host
+            api.ui.size_provider = size

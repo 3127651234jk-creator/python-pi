@@ -22,8 +22,12 @@ works; when neither is available the extension is skipped with a notice.
 Session naming, thinking changes and tool/state snapshots are bridged.
 Synchronous getters read a snapshot refreshed before setup and each callback;
 mutations return promises so callers can observe host validation failures.
-Not every TS API is bridged: TUI renderers, virtual models, MCP server
-registration, session-navigation actions and some state getters stay
+Interactive components stay in Node: ``ctx.ui.custom`` renders into a view,
+``setWidget``/``setHeader``/``setFooter`` factories render into the fullscreen
+slots, and ``setEditorComponent`` replaces the prompt editor for input reads.
+Keys and mouse events are routed back to ``handleInput``/``handleMouse`` and
+``tui.requestRender`` re-renders. Not every TS API is bridged: session
+navigation, theme switching, editor text helpers and some state getters stay
 unimplemented. Unsupported methods exist on the
 ``pi`` object but raise a clear error when an extension calls them, instead
 of failing as opaque TypeErrors.
@@ -38,7 +42,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from ..agent.types import AgentTool, AgentToolResult, BeforeToolCallResult
 from ..ai.types import ImageContent, TextContent
@@ -60,6 +64,81 @@ class InputResult:
 
     text: Optional[str] = None
     handled: bool = False
+
+
+@dataclass
+class CustomViewFrame:
+    """One render of an interactive ``ctx.ui.custom`` component."""
+
+    lines: List[str]
+    cursor: Optional[Tuple[int, int]] = None
+    overlay: Optional[dict] = None
+    hidden: bool = False
+
+
+class CustomViewSession:
+    """An open ``ctx.ui.custom`` component hosted in the Node child.
+
+    The UI host drives the component: ``render`` returns the current lines,
+    ``input`` forwards raw key data (the same bytes the TS component's
+    ``handleInput`` expects) and ``mouse`` forwards normalized mouse events.
+    The extension calls ``done(result)`` in Node, which sets ``done_event`` and
+    resolves its promise.
+    """
+
+    def __init__(self, bridge: "TsExtensionBridge", session_id: str, options: dict) -> None:
+        self.bridge, self.id, self.options = bridge, session_id, options or {}
+        self.done_event = asyncio.Event()
+        self.result: Any = None
+        self.render_listener: Optional[Callable[[], None]] = None
+        self.handle_listener: Optional[Callable[[str], None]] = None
+        self.bounds: Optional[dict] = None
+
+    def finish(self, result: Any) -> None:
+        self.result = result
+        self.done_event.set()
+
+    def request_render(self) -> None:
+        if self.render_listener is not None:
+            self.render_listener()
+
+    def handle_action(self, action: str) -> None:
+        if self.handle_listener is not None:
+            self.handle_listener(action)
+
+    @staticmethod
+    def _frame(payload: Any) -> CustomViewFrame:
+        if not isinstance(payload, dict):
+            return CustomViewFrame([])
+        lines = [str(line) for line in payload.get("lines") or []]
+        cursor = payload.get("cursor")
+        point = None
+        if isinstance(cursor, dict) and isinstance(cursor.get("x"), int) and isinstance(cursor.get("y"), int):
+            point = (cursor["x"], cursor["y"])
+        overlay = payload.get("overlay")
+        return CustomViewFrame(lines, point, overlay if isinstance(overlay, dict) else None,
+                               bool(payload.get("hidden")))
+
+    def _params(self, extra: dict) -> dict:
+        params = {"sessionId": self.id, **extra}
+        if self.bounds is not None:
+            params["bounds"] = dict(self.bounds)
+        return params
+
+    async def render(self, width: int, height: int = 24) -> CustomViewFrame:
+        payload = await self.bridge.request(
+            "customRender", self._params({"width": width, "height": height}))
+        return self._frame(payload)
+
+    async def input(self, data: str, width: int) -> CustomViewFrame:
+        payload = await self.bridge.request(
+            "customInput", self._params({"data": data, "width": width}))
+        return self._frame(payload)
+
+    async def mouse(self, event: dict, width: int) -> CustomViewFrame:
+        payload = await self.bridge.request(
+            "customMouse", self._params({"event": event, "width": width}))
+        return self._frame(payload)
 
 
 def node_command() -> Optional[List[str]]:
@@ -109,6 +188,54 @@ def result_from_json(payload: dict) -> AgentToolResult:
     )
 
 
+class CustomEditorSession:
+    """An extension-owned input editor hosted in the Node child.
+
+    ``ctx.ui.setEditorComponent(factory)`` replaces the Python prompt editor
+    with the extension's component: the read loop renders it, forwards raw key
+    data, and returns the text reported by the component's ``onSubmit``.
+    """
+
+    def __init__(self, bridge: "TsExtensionBridge", session_id: str) -> None:
+        self.bridge, self.id = bridge, session_id
+        self.submitted: Optional[str] = None
+        self.action: Optional[str] = None
+        self.submit_event = asyncio.Event()
+        self.render_listener: Optional[Callable[[], None]] = None
+
+    def submit(self, text: str) -> None:
+        self.submitted = text
+        self.submit_event.set()
+
+    def request_action(self, action: str) -> None:
+        self.action = action
+        self.submit_event.set()
+
+    def request_render(self) -> None:
+        if self.render_listener is not None:
+            self.render_listener()
+
+    def reset(self) -> None:
+        self.submitted = None
+        self.action = None
+        self.submit_event.clear()
+
+    async def render(self, width: int, height: int = 24) -> CustomViewFrame:
+        payload = await self.bridge.request(
+            "editorRender", {"sessionId": self.id, "width": width, "height": height})
+        return CustomViewSession._frame(payload)
+
+    async def input(self, data: str, width: int) -> CustomViewFrame:
+        payload = await self.bridge.request(
+            "editorInput", {"sessionId": self.id, "data": data, "width": width})
+        return CustomViewSession._frame(payload)
+
+    async def mouse(self, event: dict, width: int) -> CustomViewFrame:
+        payload = await self.bridge.request(
+            "editorMouse", {"sessionId": self.id, "event": event, "width": width})
+        return CustomViewSession._frame(payload)
+
+
 class TsExtensionBridge:
     """One Node process hosting one TS/JS extension; fills a shared ExtensionAPI."""
 
@@ -126,6 +253,10 @@ class TsExtensionBridge:
         self.keybinding_handlers: Dict[str, str] = {}
         self.renderer_handlers: List[str] = []
         self.virtual_model_handlers: Dict[tuple, str] = {}
+        self.custom_sessions: Dict[str, CustomViewSession] = {}
+        self.custom_tasks: set = set()
+        self.editor_session: Optional[CustomEditorSession] = None
+        self.editor_serial = 0
         self.closed = False
 
     async def start(self) -> None:
@@ -143,6 +274,10 @@ class TsExtensionBridge:
         except Exception:
             await self.close()
             raise
+
+    async def request(self, method: str, params: dict, timeout: float = CALL_TIMEOUT) -> Any:
+        """Host-initiated request; used by interactive custom views."""
+        return await self._request(method, params, timeout)
 
     async def _request(self, method: str, params: dict, timeout: float = CALL_TIMEOUT) -> Any:
         if self.process is None or self.process.stdin is None:
@@ -184,6 +319,12 @@ class TsExtensionBridge:
                         future.set_result(message.get("result"))
                     continue
                 method = message.get("method")
+                if method in ("customDone", "customRenderRequest", "customHandle"):
+                    self._handle_custom_notification(message)
+                    continue
+                if method in ("editorSubmit", "editorAction", "editorRenderRequest"):
+                    self._handle_editor_notification(message)
+                    continue
                 if method == "toolUpdate":
                     callback = self.updates.get((message.get("params") or {}).get("toolCallId", ""))
                     if callback is not None:
@@ -216,6 +357,16 @@ class TsExtensionBridge:
             payload["result"] = result
         try:
             self.process.stdin.write((json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode())
+            await self.process.stdin.drain()
+        except (ConnectionError, RuntimeError):
+            pass
+
+    async def _notify(self, method: str, params: dict) -> None:
+        if self.process is None or self.process.stdin is None:
+            return
+        try:
+            self.process.stdin.write((json.dumps({"method": method, "params": params},
+                                                 ensure_ascii=False, default=str) + "\n").encode())
             await self.process.stdin.drain()
         except (ConnectionError, RuntimeError):
             pass
@@ -285,6 +436,20 @@ class TsExtensionBridge:
             elif method == "ui":
                 result = await self._ui_call(params)
                 await self._reply(request, result)
+                return
+            elif method == "uiCustom":
+                await self._open_custom(request, params)
+                return
+            elif method == "uiEditor":
+                await self._open_editor(request, params)
+                return
+            elif method == "terminalSize":
+                provider = self.api.ui.size_provider
+                if provider is None:
+                    await self._reply(request, {"width": 80, "height": 24})
+                else:
+                    width, height = provider()
+                    await self._reply(request, {"width": width, "height": height})
                 return
             elif method == "appendEntry":
                 entry_id = api.append_entry(params.get("customType", ""), params.get("data") or {})
@@ -382,12 +547,103 @@ class TsExtensionBridge:
             await ui.set_status(str(params.get("text", "")))
             return None
         if call == "setWidget":
-            await ui.set_widget(str(params.get("placement", "below")), list(params.get("lines") or []))
+            await ui.set_widget(str(params.get("placement", "above")), list(params.get("lines") or []),
+                                key=str(params.get("key") or ""))
+            return None
+        if call == "setHeader":
+            await ui.set_header(list(params.get("lines") or []))
+            return None
+        if call == "setFooter":
+            await ui.set_footer(list(params.get("lines") or []))
             return None
         if call == "setTitle":
             await ui.set_title(str(params.get("title", "")))
             return None
         raise ValueError(f"unsupported ui call: {call}")
+
+    # ---- interactive custom views ------------------------------------------
+
+    def _handle_custom_notification(self, message: dict) -> None:
+        params = message.get("params") or {}
+        session = self.custom_sessions.get(str(params.get("sessionId", "")))
+        if session is None:
+            return
+        method = message.get("method")
+        if method == "customDone":
+            session.finish(params.get("result"))
+        elif method == "customHandle":
+            session.handle_action(str(params.get("action", "")))
+        else:
+            session.request_render()
+
+    async def _open_custom(self, request: dict, params: dict) -> None:
+        session_id = str(params.get("sessionId") or "")
+        if not session_id:
+            await self._reply(request, error="ui.custom requires a session id")
+            return
+        host = self.api.ui.custom_host
+        if host is None:
+            # Mirrors the TS RPC host: resolve immediately with no view.
+            await self._reply(request, {"unavailable": True})
+            return
+        session = CustomViewSession(self, session_id, params.get("options") or {})
+        self.custom_sessions[session_id] = session
+        await self._reply(request, {"sessionId": session_id})
+        task = asyncio.create_task(self._run_custom(host, session))
+        self.custom_tasks.add(task)
+        task.add_done_callback(self.custom_tasks.discard)
+
+    def _handle_editor_notification(self, message: dict) -> None:
+        session = self.editor_session
+        if session is None:
+            return
+        params = message.get("params") or {}
+        if params.get("sessionId") not in (None, session.id):
+            return
+        method = message.get("method")
+        if method == "editorSubmit":
+            session.submit(str(params.get("text", "")))
+        elif method == "editorAction":
+            session.request_action(str(params.get("action", "")))
+        else:
+            session.request_render()
+
+    async def _open_editor(self, request: dict, params: dict) -> None:
+        host = self.api.ui.editor_host
+        if host is None:
+            await self._reply(request, {"unavailable": True})
+            return
+        handler_id = params.get("handlerId")
+        if not handler_id:
+            if self.editor_session is not None:
+                await self._notify("editorClose", {"sessionId": self.editor_session.id})
+                self.editor_session = None
+            outcome = host(None)
+            if asyncio.iscoroutine(outcome):
+                await outcome
+            await self._reply(request, {})
+            return
+        if self.editor_session is not None:
+            await self._notify("editorClose", {"sessionId": self.editor_session.id})
+        self.editor_serial += 1
+        session = CustomEditorSession(self, f"editor{self.editor_serial}")
+        self.editor_session = session
+        outcome = host(session)
+        if asyncio.iscoroutine(outcome):
+            await outcome
+        await self._reply(request, {"sessionId": session.id})
+
+    async def _run_custom(self, host, session: CustomViewSession) -> None:
+        result = None
+        try:
+            result = await host(session)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - a broken view must not kill the bridge
+            self.api.log(f"Custom view failed: {exc}")
+        finally:
+            self.custom_sessions.pop(session.id, None)
+            await self._notify("customClose", {"sessionId": session.id, "result": to_jsonable(result)})
 
     # ---- parent-initiated dispatches ----------------------------------------
 
@@ -513,6 +769,14 @@ class TsExtensionBridge:
             return
         self.closed = True
         self._unsubscribe_bus()
+        if self.editor_session is not None:
+            await self._notify("editorClose", {"sessionId": self.editor_session.id})
+            self.editor_session = None
+        for task in list(self.custom_tasks):
+            task.cancel()
+        if self.custom_tasks:
+            await asyncio.gather(*self.custom_tasks, return_exceptions=True)
+        self.custom_sessions.clear()
         if self.process is not None and self.process.stdin is not None and self.process.returncode is None:
             try:
                 self.process.stdin.write(b'{"method":"shutdown"}\n')

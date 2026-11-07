@@ -9,7 +9,8 @@ from prompt_toolkit.output import DummyOutput
 
 from pi.agent.agent import Agent
 from pi.ai.models import resolve_model
-from pi.coding_agent.tui import AgentCompleter, TerminalUI
+from pi.coding_agent.tui import AgentCompleter, TerminalUI, _overlay_bounds
+from pi.coding_agent.ts_extension import CustomViewFrame
 from pi.coding_agent.config import validate_settings
 
 
@@ -85,6 +86,226 @@ def test_invalid_theme_and_bindings():
         validate_settings({"theme": "invalid"})
     with pytest.raises(ValueError):
         validate_settings({"keybindings": {"unknown": ["c-x"]}})
+
+
+def test_custom_view_forwards_keys_mouse_and_done():
+    class FakeSession:
+        def __init__(self):
+            self.done_event = asyncio.Event()
+            self.result = None
+            self.render_listener = None
+            self.handle_listener = None
+            self.options = {}
+            self.bounds = None
+            self.inputs = []
+            self.mouse_events = []
+
+        async def render(self, width, height=24):
+            return CustomViewFrame(["component"], (0, 0))
+
+        async def input(self, data, width):
+            self.inputs.append(data)
+            return CustomViewFrame([f"key:{data}"], None)
+
+        async def mouse(self, event, width):
+            self.mouse_events.append(event)
+            return CustomViewFrame([f"mouse:{event['type']}"], None)
+
+    async def check(pipe):
+        ui = TerminalUI(Agent(resolve_model("faux")), lambda: [], input=pipe, output=DummyOutput())
+        session = FakeSession()
+        task = asyncio.create_task(ui.custom_view(session))
+        await asyncio.sleep(0.1)
+        pipe.send_text("x")
+        await asyncio.sleep(0.1)
+        assert session.inputs == ["x"]
+
+        pipe.send_text("\x1b[<0;10;5M")
+        await asyncio.sleep(0.1)
+        pipe.send_text("\x1b[<0;10;5m")
+        await asyncio.sleep(0.1)
+        assert [event["type"] for event in session.mouse_events] == ["press", "release", "click"]
+        assert session.mouse_events[0]["button"] == "left"
+        assert (session.mouse_events[0]["x"], session.mouse_events[0]["y"]) == (9, 4)
+
+        session.result = "finished"
+        session.done_event.set()
+        assert await asyncio.wait_for(task, 3) == "finished"
+
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
+def test_custom_view_suspends_the_running_editor():
+    class FakeSession:
+        def __init__(self):
+            self.done_event = asyncio.Event()
+            self.result = None
+            self.render_listener = None
+            self.handle_listener = None
+            self.options = {}
+            self.bounds = None
+            self.inputs = []
+
+        async def render(self, width, height=24):
+            return CustomViewFrame(["component"], None)
+
+        async def input(self, data, width):
+            self.inputs.append(data)
+            return CustomViewFrame([f"key:{data}"], None)
+
+        async def mouse(self, event, width):
+            return CustomViewFrame(["mouse"], None)
+
+    async def check(pipe):
+        ui = TerminalUI(Agent(resolve_model("faux")), lambda: [], input=pipe, output=DummyOutput())
+        session = FakeSession()
+
+        async def work():
+            await asyncio.sleep(0.05)
+            view = asyncio.create_task(ui.custom_view(session))
+            await asyncio.sleep(0.1)
+            assert not ui.session.app.is_running
+            pipe.send_text("y")
+            await asyncio.sleep(0.1)
+            session.result = "closed"
+            session.done_event.set()
+            assert await asyncio.wait_for(view, 3) == "closed"
+
+        await asyncio.wait_for(ui.run(work()), 5)
+        assert session.inputs == ["y"]
+
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
+def test_custom_view_coalesces_alt_keys():
+    class FakeSession:
+        def __init__(self):
+            self.done_event = asyncio.Event()
+            self.result = None
+            self.render_listener = None
+            self.handle_listener = None
+            self.options = {}
+            self.bounds = None
+            self.inputs = []
+
+        async def render(self, width, height=24):
+            return CustomViewFrame(["component"], None)
+
+        async def input(self, data, width):
+            self.inputs.append(data)
+            return CustomViewFrame(["component"], None)
+
+        async def mouse(self, event, width):
+            return CustomViewFrame(["component"], None)
+
+    async def check(pipe):
+        ui = TerminalUI(Agent(resolve_model("faux")), lambda: [], input=pipe, output=DummyOutput())
+        session = FakeSession()
+        task = asyncio.create_task(ui.custom_view(session))
+        await asyncio.sleep(0.1)
+        pipe.send_text("\x1bb")
+        await asyncio.sleep(0.1)
+        assert session.inputs == ["\x1bb"]
+
+        pipe.send_text("\x1b")
+        # prompt_toolkit holds a lone ESC for its sequence timeout (~0.5s)
+        # before delivering it; the forwarder then holds it for another 40ms.
+        await asyncio.sleep(0.8)
+        assert session.inputs[-1] == "\x1b"
+
+        session.done_event.set()
+        await asyncio.wait_for(task, 3)
+
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
+def test_overlay_bounds_follow_ts_options():
+    frame = CustomViewFrame(["abc", "def"], overlay={"width": "50%", "anchor": "center"})
+    assert _overlay_bounds(frame, 80, 24) == {"row": 11, "col": 20, "width": 40, "height": 2}
+
+    frame = CustomViewFrame(["x"], overlay={"width": 10, "anchor": "bottom-right", "margin": 2})
+    assert _overlay_bounds(frame, 80, 24) == {"row": 21, "col": 68, "width": 10, "height": 1}
+
+    frame = CustomViewFrame(["x"], overlay={"minWidth": 20, "row": "25%", "col": "10%"})
+    assert _overlay_bounds(frame, 80, 24) == {"row": 6, "col": 8, "width": 20, "height": 1}
+
+
+def test_custom_view_overlay_reports_bounds():
+    class FakeSession:
+        def __init__(self):
+            self.done_event = asyncio.Event()
+            self.result = None
+            self.render_listener = None
+            self.handle_listener = None
+            self.options = {"overlay": True}
+            self.bounds = None
+
+        async def render(self, width, height=24):
+            return CustomViewFrame(["abc"], None, {"width": 10, "anchor": "top-left"})
+
+        async def input(self, data, width):
+            return await self.render(width, height=24)
+
+        async def mouse(self, event, width):
+            return await self.render(width, height=24)
+
+    async def check(pipe):
+        ui = TerminalUI(Agent(resolve_model("faux")), lambda: [], input=pipe, output=DummyOutput())
+        session = FakeSession()
+        task = asyncio.create_task(ui.custom_view(session))
+        await asyncio.sleep(0.1)
+        assert session.bounds == {"row": 0, "col": 0, "width": 10, "height": 1}
+        session.done_event.set()
+        await asyncio.wait_for(task, 3)
+
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
+def test_custom_editor_read_submits_text():
+    class FakeEditor:
+        def __init__(self):
+            self.submitted = None
+            self.action = None
+            self.submit_event = asyncio.Event()
+            self.render_listener = None
+            self.inputs = []
+
+        def reset(self):
+            self.submitted = None
+            self.action = None
+            self.submit_event.clear()
+
+        async def render(self, width, height=24):
+            return CustomViewFrame(["editor"], (0, 0))
+
+        async def input(self, data, width):
+            self.inputs.append(data)
+            if data == "\r":
+                self.submitted = "hello"
+                self.submit_event.set()
+            return CustomViewFrame([f"editor:{data}"], None)
+
+        async def mouse(self, event, width):
+            return CustomViewFrame(["editor"], None)
+
+    async def check(pipe):
+        ui = TerminalUI(Agent(resolve_model("faux")), lambda: [], input=pipe, output=DummyOutput())
+        editor = FakeEditor()
+        ui.set_custom_editor(editor)
+        task = asyncio.create_task(ui.read())
+        await asyncio.sleep(0.1)
+        pipe.send_text("h")
+        await asyncio.sleep(0.1)
+        assert editor.inputs == ["h"]
+        pipe.send_text("\r")
+        assert await asyncio.wait_for(task, 3) == "hello"
+
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
 
 
 def test_fullscreen_transcript_widgets_and_input():

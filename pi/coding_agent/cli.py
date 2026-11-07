@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import base64
 import os
+import shutil
 import sys
 import json
 import getpass
@@ -41,6 +42,7 @@ from .bug_report import (BUG_REPORT_CUSTOM_ENTRY_TYPE, bug_report_archive_file_n
                          generate_bug_report_summary, upload_bug_report, write_bug_report_archive)
 from .file_processor import process_file_arguments
 from .markdown_render import render_markdown
+from .terminal_image import render_image_lines
 from .output_guard import raw_stdout, restore_stdout, take_over_stdout
 from .packages import PackageManager
 from .provider_attribution import apply_attribution, is_opencode_like
@@ -170,6 +172,29 @@ class CliRenderer:
         self.fold = int(self.settings.get("fold_output", 10))
         self.extensions: Optional[ExtensionManager] = None
         self.tool_args = {}
+        self.ui: Optional[TerminalUI] = None
+        self.full_screen = False
+
+    def image_width(self) -> int:
+        if self.ui is not None:
+            return self.ui.width()
+        return shutil.get_terminal_size((80, 24)).columns
+
+    def render_image_block(self, block: ImageContent) -> str:
+        """Render an image content block as terminal lines.
+
+        Kitty/iTerm2 placements need raw output, so the fullscreen transcript
+        (painted by prompt_toolkit) uses truecolor half-block cells instead.
+        """
+        lines = render_image_lines(
+            block.data, block.mime_type,
+            max_width_cells=max(8, min(60, self.image_width() - 2)),
+            allow_protocol=not self.full_screen,
+        )
+        return "\n".join(lines)
+
+    def print_image_block(self, block: ImageContent) -> None:
+        print(self.render_image_block(block), flush=True)
 
     async def __call__(self, event: Any) -> None:
         if self.quiet:
@@ -180,14 +205,18 @@ class CliRenderer:
                 api.markdown_transformers for api in self.extensions.extensions)
             if isinstance(inner, TextDeltaEvent) and not self.markdown and not transformed:
                 print(inner.delta, end="", flush=True)
-        elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage) and (
-                self.markdown or self.extensions is not None and any(
-                    api.markdown_transformers for api in self.extensions.extensions)):
-            text = "\n".join(block.text for block in event.message.content if isinstance(block, TextContent))
-            if text.strip():
-                if self.extensions is not None:
-                    text = await self.extensions.transform_markdown(text, "assistant")
-                print("\n" + render_markdown(text), flush=True)
+        elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+            transformed = self.extensions is not None and any(
+                api.markdown_transformers for api in self.extensions.extensions)
+            if self.markdown or transformed:
+                text = "\n".join(block.text for block in event.message.content if isinstance(block, TextContent))
+                if text.strip():
+                    if self.extensions is not None:
+                        text = await self.extensions.transform_markdown(text, "assistant")
+                    print("\n" + render_markdown(text), flush=True)
+            for block in event.message.content:
+                if isinstance(block, ImageContent):
+                    self.print_image_block(block)
         elif isinstance(event, ToolExecutionStartEvent):
             args = event.args or {}
             self.tool_args[event.tool_call_id] = args
@@ -222,6 +251,9 @@ class CliRenderer:
                     print(f"  {line}", flush=True)
                 if len(lines) > self.fold:
                     print(f"  [+{len(lines) - self.fold} lines folded; /set fold_output 0 shows all]", flush=True)
+            for block in getattr(result, "content", None) or []:
+                if isinstance(block, ImageContent):
+                    self.print_image_block(block)
         elif isinstance(event, ToolExecutionUpdateEvent) and self.extensions is not None:
             lines = await self.extensions.render_tool(event.tool_name, "result",
                 to_json_value(event.partial_result), {
@@ -262,6 +294,10 @@ async def run_prompt(agent: Agent, text: str, renderer: CliRenderer, session: Op
             return
     if resources:
         text = resources.expand(text)
+    if images and isinstance(renderer, CliRenderer):
+        for image in images:
+            if isinstance(image, ImageContent):
+                renderer.print_image_block(image)
     unsubscribe = agent.subscribe(_session_recorder(session))
     unsubscribe_render = agent.subscribe(renderer)
     task = asyncio.ensure_future(agent.prompt(text, images=images))
@@ -488,7 +524,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                 continue
             if command == "/image":
                 try:
-                    await image_command(rest, registry)
+                    await image_command(rest, registry, renderer)
                 except (ModelError, OSError, ValueError, httpx.HTTPError) as exc:
                     print(f"error: {exc}")
                 continue
@@ -641,7 +677,8 @@ IMAGE_EXTENSIONS = {
 }
 
 
-async def image_command(argument: str, registry: Optional[ModelRegistry]) -> None:
+async def image_command(argument: str, registry: Optional[ModelRegistry],
+                        renderer: Optional[CliRenderer] = None) -> None:
     """Handle /image [model] <prompt>: generate an image via openrouter-images."""
     parts = argument.strip()
     if not parts:
@@ -671,6 +708,8 @@ async def image_command(argument: str, registry: Optional[ModelRegistry]) -> Non
             with open(path, "wb") as handle:
                 handle.write(base64.b64decode(block.data))
             print(f"saved: {path}")
+            if renderer is not None:
+                renderer.print_image_block(block)
 
 
 def sync_block_images(agent: Agent, registry: ModelRegistry) -> None:
@@ -1175,6 +1214,10 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                             extra_bindings=extensions.all_keybindings(),
                             themes=load_themes(registry.config.agent_dir), full_screen=args.tui == "fullscreen")
             ui.markdown_transform = lambda text: extensions.transform_markdown(text, "user")
+            renderer.ui = ui
+            renderer.full_screen = ui.full_screen
+            extensions.set_custom_host(ui.custom_view, size=lambda: (ui.width(), ui.height()))
+            extensions.set_editor_host(ui.set_custom_editor)
         if ui and ui.full_screen:
             extensions.set_ui_sink(ui.ui_request)
         with redirect_stdout(ui) if ui and ui.full_screen else nullcontext():

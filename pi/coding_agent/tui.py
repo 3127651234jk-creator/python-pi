@@ -2,23 +2,27 @@
 
 import asyncio
 import json
+import re
+import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import create_app_session
+from prompt_toolkit.application import Application, create_app_session
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
-from prompt_toolkit.layout import HSplit, Window
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+from prompt_toolkit.utils import get_cwidth
 
 from ..agent.agent import Agent
 
@@ -73,6 +77,154 @@ class AgentCompleter(Completer):
         yield from self.paths.get_completions(Document(word), complete_event)
 
 
+_SGR_MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+
+
+def _mouse_event_from_sequence(data: str, width: int, height: int) -> Optional[dict]:
+    """Parse a raw mouse sequence into the TS ``TuiMouseEvent`` shape.
+
+    prompt_toolkit clamps control-level mouse coordinates to the rendered
+    content, so interactive views parse the SGR/X10 sequence directly.
+    """
+    match = _SGR_MOUSE.match(data)
+    if match:
+        code = int(match.group(1))
+        x = max(0, int(match.group(2)) - 1)
+        y = max(0, int(match.group(3)) - 1)
+        released = match.group(4) == "m"
+    elif data.startswith("\x1b[M") and len(data) >= 6:
+        code = ord(data[3]) - 32
+        x = max(0, ord(data[4]) - 32 - 1)
+        y = max(0, ord(data[5]) - 32 - 1)
+        released = (code & 3) == 3
+    else:
+        return None
+
+    base = code & 3
+    motion = bool(code & 32)
+    wheel = bool(code & 64)
+    button = {0: "left", 1: "middle", 2: "right"}.get(base, "none")
+    if wheel:
+        kind = "wheel"
+    elif released:
+        kind = "release"
+    elif motion:
+        kind = "move" if base == 3 else "drag"
+    else:
+        kind = "press"
+
+    event = {
+        "type": kind, "button": button, "x": x, "y": y,
+        "screenX": x, "screenY": y, "width": width, "height": height,
+        "shift": bool(code & 4), "alt": bool(code & 8), "ctrl": bool(code & 16),
+    }
+    if wheel:
+        event["wheelDelta"] = -1 if base == 0 else 1
+    return event
+
+
+class _KeyForwarder:
+    """Coalesce ESC-prefixed keys and push raw key data onto a queue.
+
+    prompt_toolkit reports ESC followed by a character as two separate key
+    presses; TS components expect the combined ``\\x1b<char>`` sequence for
+    alt+key. Escape alone is delivered after a short hold.
+    """
+
+    HOLD_SECONDS = 0.04
+
+    def __init__(self, queue: asyncio.Queue) -> None:
+        self.queue = queue
+        self._timer: Optional[asyncio.TimerHandle] = None
+
+    def feed(self, data: str) -> None:
+        if not data:
+            return
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+            if not data.startswith("\x1b"):
+                self.queue.put_nowait(("key", "\x1b" + data))
+                return
+            self.queue.put_nowait(("key", "\x1b"))
+        if data == "\x1b":
+            self._timer = asyncio.get_running_loop().call_later(self.HOLD_SECONDS, self._flush)
+            return
+        self.queue.put_nowait(("key", data))
+
+    def _flush(self) -> None:
+        self._timer = None
+        self.queue.put_nowait(("key", "\x1b"))
+
+    def close(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+
+def _size_value(value, reference: int) -> Optional[int]:
+    """Resolve a TS SizeValue (number or "N%") against a reference dimension."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.endswith("%"):
+        try:
+            return int(float(value[:-1]) * reference / 100)
+        except ValueError:
+            return None
+    return None
+
+
+def _overlay_margins(value) -> Tuple[int, int, int, int]:
+    if isinstance(value, dict):
+        return tuple(int(value.get(side) or 0) for side in ("top", "right", "bottom", "left"))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        margin = int(value)
+        return margin, margin, margin, margin
+    return 0, 0, 0, 0
+
+
+def _overlay_bounds(frame, width: int, height: int) -> dict:
+    """Compute the overlay rectangle from TS OverlayOptions."""
+    options = frame.overlay or {}
+    top, right, bottom, left = _overlay_margins(options.get("margin"))
+    available_width = max(1, width - left - right)
+    available_height = max(1, height - top - bottom)
+
+    natural_width = max((get_cwidth(line) for line in frame.lines), default=0)
+    box_width = _size_value(options.get("width"), width) or natural_width or available_width
+    box_width = max(box_width, int(options.get("minWidth") or 0))
+    box_width = max(1, min(available_width, box_width))
+
+    box_height = max(1, min(available_height, len(frame.lines) or 1))
+    max_height = _size_value(options.get("maxHeight"), height)
+    if max_height is not None:
+        box_height = max(1, min(box_height, max_height))
+
+    anchor = str(options.get("anchor") or "center")
+    col = _size_value(options.get("col"), width)
+    if col is None:
+        if anchor.endswith("left"):
+            col = left
+        elif anchor.endswith("right"):
+            col = width - right - box_width
+        else:
+            col = left + max(0, (available_width - box_width) // 2)
+    row = _size_value(options.get("row"), height)
+    if row is None:
+        if anchor.startswith("top"):
+            row = top
+        elif anchor.startswith("bottom"):
+            row = height - bottom - box_height
+        else:
+            row = top + max(0, (available_height - box_height) // 2)
+
+    col = max(0, min(width - box_width, col + int(options.get("offsetX") or 0)))
+    row = max(0, min(height - box_height, row + int(options.get("offsetY") or 0)))
+    return {"row": row, "col": col, "width": box_width, "height": box_height}
+
+
 class TerminalUI:
     def __init__(self, agent: Agent, commands: Callable[[], List[str]], settings: Optional[dict] = None,
                  input=None, output=None, extra_bindings: Optional[List[tuple]] = None,
@@ -84,8 +236,19 @@ class TerminalUI:
         self.running = False
         self.full_screen = full_screen
         self.transcript = ""
+        self._transcript_version = 0
+        self._formatted_version = -1
+        self._formatted_transcript = []
+        # True while an extension custom view owns the terminal: the input loop
+        # parks instead of restarting the editor prompt.
+        self._suspend_read = False
+        self._resume_event = asyncio.Event()
+        self.custom_editor = None
         self.status = ""
         self.widgets = {"above": [], "below": []}
+        self.widget_entries: dict = {}  # key -> (placement, lines)
+        self.header_lines: List[str] = []
+        self.footer_lines: List[str] = []
         self.markdown_transform = None
         self.style = Style.from_dict(self.themes[self.settings.get("theme", "dark")])
         bindings = KeyBindings()
@@ -159,23 +322,49 @@ class TerminalUI:
         if full_screen:
             editor = self.session.app.layout.container
             conversation = FormattedTextControl(
-                lambda: to_formatted_text(ANSI(self.transcript)),
+                self.formatted_transcript,
                 get_cursor_position=lambda: Point(
                     len(self.transcript.rsplit("\n", 1)[-1]), self.transcript.count("\n")))
             self.session.app.layout.container = HSplit([
+                Window(FormattedTextControl(lambda: "\n".join(self.header_lines)),
+                       dont_extend_height=True),
                 Window(conversation, wrap_lines=True),
                 Window(FormattedTextControl(lambda: "\n".join(self.widgets["above"])),
                        dont_extend_height=True),
                 editor,
                 Window(FormattedTextControl(lambda: "\n".join(self.widgets["below"])),
                        dont_extend_height=True),
+                Window(FormattedTextControl(lambda: "\n".join(self.footer_lines)),
+                       dont_extend_height=True),
             ])
             self.session.app.full_screen = True
 
+    def formatted_transcript(self):
+        """Parsed transcript, rebuilt only when new text was written."""
+        if self._formatted_version != self._transcript_version:
+            self._formatted_transcript = to_formatted_text(ANSI(self.transcript))
+            self._formatted_version = self._transcript_version
+        return self._formatted_transcript
+
+    def _sync_widgets(self) -> None:
+        widgets = {"above": [], "below": []}
+        for placement, lines in self.widget_entries.values():
+            widgets[placement].extend(lines)
+        self.widgets = widgets
+
     def write(self, text: str) -> int:
         self.transcript += text
+        self._transcript_version += 1
         self.session.app.invalidate()
         return len(text)
+
+    def width(self) -> int:
+        """Terminal width used to size rendered images and extension views."""
+        return self.session.app.output.get_size().columns
+
+    def height(self) -> int:
+        """Terminal height used by extension custom views."""
+        return self.session.app.output.get_size().rows
 
     def flush(self) -> None:
         self.session.app.invalidate()
@@ -190,7 +379,20 @@ class TerminalUI:
         elif method == "setStatus":
             self.status = request["text"]
         elif method == "setWidget":
-            self.widgets[request["placement"]] = list(request["lines"])
+            placement = request.get("placement", "above")
+            if placement not in ("above", "below"):
+                raise ValueError(f"Unsupported widget placement: {placement}")
+            key = str(request.get("key", ""))
+            lines = list(request.get("lines") or [])
+            if lines:
+                self.widget_entries[key] = (placement, lines)
+            else:
+                self.widget_entries.pop(key, None)
+            self._sync_widgets()
+        elif method == "setHeader":
+            self.header_lines = list(request.get("lines") or [])
+        elif method == "setFooter":
+            self.footer_lines = list(request.get("lines") or [])
         elif method == "setTitle":
             self.session.app.output.set_title(request["title"])
         elif method == "select":
@@ -213,17 +415,286 @@ class TerminalUI:
 
     async def read(self, running=False):
         self.running = running
-        with create_app_session(input=self.session.app.input, output=self.session.app.output), \
-                (nullcontext() if self.full_screen else patch_stdout()):
-            result = await self.session.prompt_async([("class:prompt", "> ")])
-        if self.full_screen and isinstance(result, str) and result:
+        used_custom = self.custom_editor is not None
+        if used_custom:
+            try:
+                result = await self._read_custom_editor()
+            except (OSError, RuntimeError) as exc:
+                print(f"Custom editor failed ({exc}); using the default editor", file=sys.stderr)
+                self.custom_editor = None
+                used_custom = False
+                result = await self._read_prompt()
+        else:
+            result = await self._read_prompt()
+        if isinstance(result, str) and result:
             shown = result
             if self.markdown_transform is not None:
                 shown = self.markdown_transform(result)
                 if hasattr(shown, "__await__"):
                     shown = await shown
-            self.write(f"\n> {shown}\n")
+            if self.full_screen:
+                self.write(f"\n> {shown}\n")
+            elif used_custom:
+                print(f"\n> {shown}\n", flush=True)
         return result
+
+    async def _read_prompt(self):
+        with create_app_session(input=self.session.app.input, output=self.session.app.output), \
+                (nullcontext() if self.full_screen else patch_stdout()):
+            return await self.session.prompt_async([("class:prompt", "> ")])
+
+    def set_custom_editor(self, session) -> None:
+        """Swap the prompt editor for an extension component; None restores it."""
+        self.custom_editor = session
+        if self.session.app.is_running:
+            self.session.app.exit(result="")
+        self.session.app.invalidate()
+
+    async def _read_custom_editor(self) -> str:
+        """One input read driven by an extension's ``setEditorComponent``."""
+        session = self.custom_editor
+        session.reset()
+        if self.session.app.is_running:
+            self.session.app.exit(result="")
+            while self.session.app.is_running:
+                await asyncio.sleep(0.01)
+        width, height = self.width(), self.height()
+        initial = await session.render(width, height)
+        state = {"frame": initial, "fragments": []}
+        app_ref: dict = {}
+
+        def text():
+            return state["fragments"]
+
+        def cursor_position():
+            cursor = state["frame"].cursor
+            return Point(cursor[0], cursor[1]) if cursor else None
+
+        def apply(frame) -> None:
+            state["frame"] = frame
+            state["fragments"] = to_formatted_text(ANSI("\n".join(frame.lines)))
+            if "app" in app_ref:
+                app_ref["app"].invalidate()
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def worker() -> None:
+            while True:
+                kind, payload = await queue.get()
+                try:
+                    if kind == "render":
+                        frame = await session.render(width, height)
+                    elif kind == "key":
+                        frame = await session.input(payload, width)
+                    else:
+                        frame = await session.mouse(payload, width)
+                except Exception:  # noqa: BLE001 - a dead bridge must not trap the user
+                    if "app" in app_ref:
+                        app_ref["app"].exit(result=None)
+                    return
+                apply(frame)
+
+        async def watch_submit() -> None:
+            await session.submit_event.wait()
+            if "app" in app_ref:
+                app_ref["app"].exit(result=True)
+
+        session.render_listener = lambda: queue.put_nowait(("render", None))
+
+        bindings = KeyBindings()
+        forwarder = _KeyForwarder(queue)
+
+        @bindings.add(Keys.Any)
+        def forward(event) -> None:
+            forwarder.feed(
+                event.data or "".join(key.data for key in event.key_sequence if key.data))
+
+        @bindings.add(Keys.Vt100MouseEvent)
+        def forward_mouse(event) -> None:
+            payload = _mouse_event_from_sequence(event.data, width, height)
+            if payload is None:
+                return
+            editor_rows = max(1, len(state["frame"].lines))
+            if payload["y"] < height - editor_rows:
+                return
+            payload["y"] -= height - editor_rows
+            payload["screenY"] = payload["y"]
+            payload["height"] = editor_rows
+            queue.put_nowait(("mouse", payload))
+
+        editor_control = FormattedTextControl(text, focusable=True, get_cursor_position=cursor_position)
+        layout = Layout(HSplit([
+            Window(FormattedTextControl(self.formatted_transcript), wrap_lines=True),
+            Window(editor_control, wrap_lines=False, dont_extend_height=True),
+        ]))
+        apply(initial)
+        app = Application(
+            layout=layout, key_bindings=bindings, full_screen=True, mouse_support=True,
+            style=self.style, input=self.session.app.input, output=self.session.app.output,
+        )
+        app_ref["app"] = app
+        workers = [asyncio.create_task(worker()), asyncio.create_task(watch_submit())]
+        try:
+            with create_app_session(input=self.session.app.input, output=self.session.app.output):
+                await app.run_async(
+                    pre_run=lambda: app.exit(result=True) if session.submit_event.is_set() else None)
+        finally:
+            forwarder.close()
+            session.render_listener = None
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        if session.action == "exit":
+            if self.running:
+                self.agent.abort()
+                return ""
+            raise EOFError()
+        if session.action == "escape":
+            if self.running:
+                self.agent.abort()
+            return ""
+        return session.submitted or ""
+
+    async def custom_view(self, session) -> Any:
+        """Host one ``ctx.ui.custom`` component.
+
+        Renders the component in a dedicated full-screen view, forwards keys and
+        mouse events to it, and closes when the extension calls ``done``. When
+        the editor prompt is active (extension commands run while ``ui.run``
+        streams), the prompt is suspended until the view closes.
+        """
+        suspended = self.session.app.is_running
+        if suspended:
+            self._suspend_read = True
+            self._resume_event.clear()
+            self.session.app.exit(result="")
+            while self.session.app.is_running:
+                await asyncio.sleep(0.01)
+        try:
+            return await self._run_custom_view(session)
+        finally:
+            if suspended:
+                self._suspend_read = False
+                self._resume_event.set()
+
+    async def _run_custom_view(self, session) -> Any:
+        width = self.width()
+        height = self.height()
+        initial = await session.render(width, height)
+        state = {"frame": initial, "fragments": []}
+        overlay_mode = bool(session.options.get("overlay"))
+
+        def text():
+            return state["fragments"]
+
+        def cursor_position():
+            cursor = state["frame"].cursor
+            return Point(cursor[0], cursor[1]) if cursor else None
+
+        control = FormattedTextControl(text, get_cursor_position=cursor_position)
+        floating = None
+        float_container = None
+        if overlay_mode:
+            floating = Float(Window(control, wrap_lines=False), top=0, left=0,
+                             width=width, height=height)
+            float_container = FloatContainer(content=Window(FormattedTextControl("")), floats=[floating])
+            layout = Layout(float_container)
+        else:
+            layout = Layout(HSplit([Window(control, wrap_lines=False)]))
+
+        queue: asyncio.Queue = asyncio.Queue()
+        app_ref: dict = {}
+
+        def apply(frame) -> None:
+            state["frame"] = frame
+            state["fragments"] = to_formatted_text(ANSI("\n".join(frame.lines)))
+            if float_container is not None:
+                bounds = _overlay_bounds(frame, width, height)
+                session.bounds = bounds
+                floating.top = bounds["row"]
+                floating.left = bounds["col"]
+                floating.width = bounds["width"]
+                floating.height = bounds["height"]
+                float_container.floats = [] if frame.hidden else [floating]
+            if "app" in app_ref:
+                app_ref["app"].invalidate()
+
+        apply(initial)
+        session.handle_listener = lambda action: session.finish(None) if action == "hide" else None
+
+        async def worker() -> None:
+            while True:
+                kind, payload = await queue.get()
+                try:
+                    if kind == "render":
+                        frame = await session.render(width, height)
+                    elif kind == "key":
+                        frame = await session.input(payload, width)
+                    else:
+                        frame = await session.mouse(payload, width)
+                except Exception:  # noqa: BLE001 - a dead bridge must not trap the user
+                    session.finish(session.result)
+                    return
+                apply(frame)
+
+        async def watch_done() -> None:
+            await session.done_event.wait()
+            if "app" in app_ref:
+                app_ref["app"].exit(result=session.result)
+
+        session.render_listener = lambda: queue.put_nowait(("render", None))
+
+        press: dict = {"point": None, "moved": False}
+
+        bindings = KeyBindings()
+        forwarder = _KeyForwarder(queue)
+
+        @bindings.add(Keys.Any)
+        def forward(event) -> None:
+            forwarder.feed(
+                event.data or "".join(key.data for key in event.key_sequence if key.data))
+
+        @bindings.add(Keys.Vt100MouseEvent)
+        def forward_mouse(event) -> None:
+            payload = _mouse_event_from_sequence(
+                event.data, width, max(1, len(state["frame"].lines)))
+            if payload is None:
+                return
+            point = (payload["x"], payload["y"])
+            if payload["type"] == "press":
+                press["point"] = point
+                press["moved"] = False
+            elif payload["type"] in ("move", "drag") and press["point"] is not None:
+                if press["point"] != point:
+                    press["moved"] = True
+            elif payload["type"] == "release":
+                pressed, moved = press["point"], press["moved"]
+                press["point"], press["moved"] = None, False
+                queue.put_nowait(("mouse", payload))
+                if pressed is not None and pressed == point and not moved:
+                    queue.put_nowait(("mouse", dict(payload, type="click", clickCount=1)))
+                return
+            queue.put_nowait(("mouse", payload))
+
+        app = Application(
+            layout=layout,
+            key_bindings=bindings, full_screen=True, mouse_support=True,
+            style=self.style, input=self.session.app.input, output=self.session.app.output,
+        )
+        app_ref["app"] = app
+        workers = [asyncio.create_task(worker()), asyncio.create_task(watch_done())]
+        try:
+            with create_app_session(input=self.session.app.input, output=self.session.app.output):
+                return await app.run_async(
+                    pre_run=lambda: app.exit(result=session.result) if session.done_event.is_set() else None)
+        finally:
+            forwarder.close()
+            session.render_listener = None
+            session.handle_listener = None
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
     async def choose(self, title: str, values: List[Tuple[str, str]]) -> Optional[str]:
         if not values:
@@ -237,6 +708,9 @@ class TerminalUI:
         reader = None
         try:
             while not task.done():
+                if self._suspend_read:
+                    await self._resume_event.wait()
+                    continue
                 reader = asyncio.create_task(self.read(running=True))
                 done, _ = await asyncio.wait([task, reader], return_when=asyncio.FIRST_COMPLETED)
                 if task in done:
