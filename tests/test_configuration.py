@@ -7,11 +7,13 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from pi.ai.models import ModelError
+from pi.agent.agent import Agent
+from pi.ai.models import ModelError, resolve_model
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers.faux import reset_script_index
 from pi.coding_agent.auth import AuthStore, login_device, login_openrouter
-from pi.coding_agent.cli import async_main, authenticate, build_parser, make_agent
+from pi.coding_agent.cli import (CliRenderer, async_main, authenticate, build_parser, interactive_loop,
+                                 login_provider_options, make_agent)
 from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.model_registry import ModelRegistry
 
@@ -210,6 +212,56 @@ def test_api_key_login_logout(config, monkeypatch, capsys):
     assert "private-key" not in repr(registry.resolve("openai", api_key="private-key"))
     assert asyncio.run(async_main(["--logout", "openai"])) == 0
     assert registry.auth.get("openai") is None
+
+
+class PickerUI:
+    def __init__(self, inputs, selections):
+        self.inputs = iter(inputs)
+        self.selections = list(selections)
+        self.prompts = []
+
+    async def read(self, running=False):
+        return next(self.inputs)
+
+    async def choose(self, title, values):
+        self.prompts.append((title, [label for _value, label in values]))
+        return self.selections.pop(0)
+
+
+def test_login_without_provider_uses_pickers(config, monkeypatch):
+    registry = ModelRegistry(config)
+    recorded = []
+
+    async def authenticate(reg, provider, oauth=False):
+        recorded.append((provider, oauth))
+
+    monkeypatch.setattr("pi.coding_agent.cli.authenticate", authenticate)
+    ui = PickerUI(["/login", "/exit"], ["oauth", "radius"])
+    asyncio.run(interactive_loop(Agent(resolve_model("faux")), CliRenderer(quiet=True), None, registry, ui=ui))
+    assert recorded == [("radius", True)]
+    assert ui.prompts[0][0] == "Sign in"
+    assert ui.prompts[1][0] == "Provider"
+    assert "radius" in ui.prompts[1][1] and "anthropic" in ui.prompts[1][1]
+
+
+def test_login_without_provider_lists_providers_in_plain_mode(config, monkeypatch, capsys):
+    registry = ModelRegistry(config)
+    inputs = iter(["/login", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+    asyncio.run(interactive_loop(Agent(resolve_model("faux")), CliRenderer(quiet=True), None, registry))
+    output = capsys.readouterr().out
+    assert "Usage: /login <provider> [oauth]" in output
+    assert "radius" in output
+
+
+def test_login_provider_options_cover_both_methods(config):
+    registry = ModelRegistry(config)
+    oauth = {name for name, _label in login_provider_options(registry, True)}
+    api_key = {name for name, _label in login_provider_options(registry, False)}
+    assert {"anthropic", "openai", "openrouter", "radius", "openai-codex"} <= oauth
+    assert {"anthropic", "openai"} <= api_key
+    assert "faux" not in api_key
+    assert "radius" not in api_key
 
 
 def test_openrouter_timeout_closes_listener():

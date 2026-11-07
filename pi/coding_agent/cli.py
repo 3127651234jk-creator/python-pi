@@ -332,7 +332,7 @@ SLASH_HELP = """Commands:
   /model <id>    switch model id (provider unchanged)
   /models        list catalog and capabilities
   /thinking [level]  show or set the thinking level
-  /login <provider> [oauth]  store API key or sign in
+  /login [provider] [oauth]  sign in (provider picker when omitted)
   /logout <provider>        remove saved credentials
   /settings [key JSON]     view or save user defaults
   /reload        reload settings and model catalog
@@ -423,6 +423,16 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                     if not selected:
                         continue
                     rest = selected
+                elif command == "/login" and registry:
+                    method = await ui.choose("Sign in", [
+                        ("oauth", "Sign in with an account (OAuth)"),
+                        ("api_key", "Sign in with an API key")])
+                    if not method:
+                        continue
+                    selected = await ui.choose("Provider", login_provider_options(registry, method == "oauth"))
+                    if not selected:
+                        continue
+                    rest = selected + (" oauth" if method == "oauth" else "")
             if command in ("/exit", "/quit"):
                 break
             if command == "/help":
@@ -568,7 +578,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                     elif command == "/login":
                         parts = rest.split()
                         if not parts:
-                            raise ValueError("Usage: /login <provider> [oauth]")
+                            raise ValueError("Usage: /login <provider> [oauth]\nProviders: "
+                                             + ", ".join(sorted(registry.providers)))
                         await authenticate(registry, parts[0], "oauth" in parts[1:])
                     elif command == "/logout":
                         if not rest.strip():
@@ -785,12 +796,31 @@ def print_models(registry: ModelRegistry) -> None:
         print(f"{identifier}  context={model.context_window} output={model.max_tokens} reasoning={model.reasoning} input={','.join(model.input)}")
 
 
+# Providers whose sign-in flow is OAuth unless an API key is stored manually.
+OAUTH_DEFAULT_PROVIDERS = ("openai-codex", "github-copilot", "kimi-coding", "xai", "radius")
+# Providers that also offer OAuth through `/login <provider> oauth`.
+OAUTH_OPTIONAL_PROVIDERS = ("anthropic", "openai", "openrouter")
+
+
+def login_provider_options(registry: ModelRegistry, oauth: bool) -> List[Tuple[str, str]]:
+    """Provider choices for one authentication method of the `/login` picker."""
+    if oauth:
+        names = [name for name, provider in registry.providers.items()
+                 if name in OAUTH_DEFAULT_PROVIDERS or name in OAUTH_OPTIONAL_PROVIDERS
+                 or provider.get("oauth")]
+    else:
+        names = [name for name, provider in registry.providers.items()
+                 if name != "faux" and name not in OAUTH_DEFAULT_PROVIDERS
+                 and provider.get("auth_required", True)]
+    return [(name, name) for name in sorted(names)]
+
+
 async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = False) -> None:
     provider = {"claude": "anthropic", "codex": "openai-codex", "copilot": "github-copilot",
         "chatgpt": "openai", "openai-chatgpt": "openai"}.get(provider, provider)
     if provider not in registry.providers:
         raise ModelError(f"Unknown provider: {provider}")
-    if oauth or provider in ("openai-codex", "github-copilot", "kimi-coding", "xai", "radius"):
+    if oauth or provider in OAUTH_DEFAULT_PROVIDERS:
         async def prompt(message):
             return await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, message)
         if provider == "anthropic":

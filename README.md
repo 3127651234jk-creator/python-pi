@@ -460,6 +460,7 @@ provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 head
 /models                         列出模型与能力参数
 /model openai/gpt-4o             切换 provider 和模型
 /model gpt-4o-mini               在当前 provider 内切换
+/login                          交互选择登录方式与 provider
 /login openai                   保存 API key
 /login openrouter oauth         OAuth 登录
 /logout openrouter              移除本地凭据
