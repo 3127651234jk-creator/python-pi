@@ -127,7 +127,7 @@ python -m pi --provider azure-openai --model gpt-4o "hello"
 模型目录由三部分合并：内置目录、用户/扩展定义（`models.json` 优先于扩展注册）、在线目录缓存。在线同步有两个来源：
 
 - models.dev 公共目录：覆盖 `anthropic`、`openai`、`google`、`google-vertex`、`azure-openai`、`amazon-bedrock`、`openrouter` 七个 provider，为用户与扩展都未显式配置的 provider 补充型号（上下文窗口、输出限制、价格）。触发方式为 `--sync-models` 参数、交互 `/sync-models` 命令或 RPC `sync_models`；结果缓存在 agent 目录的 `models-cache.json`，有效期 7 天，过期前 reload 直接读缓存。
-- Radius 网关发现：启动时尽力刷新（`PI_OFFLINE=1` 或 `sync_catalog: false` 跳过；`/login radius` 成功后也会刷新一次），从网关 `/v1/config` 读取模型与 `baseUrl`，缓存在 `radius-cache.json`；发现的型号叠加到 `radius` provider，用户在 `models.json` 声明的同 id 条目仍优先。
+- Radius 网关发现：仅在已配置 Radius 凭据（`/login radius` 保存的凭据或 `RADIUS_API_KEY`）时于启动刷新，与 TS 一致；未配置时不发起请求。`PI_OFFLINE=1` 或 `sync_catalog: false` 跳过；`/login radius` 成功后也会刷新一次。通过网关 `/v1/config` 读取模型与 `baseUrl`，缓存在 `radius-cache.json`；发现的型号叠加到 `radius` provider，用户在 `models.json` 声明的同 id 条目仍优先。
 
 settings 的 `sync_catalog: false` 同时关闭两个缓存叠加（缓存文件保留）。与 TS 版的差异：TS 在每次启动时刷新 models.dev 目录，Python 版仅在显式触发或缓存有效期内叠加。
 

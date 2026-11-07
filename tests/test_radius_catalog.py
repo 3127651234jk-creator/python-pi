@@ -13,6 +13,7 @@ from pi.coding_agent.config import Configuration, read_json, write_json
 from pi.coding_agent.model_registry import ModelRegistry
 from pi.coding_agent.radius_catalog import (fetch_radius_gateway_config, load_cache, normalize_gateway_config,
                                             radius_overlay, refresh_radius_catalog, save_cache)
+from pi.coding_agent.cli import refresh_radius_models
 
 GATEWAY_CONFIG = {
     "baseUrl": "https://gw.example/v1",
@@ -172,6 +173,30 @@ def test_refresh_radius_catalog_credential_gateway(monkeypatch, tmp_path):
     asyncio.run(refresh_radius_catalog(reg))
     assert str(captured["request"].url) == "https://custom.example/v1/config"
     assert captured["request"].headers["authorization"] == "Bearer stored"
+
+
+def test_startup_discovery_skips_without_radius_credentials(monkeypatch, tmp_path):
+    monkeypatch.delenv("RADIUS_API_KEY", raising=False)
+    monkeypatch.delenv("PI_OFFLINE", raising=False)
+    reg = registry(tmp_path)
+
+    async def send(self, request, **kwargs):
+        raise AssertionError("startup must not fetch the Radius gateway without credentials")
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    asyncio.run(refresh_radius_models(reg))
+    assert [model for model in reg.models.values() if model.provider == "radius"] == []
+
+
+def test_startup_discovery_fetches_with_radius_env_key(monkeypatch, tmp_path):
+    captured = {}
+    stub_config_response(monkeypatch, captured)
+    monkeypatch.delenv("PI_OFFLINE", raising=False)
+    monkeypatch.setenv("RADIUS_API_KEY", "env-key")
+    reg = registry(tmp_path)
+    asyncio.run(refresh_radius_models(reg))
+    assert "radius/balanced" in reg.models
+    assert captured["request"].headers["authorization"] == "Bearer env-key"
 
 
 def test_refresh_radius_catalog_env_gateway(monkeypatch, tmp_path):

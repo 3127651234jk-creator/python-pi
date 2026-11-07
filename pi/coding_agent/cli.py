@@ -539,7 +539,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                     try:
                         radius_count = await refresh_radius_catalog(registry)
                     except (OSError, ValueError, httpx.HTTPError) as exc:
-                        print(f"warning: Radius model discovery failed: {exc}", file=sys.stderr)
+                        print(f"warning: Radius model discovery failed: {describe_error(exc)}", file=sys.stderr)
                     registry.reload()
                     total = sum(len(entry["models"]) for entry in providers.values())
                     print(f"synced {total} models across {len(providers)} providers")
@@ -827,7 +827,7 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
             count = await refresh_radius_catalog(registry)
             print(f"synced {count} models from the Radius gateway")
         except (OSError, ValueError, httpx.HTTPError) as exc:
-            print(f"warning: could not sync the Radius model catalog: {exc}")
+            print(f"warning: could not sync the Radius model catalog: {describe_error(exc)}")
 
 
 async def _choose_console(title: str, values):
@@ -1017,14 +1017,36 @@ def sync_mcp_tools(agent: Agent, mcp: McpManager) -> None:
     agent.tools[:] = [tool for tool in agent.tools if not getattr(tool, "_mcp_managed", False)] + list(mcp.tools)
 
 
+def describe_error(exc: BaseException) -> str:
+    """Exception text, falling back to the type name when the message is empty."""
+    return str(exc) or type(exc).__name__
+
+
+def radius_login_configured(registry: ModelRegistry) -> bool:
+    """Whether Radius credentials exist.
+
+    Discovery without credentials is a guaranteed failure (the TS runtime does
+    not fetch the gateway catalog at all until Radius is configured), so startup
+    skips it instead of warning on every non-Radius install.
+    """
+    if os.environ.get("RADIUS_API_KEY"):
+        return True
+    try:
+        return registry.auth.get("radius") is not None
+    except ValueError:
+        return False
+
+
 async def refresh_radius_models(registry: ModelRegistry) -> None:
     """Best-effort Radius gateway model discovery; failures keep the cached catalog."""
     if os.environ.get("PI_OFFLINE") or registry.config.settings.get("sync_catalog") is False:
         return
+    if not radius_login_configured(registry):
+        return
     try:
         await refresh_radius_catalog(registry)
     except (OSError, ValueError, httpx.HTTPError) as exc:
-        print(f"warning: Radius model discovery failed: {exc}", file=sys.stderr)
+        print(f"warning: Radius model discovery failed: {describe_error(exc)}", file=sys.stderr)
 
 
 async def async_main(argv: Optional[List[str]] = None) -> int:
@@ -1073,7 +1095,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             try:
                 radius_count = await refresh_radius_catalog(registry)
             except (OSError, ValueError, httpx.HTTPError) as exc:
-                print(f"warning: Radius model discovery failed: {exc}", file=sys.stderr)
+                print(f"warning: Radius model discovery failed: {describe_error(exc)}", file=sys.stderr)
             registry.reload()
             total = sum(len(entry["models"]) for entry in providers.values())
             print(f"synced {total} models across {len(providers)} providers")
