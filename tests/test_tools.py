@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from pi.coding_agent.tools import create_default_tools
+from pi.coding_agent.tools import bash as bash_module
 from pi.coding_agent.tools.edit import prepare_edit_arguments
 from pi.coding_agent.tools.truncate import truncate_head, truncate_tail
 
@@ -172,17 +173,25 @@ def test_bash_nonzero_exit_is_error(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows shell selection")
+def test_bash_prefers_git_bash_when_installed():
+    git_bash = bash_module._find_windows_bash()
+    if git_bash is None:
+        pytest.skip("Git Bash unavailable")
+    argv, _ = bash_module._shell_command("echo hi")
+    assert argv[0] == git_bash
+    assert argv[1] == "-c"
+    assert "bash" in bash_module.BASH_PROMPT_SNIPPET
+
+
 def test_bash_timeout(tmp_path):
     cwd = str(tmp_path)
 
     async def scenario():
         bash = get_tool(cwd, "bash")
-        if sys.platform == "win32":
-            command = "Start-Sleep -Seconds 5"
-        else:
-            command = "sleep 5"
+        # "sleep" exists both in bash and as a PowerShell alias for Start-Sleep.
         with pytest.raises(RuntimeError, match="timed out"):
-            await bash.execute("t1", {"command": command, "timeout": 1})
+            await bash.execute("t1", {"command": "sleep 5", "timeout": 1})
 
     asyncio.run(scenario())
 

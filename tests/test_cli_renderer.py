@@ -3,7 +3,7 @@ returning to the prompt with no output."""
 
 import asyncio
 
-from pi.agent.types import MessageEndEvent
+from pi.agent.types import MessageEndEvent, ToolExecutionStartEvent
 from pi.ai.types import AssistantMessage, Usage
 from pi.coding_agent.cli import CliRenderer
 
@@ -29,3 +29,9 @@ def test_renderer_falls_back_when_the_error_has_no_message(capsys):
 def test_renderer_stays_silent_for_a_successful_empty_message(capsys):
     asyncio.run(CliRenderer()(MessageEndEvent(message=assistant(stop_reason="stop"))))
     assert capsys.readouterr().out == ""
+
+
+def test_renderer_labels_a_search_with_its_pattern(capsys):
+    event = ToolExecutionStartEvent(tool_call_id="t", tool_name="find", args={"pattern": "*.py"})
+    asyncio.run(CliRenderer()(event))
+    assert "[find] *.py" in capsys.readouterr().out

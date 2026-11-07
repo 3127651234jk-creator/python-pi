@@ -321,7 +321,9 @@ async def _drive_provider_stream(
                 if not done_emitted:
                     # A finish reason is authoritative even when a gateway omits
                     # the final sentinel. Bare EOF may be a truncated tool call.
-                    if _terminated(state.partial.stop_reason):
+                    # raw_stop_reason distinguishes a reported finish reason from
+                    # a provider's default stop_reason on a partial snapshot.
+                    if state.partial.raw_stop_reason is not None and _terminated(state.partial.stop_reason):
                         stop_reason = state.partial.stop_reason
                     else:
                         error_message = "Provider stream ended without a completion marker"

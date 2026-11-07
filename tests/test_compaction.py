@@ -71,19 +71,44 @@ def test_overflow_retries_once():
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("reason,text", [("length", "partial"), ("stop", "")])
-def test_failed_summary_keeps_previous_state(reason, text):
+@pytest.mark.parametrize("reason,text,match", [("length", "partial", "token cap"), ("stop", "", "empty summary")])
+def test_failed_summary_keeps_previous_state(reason, text, match):
     async def check():
         compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=1))
 
         async def stream(model, context, options):
             yield DoneEvent(reason=reason, message=response(text, reason))
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match=match):
             await compactor.project([UserMessage(content="x" * 1000, timestamp=0), UserMessage(content="latest", timestamp=1)],
                                     resolve_model("faux"), SimpleStreamOptions(), stream, force=True)
         assert compactor.prefix == []
         assert compactor.summary == ""
+    asyncio.run(check())
+
+
+def test_summary_output_budget_follows_reserve_tokens():
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=50))
+        model = resolve_model("faux")
+        model.context_window = 3000
+        messages = [
+            UserMessage(content="old" * 4000, timestamp=0),
+            UserMessage(content="build the parser", timestamp=1),
+            AssistantMessage(content=[TextContent(text="work" * 50)], api="faux", provider="faux",
+                             model="faux", usage=Usage(), stop_reason="stop", timestamp=2),
+        ]
+        budgets = {}
+
+        async def stream(model, context, options):
+            budgets[context.messages[0].content] = options.max_tokens
+            text = "TURN_CONTEXT" if context.messages[0].content == TURN_PREFIX_SUMMARIZATION_PROMPT else "HISTORY"
+            yield DoneEvent(reason="stop", message=response(text))
+
+        await compactor.project(messages, model, SimpleStreamOptions(), stream)
+        # reserve = min(16384, 3000 // 4) = 750: 0.8x history, 0.5x turn prefix.
+        assert budgets[HISTORY_SUMMARIZATION_PROMPT] == 600
+        assert budgets[TURN_PREFIX_SUMMARIZATION_PROMPT] == 375
     asyncio.run(check())
 
 

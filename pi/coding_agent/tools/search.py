@@ -1,14 +1,41 @@
-"""Bounded, cancellable ripgrep subprocesses shared by grep and find."""
+"""Bounded, cancellable ripgrep subprocesses shared by grep and find.
+
+When ripgrep is not installed the tools fall back to a pure-Python scan that
+keeps the same output shape and limit behaviour (slower, but works offline).
+"""
 
 import asyncio
+import fnmatch
+import os
 import re
 import shutil
+from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...agent.types import AgentToolResult
 from ...ai.types import TextContent
 from ...util import AbortSignal
 from .truncate import DEFAULT_MAX_BYTES
+
+FALLBACK_MAX_FILE_BYTES = 16 * 1024 * 1024
+FALLBACK_MAX_LINE_CHARS = 500
+SKIPPED_DIRS = {".git", "node_modules"}
+
+
+def matches_glob(path: str, pattern: str) -> bool:
+    path = path.replace("\\", "/").removeprefix("./")
+    pattern = pattern.replace("\\", "/").removeprefix("./")
+    if "/" not in pattern:
+        return fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pattern)
+
+    def match(parts, patterns):
+        if not patterns:
+            return not parts
+        if patterns[0] == "**":
+            return match(parts, patterns[1:]) or bool(parts) and match(parts[1:], patterns)
+        return bool(parts) and fnmatch.fnmatchcase(parts[0], patterns[0]) and match(parts[1:], patterns[1:])
+
+    return match(path.split("/"), pattern.split("/"))
 
 
 def positive_limit(value: object, default: int) -> int:
@@ -109,3 +136,218 @@ async def run_rg(cwd: str, args: List[str], limit: int, signal: Optional[AbortSi
         await process.stdout.read()
         await process.wait()
         await error_task
+
+
+@dataclass
+class _IgnoreRule:
+    pattern: str
+    negate: bool
+    directory_only: bool
+
+
+def _load_ignore_rules(root: str) -> List[_IgnoreRule]:
+    """Read every .gitignore under root (rules apply at any depth)."""
+    rules: List[_IgnoreRule] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in SKIPPED_DIRS]
+        if ".gitignore" not in filenames:
+            continue
+        try:
+            with open(os.path.join(dirpath, ".gitignore"), "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            negate = line.startswith("!")
+            if negate:
+                line = line[1:].lstrip()
+            directory_only = line.endswith("/")
+            pattern = line.rstrip("/").lstrip("/")
+            if pattern:
+                rules.append(_IgnoreRule(pattern, negate, directory_only))
+    return rules
+
+
+def _matches_ignore(rel_path: str, pattern: str) -> bool:
+    if "/" not in pattern:
+        return any(fnmatch.fnmatchcase(part, pattern) for part in rel_path.split("/"))
+    parts = rel_path.split("/")
+    return any(matches_glob("/".join(parts[start:]), pattern) for start in range(len(parts)))
+
+
+def _is_ignored(rel_path: str, is_dir: bool, rules: List[_IgnoreRule]) -> bool:
+    """Last matching rule wins, like git; dir-only rules also cover ancestors."""
+    parts = rel_path.split("/")
+    directories = ["/".join(parts[:index]) for index in range(1, len(parts))]
+    if is_dir:
+        directories.append(rel_path)
+    ignored = False
+    for rule in rules:
+        if rule.directory_only:
+            matched = any(_matches_ignore(directory, rule.pattern) for directory in directories)
+        else:
+            matched = _matches_ignore(rel_path, rule.pattern)
+        if matched:
+            ignored = not rule.negate
+    return ignored
+
+
+def _walk_files(root: str) -> List[str]:
+    rules = _load_ignore_rules(root)
+    files: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        relative = os.path.relpath(dirpath, root)
+        relative = "" if relative == "." else relative.replace(os.sep, "/")
+        kept = []
+        for name in dirnames:
+            if name in SKIPPED_DIRS:
+                continue
+            rel = f"{relative}/{name}" if relative else name
+            if not _is_ignored(rel, True, rules):
+                kept.append(name)
+        dirnames[:] = sorted(kept)
+        for name in sorted(filenames):
+            rel = f"{relative}/{name}" if relative else name
+            if not _is_ignored(rel, False, rules):
+                files.append(os.path.join(dirpath, name))
+    return files
+
+
+async def _git_files(root: str) -> Optional[List[str]]:
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            git, "-C", root, "ls-files", "-z", "-c", "-o", "--exclude-standard",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        data, _ = await process.communicate()
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    files = []
+    for name in data.decode("utf-8", errors="replace").split("\0"):
+        if not name:
+            continue
+        relative = name.replace("\\", "/")
+        if any(part in SKIPPED_DIRS for part in relative.split("/")):
+            continue
+        files.append(os.path.join(root, relative))
+    if not files:
+        # An empty .git directory (or a repo with nothing to list) makes git
+        # return success with no output; the walk still has to find the files.
+        return None
+    return sorted(files)
+
+
+async def list_files(root: str) -> List[str]:
+    """Files under root, honouring .gitignore through git when possible."""
+    if os.path.isfile(root):
+        return [root]
+    files = await _git_files(root)
+    if files is not None:
+        return files
+    return await asyncio.to_thread(_walk_files, root)
+
+
+def _read_text(path: str) -> Optional[str]:
+    try:
+        if os.path.getsize(path) > FALLBACK_MAX_FILE_BYTES:
+            return None
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    if b"\x00" in data[:8192]:  # binary file
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+async def grep_python(root: str, pattern: str, *, glob: Optional[str] = None, ignore_case: bool = False,
+                      literal: bool = False, context: int = 0, limit: int = 100,
+                      signal: Optional[AbortSignal] = None) -> AgentToolResult:
+    """ripgrep-compatible grep used when rg is unavailable."""
+    try:
+        regex = re.compile(re.escape(pattern) if literal else pattern,
+                           re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        raise RuntimeError(f"invalid pattern: {exc}") from exc
+    if signal:
+        signal.throw_if_aborted()
+    base = root if os.path.isdir(root) else os.path.dirname(root) or "."
+    lines: List[str] = []
+    count = 0
+    size = 0
+    limited = False
+    byte_limited = False
+    for path in await list_files(root):
+        if signal:
+            signal.throw_if_aborted()
+        if not os.path.isfile(path):
+            continue
+        relative = os.path.relpath(path, base).replace(os.sep, "/")
+        if glob and not matches_glob(relative, glob):
+            continue
+        text = await asyncio.to_thread(_read_text, path)
+        if text is None:
+            continue
+        content = text.splitlines()
+        matches = [index for index, line in enumerate(content) if regex.search(line)]
+        if not matches:
+            continue
+        emitted = set()
+        for index in matches:
+            count += 1
+            if count > limit:
+                limited = True
+                break
+            start = max(0, index - context)
+            end = min(len(content), index + context + 1)
+            for line_number in range(start, end):
+                if line_number in emitted:
+                    continue
+                emitted.add(line_number)
+                line = content[line_number]
+                if len(line) > FALLBACK_MAX_LINE_CHARS:
+                    line = line[:FALLBACK_MAX_LINE_CHARS] + " [line truncated]"
+                marker = ":" if line_number == index else "-"
+                rendered = f"{relative}{marker}{line_number + 1}{marker}{line}"
+                lines.append(rendered)
+                size += len(rendered.encode("utf-8")) + 1
+                byte_limited = size > DEFAULT_MAX_BYTES
+            if byte_limited:
+                break
+        if limited or byte_limited:
+            break
+    if signal:
+        signal.throw_if_aborted()
+    return bounded_result(lines, limited, "No matches found", byte_limited=byte_limited)
+
+
+async def find_python(root: str, pattern: str, limit: int = 1000,
+                      signal: Optional[AbortSignal] = None) -> AgentToolResult:
+    """ripgrep-compatible file glob used when rg is unavailable."""
+    if signal:
+        signal.throw_if_aborted()
+    found: List[str] = []
+    limited = False
+    for path in await list_files(root):
+        if signal:
+            signal.throw_if_aborted()
+        if not os.path.isfile(path):
+            continue
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if not matches_glob(relative, pattern):
+            continue
+        if len(found) >= limit:
+            limited = True
+            break
+        found.append(relative)
+    if signal:
+        signal.throw_if_aborted()
+    return bounded_result(found, limited, "No files found matching pattern")

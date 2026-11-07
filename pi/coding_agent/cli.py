@@ -232,7 +232,7 @@ class CliRenderer:
                 if lines is not None:
                     print("\n" + "\n".join(lines), flush=True)
                     return
-            shown = args.get("command") or args.get("path") or ""
+            shown = args.get("command") or args.get("path") or args.get("pattern") or ""
             print(f"\n[{event.tool_name}] {shown}", flush=True)
         elif isinstance(event, ToolExecutionEndEvent):
             result = event.result

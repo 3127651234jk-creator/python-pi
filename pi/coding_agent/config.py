@@ -150,5 +150,11 @@ def validate_settings(settings: dict) -> None:
     if not isinstance(compaction, dict) or set(compaction) - {"enabled", "reserve_tokens", "keep_recent_tokens", "summary_tokens"}:
         raise ValueError("Invalid compaction settings")
     for key, value in compaction.items():
-        if (key == "enabled" and type(value) is not bool) or (key != "enabled" and (type(value) is not int or value <= 0)):
+        if key == "enabled":
+            if type(value) is not bool:
+                raise ValueError(f"Invalid compaction setting: {key}")
+        elif key == "summary_tokens":
+            if type(value) is not int or value < 0:  # 0 means "derive from reserve_tokens"
+                raise ValueError(f"Invalid compaction setting: {key}")
+        elif type(value) is not int or value <= 0:
             raise ValueError(f"Invalid compaction setting: {key}")

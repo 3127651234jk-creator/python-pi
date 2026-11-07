@@ -1,15 +1,17 @@
 """bash tool: execute shell commands with streaming, truncated output.
 
 Python port of ``packages/coding-agent/src/core/tools/bash.ts``. On Windows
-commands run through PowerShell; elsewhere through bash. Output accumulates
-streaming and is tail-truncated to the shared line/byte limits; full output is
-saved to a temp file when truncation occurs.
+commands run through Git Bash when it is installed (the shell the TS client
+prefers), otherwise through PowerShell; elsewhere through bash. Output
+accumulates streaming and is tail-truncated to the shared line/byte limits;
+full output is saved to a temp file when truncation occurs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -39,13 +41,48 @@ BASH_SCHEMA = {
     "required": ["command"],
 }
 
+_WINDOWS_BASH: Optional[str] = None
+
+
+def _find_windows_bash() -> Optional[str]:
+    """Locate Git Bash: the shell the TS client prefers on Windows.
+
+    Checks the standard Git install locations, the install next to ``git`` on
+    PATH (covers non-default installs), and ``bash.exe`` itself.
+    """
+    candidates = []
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(variable)
+        if base:
+            candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
+    git = shutil.which("git")
+    if git:
+        install = os.path.dirname(os.path.dirname(git))
+        candidates.append(os.path.join(install, "bin", "bash.exe"))
+        candidates.append(os.path.join(os.path.dirname(git), "bash.exe"))
+    found = shutil.which("bash.exe")
+    if found:
+        candidates.append(found)
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+if sys.platform == "win32":
+    _WINDOWS_BASH = _find_windows_bash()
+
+_SHELL_LABEL = "PowerShell" if sys.platform == "win32" and _WINDOWS_BASH is None else "bash"
+_SHELL_EXAMPLES = ("Get-ChildItem, Select-String, etc." if _SHELL_LABEL == "PowerShell"
+                   else "ls, grep, find, etc.")
 BASH_DESCRIPTION = (
-    "Execute a shell command in the current working directory. Returns stdout and stderr. Output is "
+    f"Execute a shell command in the current working directory (this machine runs {_SHELL_LABEL}). "
+    "Returns stdout and stderr. Output is "
     f"truncated to last {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB (whichever is hit "
     "first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
 )
 
-BASH_PROMPT_SNIPPET = "Execute shell commands (ls, grep, find, etc.)"
+BASH_PROMPT_SNIPPET = f"Execute {_SHELL_LABEL} commands ({_SHELL_EXAMPLES})"
 
 
 class OutputAccumulator:
@@ -83,8 +120,15 @@ class OutputAccumulator:
 
 
 def _shell_command(command: str) -> Tuple[list, bool]:
-    """Return (argv, needs_shell_wrap). Windows uses PowerShell; POSIX uses bash."""
+    """Return (argv, needs_shell_wrap).
+
+    Windows prefers Git Bash (POSIX commands work) and falls back to
+    PowerShell; other platforms use bash.
+    """
     if sys.platform == "win32":
+        bash = _WINDOWS_BASH or _find_windows_bash()
+        if bash is not None:
+            return [bash, "-c", command], False
         return ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], False
     return ["bash", "-c", command], False
 

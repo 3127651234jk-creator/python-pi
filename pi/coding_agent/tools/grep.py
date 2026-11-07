@@ -1,12 +1,12 @@
-"""Search file contents without shell interpolation."""
+"""Search file contents without shell interpolation, ripgrep when available."""
 
 import os
 import re
+import shutil
 
 from ...agent.types import AgentTool
 from .common import resolve_to_cwd
-from .search import positive_limit, run_rg
-from .find import matches_glob
+from .search import grep_python, matches_glob, positive_limit, run_rg
 
 GREP_PROMPT_SNIPPET = "Search file contents by regex or literal text, respecting .gitignore"
 
@@ -20,6 +20,11 @@ def create_grep_tool(cwd: str) -> AgentTool:
         context = params.get("context", 0)
         if type(context) is not int or context < 0:
             raise ValueError("context must be a nonnegative integer")
+        if shutil.which("rg") is None:
+            return await grep_python(root, params["pattern"], glob=params.get("glob"),
+                                     ignore_case=bool(params.get("ignoreCase")),
+                                     literal=bool(params.get("literal")),
+                                     context=context, limit=limit, signal=signal)
         args = ["--no-config", "--color=never", "--line-number", "--with-filename", "--no-heading",
                 "--hidden", "--no-require-git", "--glob=!.git/**", "--glob=!node_modules/**", "--sort=path",
                 "--max-columns=500", "--max-columns-preview", "--context", str(context)]
@@ -39,7 +44,7 @@ def create_grep_tool(cwd: str) -> AgentTool:
         return await run_rg(cwd, args, limit, signal, matches=True,
                             include=include if params.get("glob") else None)
 
-    return AgentTool(name="grep", description="Search text files with ripgrep. Returns paths and line numbers; respects .gitignore, includes hidden files, skips .git and node_modules. Defaults: 100 matching lines, 50KB output. Long lines use ripgrep's 500-column preview. Requires rg on PATH.",
+    return AgentTool(name="grep", description="Search text files. Returns paths and line numbers; respects .gitignore, includes hidden files, skips .git and node_modules. Defaults: 100 matching lines, 50KB output. Long lines are truncated. Uses ripgrep when installed, otherwise a built-in scan.",
                      parameters={"type": "object", "properties": {
                          "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"},
                          "ignoreCase": {"type": "boolean"}, "literal": {"type": "boolean"},

@@ -19,7 +19,10 @@ class CompactionSettings:
     enabled: bool = True
     reserve_tokens: int = 16384
     keep_recent_tokens: int = 20000
-    summary_tokens: int = 2048
+    # Output budget for a summarization request. 0 derives it from
+    # reserve_tokens like the TS compactor (0.8x history, 0.5x turn prefix);
+    # an explicit value caps those derived budgets.
+    summary_tokens: int = 0
 
 
 HISTORY_SUMMARIZATION_PROMPT = (
@@ -146,7 +149,8 @@ class ContextCompactor:
         if cut == 0:
             return projected
         # Chunking also allows summarization after the original request overflowed.
-        chunk_budget = max(1, budget - self.settings.summary_tokens - 1024)
+        history_budget, turn_budget = self._summary_budgets(model, reserve)
+        chunk_budget = max(1, budget - history_budget - 1024)
         # A cut before an assistant message splits its turn: the user request and
         # earlier work of that turn get their own checkpoint next to the history
         # summary, matching the TypeScript agent's split-turn compaction.
@@ -162,7 +166,7 @@ class ContextCompactor:
             if turn_start > 0:
                 history, history_usage = await self._summarize(
                     tail[:turn_start], model, options, stream, chunk_budget,
-                    HISTORY_SUMMARIZATION_PROMPT, self.summary, self.settings.summary_tokens,
+                    HISTORY_SUMMARIZATION_PROMPT, self.summary, history_budget,
                 )
             else:
                 # The whole tail is one turn; only the prior summary can stand in.
@@ -170,15 +174,14 @@ class ContextCompactor:
             # Smaller output budget, like the TypeScript turn-prefix summary.
             turn_context, turn_usage = await self._summarize(
                 tail[turn_start:cut], model, options, stream, chunk_budget,
-                TURN_PREFIX_SUMMARIZATION_PROMPT, "",
-                max(1, self.settings.summary_tokens // 2),
+                TURN_PREFIX_SUMMARIZATION_PROMPT, "", turn_budget,
             )
             summary = history + "\n\n---\n\n**Turn Context (split turn):**\n\n" + turn_context
             usage = combine_usage(history_usage, turn_usage) if history_usage else turn_usage
         else:
             summary, usage = await self._summarize(
                 tail[:cut], model, options, stream, chunk_budget,
-                HISTORY_SUMMARIZATION_PROMPT, self.summary, self.settings.summary_tokens,
+                HISTORY_SUMMARIZATION_PROMPT, self.summary, history_budget,
             )
         result = ([system] if system else []) + [
             UserMessage(content="Previous conversation summary:\n" + summary, timestamp=0)
@@ -191,6 +194,21 @@ class ContextCompactor:
         if self.on_summary is not None:
             self.on_summary(summary, usage)
         return result
+
+    def _summary_budgets(self, model: Model, reserve: int) -> Tuple[int, int]:
+        """Output budgets for the history and turn-prefix summaries.
+
+        Mirrors the TS compactor: 0.8x reserve for history, 0.5x for the turn
+        prefix, both capped by the model's own output limit. An explicit
+        ``summary_tokens`` setting caps them further.
+        """
+        ceiling = model.max_tokens if model.max_tokens > 0 else reserve
+        history = min(max(1, int(0.8 * reserve)), ceiling)
+        turn = min(max(1, int(0.5 * reserve)), ceiling)
+        if self.settings.summary_tokens > 0:
+            history = min(history, self.settings.summary_tokens)
+            turn = min(turn, max(1, self.settings.summary_tokens // 2))
+        return history, turn
 
     async def _summarize(self, messages, model: Model, options, stream, chunk_budget: int,
                          system_prompt: str, previous_summary: str, max_tokens: int) -> Tuple[str, Usage]:
@@ -226,8 +244,18 @@ class ContextCompactor:
                     raise RuntimeError("Context summarization failed: " + (event.error.error_message or event.reason))
             if options.signal:
                 options.signal.throw_if_aborted()
-            if final is None or final.stop_reason != "stop" or any(isinstance(b, ToolCall) for b in final.content):
+            if final is None:
                 raise RuntimeError("Context summarization did not produce a complete summary")
+            if final.stop_reason == "error":
+                raise RuntimeError("Context summarization failed: "
+                                   + (final.error_message or "unknown provider error"))
+            if final.stop_reason == "length":
+                raise RuntimeError("Context summarization failed: generation hit the token cap "
+                                   "and the summary is incomplete")
+            if final.stop_reason == "aborted":
+                raise RuntimeError("Context summarization was aborted")
+            if any(isinstance(block, ToolCall) for block in final.content):
+                raise RuntimeError("Context summarization attempted to call a tool")
             text = "\n".join(b.text for b in final.content if isinstance(b, TextContent)).strip()
             if not text:
                 raise RuntimeError("Context summarization returned an empty summary")

@@ -1,29 +1,13 @@
-"""Find files with ripgrep's ignore-aware glob traversal."""
+"""Find files by glob pattern, ripgrep when available."""
 
 import os
-import fnmatch
+import shutil
 
 from ...agent.types import AgentTool
 from .common import resolve_to_cwd
-from .search import positive_limit, run_rg
+from .search import find_python, matches_glob, positive_limit, run_rg
 
 FIND_PROMPT_SNIPPET = "Find files by glob pattern, respecting .gitignore"
-
-
-def matches_glob(path: str, pattern: str) -> bool:
-    path = path.replace("\\", "/").removeprefix("./")
-    pattern = pattern.replace("\\", "/").removeprefix("./")
-    if "/" not in pattern:
-        return fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pattern)
-
-    def match(parts, patterns):
-        if not patterns:
-            return not parts
-        if patterns[0] == "**":
-            return match(parts, patterns[1:]) or bool(parts) and match(parts[1:], patterns)
-        return bool(parts) and fnmatch.fnmatchcase(parts[0], patterns[0]) and match(parts[1:], patterns[1:])
-
-    return match(path.split("/"), pattern.split("/"))
 
 
 def create_find_tool(cwd: str) -> AgentTool:
@@ -32,10 +16,12 @@ def create_find_tool(cwd: str) -> AgentTool:
         if not os.path.isdir(root):
             raise NotADirectoryError(root)
         limit = positive_limit(params.get("limit"), 1000)
+        if shutil.which("rg") is None:
+            return await find_python(root, params["pattern"], limit, signal)
         args = ["--no-config", "--files", "--hidden", "--no-require-git", "--sort=path",
                 "--glob=!.git/**", "--glob=!node_modules/**", "--", "."]
         return await run_rg(root, args, limit, signal, include=lambda path: matches_glob(path, params["pattern"]))
 
-    return AgentTool(name="find", description="Find files by glob pattern (e.g. '*.py' or 'src/**/*.py'). Paths are relative to the search directory. Respects .gitignore, includes hidden files, skips .git and node_modules. Defaults: 1000 files, 50KB output. Requires rg on PATH.",
+    return AgentTool(name="find", description="Find files by glob pattern (e.g. '*.py' or 'src/**/*.py'). Paths are relative to the search directory. Respects .gitignore, includes hidden files, skips .git and node_modules. Defaults: 1000 files, 50KB output. Uses ripgrep when installed, otherwise a built-in scan.",
                      parameters={"type": "object", "properties": {"pattern": {"type": "string"},
                          "path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["pattern"]}, execute=execute)

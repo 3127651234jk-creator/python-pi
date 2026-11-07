@@ -45,7 +45,6 @@ def test_ls_sorted_hidden_directories_and_limit(files):
         execute(files, "ls", {"path": "ignored.txt"})
 
 
-@pytest.mark.skipif(not shutil.which("rg"), reason="ripgrep unavailable")
 def test_find_globs_relative_paths_and_ignores(files):
     text = execute(files, "find", {"pattern": "*.py"}).content[0].text.replace("\\", "/")
     assert "src/a.py" in text and ".hidden.py" in text
@@ -55,7 +54,6 @@ def test_find_globs_relative_paths_and_ignores(files):
     assert execute(files, "find", {"pattern": "*", "limit": 1}).details["resultLimitReached"]
 
 
-@pytest.mark.skipif(not shutil.which("rg"), reason="ripgrep unavailable")
 def test_grep_literal_case_context_glob_and_limit(files):
     (files / ".gitignore").write_text("ignored.txt\nignored.py\n", encoding="utf-8")
     (files / "ignored.py").write_text("secret match", encoding="utf-8")
@@ -83,10 +81,38 @@ def test_abort_and_missing_executables(files, monkeypatch):
                 await tool.execute("test", params, signal)
     asyncio.run(abort_check())
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    with pytest.raises(FileNotFoundError, match="ripgrep"):
-        execute(files, "find", {"pattern": "*"})
     with pytest.raises(FileNotFoundError, match="PowerShell"):
         execute(files, "powershell", {"command": "echo hello"})
+
+
+def without_ripgrep(monkeypatch):
+    real = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name: None if name == "rg" else real(name))
+
+
+def test_grep_falls_back_without_ripgrep(files, monkeypatch):
+    (files / ".gitignore").write_text("ignored.txt\nignored.py\n", encoding="utf-8")
+    (files / "ignored.py").write_text("secret match", encoding="utf-8")
+    without_ripgrep(monkeypatch)
+    result = execute(files, "grep", {"pattern": "hello", "ignoreCase": True, "glob": "*.py", "limit": 1})
+    assert result.details["resultLimitReached"]
+    literal = execute(files, "grep", {"pattern": "Hello [world]", "literal": True, "context": 1})
+    assert ":2:Hello [world]" in literal.content[0].text
+    assert "before" in literal.content[0].text and "after" in literal.content[0].text
+    assert "No matches" in execute(files, "grep", {"pattern": "secret"}).content[0].text
+    assert "No matches" in execute(files, "grep", {"pattern": "secret", "glob": "*.py"}).content[0].text
+    with pytest.raises(RuntimeError):
+        execute(files, "grep", {"pattern": "["})
+
+
+def test_find_falls_back_without_ripgrep(files, monkeypatch):
+    without_ripgrep(monkeypatch)
+    text = execute(files, "find", {"pattern": "*.py"}).content[0].text.replace("\\", "/")
+    assert "src/a.py" in text and ".hidden.py" in text
+    assert "ignored.txt" not in execute(files, "find", {"pattern": "*"}).content[0].text
+    assert "src/a.py" in execute(files, "find", {"pattern": "src/**/*.py"}).content[0].text.replace("\\", "/")
+    assert "a.py" in execute(files, "find", {"path": "src", "pattern": "*.py"}).content[0].text
+    assert execute(files, "find", {"pattern": "*", "limit": 1}).details["resultLimitReached"]
 
 
 @pytest.mark.skipif(not (shutil.which("pwsh") or shutil.which("powershell")), reason="PowerShell unavailable")
@@ -97,7 +123,6 @@ def test_powershell_unicode_exit_and_timeout(tmp_path):
         execute(tmp_path, "powershell", {"command": "Start-Sleep -Seconds 10", "timeout": 0.3})
 
 
-@pytest.mark.skipif(not shutil.which("rg"), reason="ripgrep unavailable")
 def test_grep_output_byte_limit_and_long_lines(tmp_path):
     (tmp_path / "big.txt").write_text(("needle " + "x" * 300 + "\n") * 400, encoding="utf-8")
     result = execute(tmp_path, "grep", {"pattern": "needle", "limit": 1000})
