@@ -1,6 +1,14 @@
 # pi-python
 
-pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不是 1:1 复刻整个 monorepo，而是用 Python 忠实还原 pi 的三层核心：Provider 流式协议、agent loop、以及编码工具（`read`/`write`/`edit`/`bash` 加 `grep`/`find`/`ls`/`powershell`），可直接运行。
+pi（TypeScript monorepo）的 Python 移植版。目标是 1:1 复刻整个 monorepo 的全部 package——`ai`、`agent`、`coding-agent`（含 codemode/MCP/TUI）、`evals`、`durable`、`telemetry`，以及 `protocol`/`server`/`client` 路由传输与 `chord` 服务层——用 Python 忠实还原对应实现并保持可直接运行。与 TS 版尚有差距的部分见文末「尚未移植」。
+
+## 复刻版本基线
+
+- 源仓库：[earendil-works/pi](https://github.com/earendil-works/pi)（TypeScript monorepo，13 个 package）。
+- 基线版本：`v1.0.3`（tag 提交 `d78dc83d6`，2026-10-05），全部 package 的 `package.json` 版本一致为 `1.0.3`。
+- 移植基点：`analysis-notes` 分支提交 `293fb03cb`（2026-11-07），即 `v1.0.3` 之后 8 个仅更新 pi-python 子模块的提交，TS 源码与 `v1.0.3` 相同。
+- 路由协议版本：两侧一致为 `PROTOCOL_VERSION = 8`（`packages/protocol/src/protocol.ts` 与 `pi/protocol.py`）。
+- 后续同步：`main` 分支与更新的 release（当前最新为 `v1.5.0`，2026-11-02）不在本基线内；TS 侧版本推进时更新本节记录的 tag/提交。
 
 ## 与 TS 版的对应关系
 
@@ -24,30 +32,80 @@ pi（TypeScript 编码智能体）核心架构的 Python 移植版。目标不�
 | `pi.evals.cli` | `packages/evals/src/cli.ts` | 评测编排 CLI：参数解析、发现对齐、协议落盘、报告产出 |
 | `pi.evals.framework` | `vitest-evals`（npm 依赖） | 本地替代：Harness 适配器、运行规范化、结构化输出裁判、用例发现与运行器、`tool_calls` 提取 |
 | `pi.evals.host` | `packages/evals/vitest.evals.config.ts`（host project） | host 评测运行器：发现非 docs 套件、顺序执行、聚合 Vitest JSON 报告 |
+| `pi.durable` | `packages/durable` | 持久化运行时：会话/任务/文档先提交后可见、`ExecutionEnv`、持久化工具与一致性套件（见下文「持久化运行时」） |
+| `pi.telemetry` | `packages/telemetry` | 遥测契约：span/上下文类型、OTLP/HTTP(JSON) 导出、内存与空实现后端 |
+| `pi.protocol` / `pi.server` / `pi.client` | `packages/protocol`、`packages/server`、`packages/client` | Pi v8 路由封包传输：严格 JSON 信封与定长 CBOR 帧、握手与身份校验、并发关联请求、TCP/Unix 传输、连接作用域端点与会话路由（见 ROUTED_PROTOCOL.md） |
+| `pi.chord` | `packages/chord` | Chord 服务层：契约绑定、`$chord.service` 控制调用、delta wire 编解码（`pi.delta`）、provider/consumer、状态编解码注册表；与 TS 的互通由 `tests/test_chord_interop.py` 以 Node 直接加载 TS 源码验证（见 ROUTED_PROTOCOL.md） |
+| `pi.coding_agent.mcp` | `packages/mcp` | MCP 客户端：stdio / Streamable HTTP（JSON/SSE）传输、工具发现与注册 |
+| `pi.coding_agent.tui` | `packages/tui` | 终端 UI：全屏对话布局、多行编辑、补全、选择器、主题、快捷键、ANSI Markdown、终端图片 |
 
 ## 安装
 
-```bash
+要求 Python 3.9+。以下命令从仓库根目录执行，建议使用独立虚拟环境。
+
+Windows PowerShell：
+
+```powershell
 cd pi-python
-pip install -e .        # 或直接 python -m pi（依赖 httpx）
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
 ```
 
-要求 Python 3.9+，依赖 `httpx`、`PyYAML`、`prompt_toolkit` 和 `wcwidth`。
+macOS / Linux：
+
+```bash
+cd pi-python
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+安装会自动安装 `httpx`、`Pillow`、`PyYAML`、`prompt_toolkit` 和 `wcwidth`。`-e` 表示可编辑安装，修改 Python 源码后无需重新安装。
+
+如果 PowerShell 禁止运行激活脚本，可直接使用 `.\.venv\Scripts\python.exe -m pip install -e .` 安装，后续将命令中的 `python` 替换为 `.\.venv\Scripts\python.exe`。
+
+每次打开新终端后，需要重新激活虚拟环境。退出虚拟环境使用 `deactivate`。
 
 ## 运行
 
+先验证安装（无需 API key，不调用真实模型）：
+
 ```bash
-# OpenAI 兼容端点（OpenAI/DeepSeek/Groq/OpenRouter/vLLM/llama.cpp...）
-set OPENAI_API_KEY=sk-...
-set OPENAI_BASE_URL=https://api.openai.com/v1   # 可选
-python -m pi "list the python files in this project"
+python -m pi --help
+python -m pi --provider faux --no-session "hello"
+```
 
-# Anthropic
-set ANTHROPIC_API_KEY=sk-ant-...
-python -m pi --provider anthropic "explain pyproject.toml"
+配置 API key 后启动。以下以 OpenAI 为例，将占位密钥替换为自己的密钥。
 
-# 离线/测试：脚本化假模型
-python -m pi --provider faux "hello"
+Windows PowerShell：
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+python -m pi --provider openai
+```
+
+macOS / Linux：
+
+```bash
+export OPENAI_API_KEY="sk-..."
+python -m pi --provider openai
+```
+
+不带 prompt 参数进入交互模式，输入问题后按 Enter 提交，输入 `/exit` 退出。也可直接执行一次任务，或恢复上次会话：
+
+```bash
+python -m pi --provider openai "列出当前项目中的 Python 文件"
+python -m pi --provider openai -c
+python -m pi --provider openai --tui fullscreen
+```
+
+安装后也可以用 `pi` 代替 `python -m pi`。如果机器同时安装了 TypeScript 版 pi，建议使用 `python -m pi` 明确启动 Python 版。可先切换到要处理的项目目录，再启动；工具将以该目录作为工作目录。
+
+使用 OpenAI 兼容端点时，可添加 `--base-url <服务地址>` 和 `--model <模型ID>`；服务地址应包含服务要求的 API 路径（例如 `/v1`）。使用 Anthropic 时，在当前终端设置 `ANTHROPIC_API_KEY`（PowerShell 使用 `$env:ANTHROPIC_API_KEY = "sk-ant-..."`，macOS / Linux 使用 `export ANTHROPIC_API_KEY="sk-ant-..."`），然后运行：
+
+```bash
+python -m pi --provider anthropic "解释 pyproject.toml"
 ```
 
 常用参数：`--provider <id>`、`--model <id>`、`--base-url`、`--api-key`、`--thinking off|minimal|low|medium|high|xhigh|max`、`-c` 继续上次会话、`--no-session` 不落盘、`--sync-models` 同步在线模型目录。
@@ -515,7 +573,7 @@ python -m pi.evals.host -t "matches the implementation" --report out/vitest.json
 
 系统提示词现在包含 `<docs>` 一节（PI 文档路由：README/docs/examples 路径与阅读指引），`SystemPromptOptions.include_pi_documentation` 控制其出现：默认自动探测包内文档是否存在；评测 harness 强制包含并在 `without_docs` 变体中剥离该节（`exclude_pi_documentation`），配合镜像内删除文档文件构成对照实验。`<cwd>` 一节同步改为 `<cwd>\n路径\n</cwd>` 的分节格式。
 
-与 TS 版的差异（有意省略）：容器内不再运行 Vitest，而是 `docker/entrypoint.py` 直接发现/运行用例并写 Vitest JSON；host 评测运行器（`pi.evals.host`）取代 Vitest host project，报告结构一致但不经 Vitest；TS 的 Vite transformed-module 保护无对应物，改由镜像内 `chmod go-rwx` 保证评测源码仅 root 可读；`reload` 只重读模型配置（Python 会话无扩展重载）；acme/configured-runtime 夹具的 models.json 与探针沿用 Python 的 snake_case 键（`context_window`/`max_tokens`/`costs`），`configured_runtime` 对模型快照与 judge 期望保持 TS 的 camelCase 形状，models.json 解析失败的消息为 Python 的 `Cannot read configuration`（TS 为 `Failed to parse models.json`）；npm tarball 打包换为容器内 `pip install /repo/pi-python`，并把 README 复制到 site-packages 作为 `with_docs` 的文档。凭据来源探测在降权时按环境变量名近似（`PROVIDER_API_KEY` / `PI_PY_API_KEY`），TS 版使用 ModelRuntime 的精确 source。
+与 TS 版的实现差异（同等功能的替换实现）：容器内不再运行 Vitest，而是 `docker/entrypoint.py` 直接发现/运行用例并写 Vitest JSON；host 评测运行器（`pi.evals.host`）取代 Vitest host project，报告结构一致但不经 Vitest；TS 的 Vite transformed-module 保护无对应物，改由镜像内 `chmod go-rwx` 保证评测源码仅 root 可读；`reload` 只重读模型配置（Python 会话无扩展重载）；acme/configured-runtime 夹具的 models.json 与探针沿用 Python 的 snake_case 键（`context_window`/`max_tokens`/`costs`），`configured_runtime` 对模型快照与 judge 期望保持 TS 的 camelCase 形状，models.json 解析失败的消息为 Python 的 `Cannot read configuration`（TS 为 `Failed to parse models.json`）；npm tarball 打包换为容器内 `pip install /repo/pi-python`，并把 README 复制到 site-packages 作为 `with_docs` 的文档。凭据来源探测在降权时按环境变量名近似（`PROVIDER_API_KEY` / `PI_PY_API_KEY`），TS 版使用 ModelRuntime 的精确 source。
 
 ## 作为库使用
 
@@ -598,9 +656,7 @@ python -m pytest tests -q
 - OpenRouter、NVIDIA NIM、Cloudflare、OpenCode 的客户端归属请求头自动合并进模型请求；开关为 settings 的 `enable_install_telemetry`（默认开启），环境变量 `PI_TELEMETRY` 优先。
 - `PI_TIMING=1` 在退出前于 stderr 打印启动耗时分组（解析、registry、agent、session、extensions）。
 
-## 未移植（有意省略）
-
-### Python 上下文压缩
+## 上下文压缩
 
 Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时，摘要旧消息并保留近期消息、系统指令和工具声明。切分不会拆开工具调用与其结果。明确的上下文溢出错误会触发强制压缩并重试一次；其他错误不会触发重试。摘要失败、为空或达到输出上限时不会替换已有摘要。
 
@@ -608,8 +664,11 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 
 库调用可通过 `Agent(..., compaction=CompactionSettings(...))` 配置；从 `pi.agent.compaction` 导入 `CompactionSettings`。默认 `reserve_tokens=16384`、`keep_recent_tokens=20000`、`summary_tokens=2048`，可设置 `enabled=False` 关闭。未知模型应准确设置 `model.context_window`。Token 数使用 UTF-8 长度估算，并非模型的精确分词结果。
 
+## 尚未移植
+
+目标是 1:1 复刻，以下为与 TS 版的剩余差距：
+
 - TS TUI 的通用组件布局（转录区内任意组件的横向组合、焦点栈与滚动视口）；Python 已有全屏对话布局（`--tui fullscreen`）、多行编辑、补全、选择器、主题、快捷键、ANSI Markdown、工具输出折叠、终端图片显示（Kitty/iTerm2 协议，全屏模式为半块字符）、扩展 `ctx.ui.custom` 交互视图（按键/鼠标转发、overlay 几何与 handle）、widget/header/footer 组件工厂及 `setEditorComponent` 编辑器接管
-- 扩展系统、MCP、telemetry 已有部分 Python 实现，durable 核心 + env/tools/testing 套件已移植（见上文）。路由协议（pi.protocol/pi.server/pi.client）、Chord 服务层（pi.chord：契约绑定、$chord.service 控制调用、delta wire 编解码、provider/consumer，见 ROUTED_PROTOCOL.md）与 durable coding-agent 服务宿主（`pi server` 入口、每会话 worker 进程、退出监控、会话移除管理）已实现；Python 客户端 ↔ TS 服务端、TS 客户端 ↔ Python 服务端的真实互通由 tests/test_chord_interop.py 以 Node 直接加载 TS 源码验证
 - prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）与嵌套工具调用的记录/用量聚合（TS nested-tool-calls）
-- 其他 provider 的专属认证；已实现 Claude、Codex、Copilot、Kimi、xAI、Radius 登录，OpenAI 的 Sign in with ChatGPT、OpenRouter PKCE 及可配置标准设备码 OAuth
+- 其余 provider 的专属认证流程；已实现 Claude、Codex、Copilot、Kimi、xAI、Radius 登录，OpenAI 的 Sign in with ChatGPT、OpenRouter PKCE 及可配置标准设备码 OAuth
 - models.dev 在线目录仅在显式触发（`--sync-models` / `/sync-models` / `sync_models`）时刷新，Radius 发现在启动或登录后刷新；TS 版每次启动都会刷新目录。未收录的模型 id 以默认参数运行
