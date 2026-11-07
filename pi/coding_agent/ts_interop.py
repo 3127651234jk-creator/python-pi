@@ -19,6 +19,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ..ai.json_io import usage_from_json
 from ..ai.types import (
     AssistantMessage,
     ImageContent,
@@ -54,7 +55,7 @@ def _ts_usage(data: Optional[dict]) -> Usage:
     )
 
 
-def _our_usage(usage: Usage) -> dict:
+def usage_to_ts(usage: Usage) -> dict:
     return {
         "input": usage.input, "output": usage.output, "cacheRead": usage.cache_read,
         "cacheWrite": usage.cache_write, **({"cacheWrite1h": usage.cache_write_1h} if usage.cache_write_1h else {}),
@@ -138,7 +139,7 @@ def our_message_to_ts(message) -> dict:
         if message.details is not None:
             result["details"] = message.details
         if message.usage is not None:
-            result["usage"] = _our_usage(message.usage)
+            result["usage"] = usage_to_ts(message.usage)
         return result
     # AssistantMessage
     blocks = []
@@ -158,7 +159,7 @@ def our_message_to_ts(message) -> dict:
                 entry["thoughtSignature"] = block.thought_signature
             blocks.append(entry)
     result = {"role": "assistant", "content": blocks, "api": message.api, "provider": message.provider,
-              "model": message.model, "usage": _our_usage(message.usage), "stopReason": message.stop_reason,
+              "model": message.model, "usage": usage_to_ts(message.usage), "stopReason": message.stop_reason,
               "timestamp": message.timestamp}
     for ours, ts in (("response_model", "responseModel"), ("response_id", "responseId"),
                      ("thinking_level", "thinkingLevel"), ("error_message", "errorMessage"),
@@ -182,7 +183,11 @@ def ts_entry_to_custom(record: dict) -> Optional[dict]:
     """Map a TS metadata entry to this port's custom-entry payload, if any."""
     kind = record.get("type")
     if kind == "compaction":
-        return {"kind": "compaction", "data": {"summary": record.get("summary", ""), "tokens_before": record.get("tokensBefore", 0)}}
+        data = {"summary": record.get("summary", ""), "tokens_before": record.get("tokensBefore", 0)}
+        ts_usage = record.get("usage")
+        if isinstance(ts_usage, dict):
+            data["usage"] = _ts_usage(ts_usage).to_dict()
+        return {"kind": "compaction", "data": data}
     if kind == "model_change":
         return {"kind": "model_change", "data": {"provider": record.get("provider", ""), "modelId": record.get("modelId", "")}}
     if kind == "thinking_level_change":
@@ -194,7 +199,11 @@ def ts_entry_to_custom(record: dict) -> Optional[dict]:
 
 def custom_to_ts_entry(kind: str, data: dict) -> Optional[dict]:
     if kind == "compaction":
-        return {"type": "compaction", "summary": data.get("summary", ""), "tokensBefore": data.get("tokens_before", 0)}
+        entry = {"type": "compaction", "summary": data.get("summary", ""), "tokensBefore": data.get("tokens_before", 0)}
+        usage_data = data.get("usage")
+        if isinstance(usage_data, dict):
+            entry["usage"] = usage_to_ts(usage_from_json(usage_data))
+        return entry
     if kind == "model_change":
         return {"type": "model_change", "provider": data.get("provider", ""), "modelId": data.get("modelId", "")}
     if kind == "thinking_level_change":
@@ -225,7 +234,8 @@ def read_ts_file(path: str) -> dict:
             if kind == "session_info":
                 name = record.get("name", name)
                 continue
-            entry = {"id": record.get("id") or uuid.uuid4().hex, "parent_id": record.get("parentId")}
+            entry = {"id": record.get("id") or uuid.uuid4().hex, "parent_id": record.get("parentId"),
+                     "timestamp": record.get("timestamp", "")}
             if kind == "message":
                 entry["message"] = ts_message_to_ours(record.get("message", {}))
             elif kind == "custom_message":

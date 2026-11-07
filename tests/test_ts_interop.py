@@ -133,6 +133,36 @@ def test_session_roundtrip_through_ts_format(tmp_path):
     assert len(notes) == 1 and notes[0].message.content == "imported"
 
 
+def test_compaction_usage_roundtrip(tmp_path):
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.start_new()
+    manager.append(UserMessage(content="hello", timestamp=1))
+    manager.append_compaction("compressed", tokens_before=99,
+                              usage=Usage(input=11, output=4, cost={"total": 0.02}))
+
+    exported = manager.export_ts(str(tmp_path / "out.jsonl"))
+    records = [json.loads(line) for line in open(exported, encoding="utf-8") if line.strip()]
+    entry = next(r for r in records if r.get("type") == "compaction")
+    assert entry["usage"]["input"] == 11 and entry["usage"]["output"] == 4
+    assert entry["usage"]["totalTokens"] == 15
+    assert entry["usage"]["cost"]["total"] == 0.02
+
+    # A TS file whose compaction entry carries usage imports it into the payload.
+    lines = [FIXTURE_LINES[0],
+             {"type": "compaction", "id": "c1", "parentId": None, "timestamp": 5, "summary": "compressed",
+              "tokensBefore": 99,
+              "usage": {"input": 7, "output": 2, "cacheRead": 1, "cacheWrite": 0, "totalTokens": 10,
+                        "cost": {"total": 0.03}}}]
+    path = tmp_path / "usage.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    loaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    loaded.load(str(path))
+    data = loaded.latest_custom("compaction")
+    assert data["usage"]["input"] == 7 and data["usage"]["output"] == 2
+    assert data["usage"]["cost"]["total"] == 0.03
+    assert [u.input for u in loaded.compaction_usages()] == [7]
+
+
 def test_export_refuses_non_jsonl_and_overwrite(tmp_path):
     manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
     manager.start_new()

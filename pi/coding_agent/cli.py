@@ -59,7 +59,7 @@ from .rpc import JsonWriter, RpcServer
 from .extensions import ExtensionManager
 from .ts_extension import to_jsonable as to_json_value
 from .tui import ExtensionAction, TerminalUI, THEMES, DEFAULT_KEYBINDINGS, load_themes
-from .usage import context_usage, format_usage, session_stats, usage_cost_breakdown
+from .usage import context_usage, format_usage, session_stats, summary_usage_extra, usage_cost_breakdown
 
 BANNER = "pi-python — Python port of the pi coding agent core. Type /help for commands."
 
@@ -479,7 +479,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                     print(f"error: {exc}")
                 continue
             if command == "/usage":
-                totals = usage_cost_breakdown(agent.messages, registry)
+                totals = usage_cost_breakdown(agent.messages, registry,
+                                              extra_usage=summary_usage_extra(session) if session else None)
                 print(format_usage(totals, context_usage(agent.messages, agent.model)))
                 continue
             if command == "/image":
@@ -895,7 +896,8 @@ def handle_session_command(command: str, argument: str, agent: Agent,
             for item in session.list_sessions():
                 print(f"{item['id']}  {item['name']}  {item['messages']} messages")
     elif command == "/session":
-        stats = session_stats(agent.messages, agent.model, session.session_file)
+        stats = session_stats(agent.messages, agent.model, session.session_file,
+                              extra_usage=summary_usage_extra(session))
         print(f"{session.session_file}\nname: {session.name}\nleaf: {session.leaf_id}\nmessages: {stats['total_messages']}")
         print(f"user: {stats['user_messages']}  assistant: {stats['assistant_messages']}  tool calls: {stats['tool_calls']}")
         print(f"tokens: in {stats['tokens']['input']:,}  out {stats['tokens']['output']:,}  "
@@ -1070,8 +1072,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             agent.messages.append(update)
             session.append(update)
 
-        def persist_summary(summary: str) -> None:
-            session.append_compaction(summary, checkpoint=prefix_checkpoint(agent.compactor.prefix))
+        def persist_summary(summary: str, usage=None) -> None:
+            session.append_compaction(summary, checkpoint=prefix_checkpoint(agent.compactor.prefix), usage=usage)
 
         agent.compactor.on_summary = persist_summary
         CRASH_CONTEXT["session_file"] = session.session_file

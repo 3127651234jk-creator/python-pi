@@ -68,8 +68,14 @@ def _usage_cost(usage: Usage, model, registry) -> float:
     return 0.0
 
 
-def usage_cost_breakdown(messages: Iterable, registry=None) -> UsageTotals:
-    """Total usage grouped by provider/model; unpriced calls fall back to the catalog."""
+def usage_cost_breakdown(messages: Iterable, registry=None,
+                         extra_usage: Optional[Iterable[tuple]] = None) -> UsageTotals:
+    """Total usage grouped by provider/model; unpriced calls fall back to the catalog.
+
+    ``extra_usage`` carries non-message billing such as compaction summary
+    requests; the TypeScript implementation attributes those to the
+    "Tools/summaries" bucket.
+    """
     totals = UsageTotals()
     for message in messages:
         if not isinstance(message, AssistantMessage):
@@ -82,6 +88,10 @@ def usage_cost_breakdown(messages: Iterable, registry=None) -> UsageTotals:
         if registry is not None:
             model = registry.models.get(key) or registry.models.get(f"{message.provider}/{message.model}")
         totals.add(usage, _usage_cost(usage, model, registry), key)
+    for key, usage in extra_usage or []:
+        if usage.total_tokens == 0 and not usage.cost.get("total"):
+            continue
+        totals.add(usage, _usage_cost(usage, None, registry), key)
     return totals
 
 
@@ -125,14 +135,23 @@ def format_usage(totals: UsageTotals, context: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
-def session_stats(messages: list, model=None, session_file: Optional[str] = None) -> dict:
+TOOLS_SUMMARIES_KEY = "Tools/summaries"
+
+
+def summary_usage_extra(session) -> list:
+    """(key, usage) pairs for compaction summary requests recorded on a session."""
+    return [(TOOLS_SUMMARIES_KEY, usage) for usage in session.compaction_usages()]
+
+
+def session_stats(messages: list, model=None, session_file: Optional[str] = None,
+                  extra_usage: Optional[Iterable[tuple]] = None) -> dict:
     """Port of AgentSession.getSessionStats()."""
     user = sum(1 for m in messages if getattr(m, "role", None) == "user")
     assistant = sum(1 for m in messages if isinstance(m, AssistantMessage))
     tool_calls = sum(1 for m in messages if isinstance(m, AssistantMessage)
                      for block in m.content if isinstance(block, ToolCall))
     tool_results = sum(1 for m in messages if isinstance(m, ToolResultMessage))
-    totals = usage_cost_breakdown(messages)
+    totals = usage_cost_breakdown(messages, extra_usage=extra_usage)
     return {
         "session_file": session_file,
         "user_messages": user,

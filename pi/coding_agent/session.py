@@ -8,8 +8,9 @@ import time
 import uuid
 import html
 from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timezone
 from typing import Any, List, Optional
-from ..ai.json_io import message_from_json
+from ..ai.json_io import message_from_json, usage_from_json
 from ..ai.types import Message, get_message_text
 
 from ..ai.types import (
@@ -101,6 +102,7 @@ class SessionEntry:
     parent_id: Optional[str]
     message: Optional[Message]  # None for custom (non-message) entries
     custom: Optional[dict] = None  # {"kind": str, "data": dict}
+    timestamp: str = ""  # UTC ISO timestamp (TS session files always carry one)
 
 
 class SessionManager:
@@ -143,9 +145,9 @@ class SessionManager:
     def append(self, message: Message) -> str:
         if self.session_file is None:
             self.start_new()
-        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, message)
+        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, message, timestamp=_now_iso())
         self._write({"type": "message", "id": entry.id, "parent_id": entry.parent_id,
-                     "message": _to_dict(message)})
+                     "timestamp": entry.timestamp, "message": _to_dict(message)})
         self.entries.append(entry)
         self.leaf_id = entry.id
         return entry.id
@@ -173,9 +175,10 @@ class SessionManager:
         """State-only entry: replayed on load, never enters the LLM context."""
         if self.session_file is None:
             self.start_new()
-        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, None, {"kind": custom_type, "data": data})
+        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, None, {"kind": custom_type, "data": data},
+                             timestamp=_now_iso())
         self._write({"type": "custom", "id": entry.id, "parent_id": entry.parent_id,
-                     "customType": custom_type, "data": data})
+                     "timestamp": entry.timestamp, "customType": custom_type, "data": data})
         self.entries.append(entry)
         self.leaf_id = entry.id
         return entry.id
@@ -187,18 +190,22 @@ class SessionManager:
         metadata = {"display": display}
         if details is not None:
             metadata["details"] = details
-        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, message, {"kind": custom_type, "data": metadata})
+        entry = SessionEntry(uuid.uuid4().hex, self.leaf_id, message, {"kind": custom_type, "data": metadata},
+                             timestamp=_now_iso())
         self._write({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
-                     "customType": custom_type, "display": display, "details": details,
-                     "message": _to_dict(message)})
+                     "timestamp": entry.timestamp, "customType": custom_type, "display": display,
+                     "details": details, "message": _to_dict(message)})
         self.entries.append(entry)
         self.leaf_id = entry.id
         return entry.id
 
-    def append_compaction(self, summary: str, tokens_before: int = 0, checkpoint: Optional[dict] = None) -> str:
+    def append_compaction(self, summary: str, tokens_before: int = 0, checkpoint: Optional[dict] = None,
+                          usage: Optional[Usage] = None) -> str:
         data: dict = {"summary": summary, "tokens_before": tokens_before}
         if checkpoint is not None:
             data["checkpoint"] = checkpoint
+        if usage is not None:
+            data["usage"] = usage.to_dict()
         return self.append_custom("compaction", data)
 
     def append_model_change(self, provider: str, model_id: str) -> str:
@@ -213,6 +220,16 @@ class SessionManager:
     def custom_entries(self, custom_type: Optional[str] = None) -> List[SessionEntry]:
         return [entry for entry in self.entries
                 if entry.custom is not None and (custom_type is None or entry.custom["kind"] == custom_type)]
+
+    def compaction_usages(self) -> List[Usage]:
+        """Usage recorded on this branch's compaction entries (summary-request billing)."""
+        result: List[Usage] = []
+        for entry in self.get_branch():
+            if entry.custom is not None and entry.custom["kind"] == "compaction":
+                data = entry.custom["data"].get("usage")
+                if isinstance(data, dict):
+                    result.append(usage_from_json(data))
+        return result
 
     def latest_custom(self, custom_type: str) -> Optional[dict]:
         """Last custom entry payload of a type on the active branch."""
@@ -382,13 +399,15 @@ class SessionManager:
                         raise ValueError("Invalid session entry")
                     if kind == "custom":
                         entries.append(SessionEntry(entry_id, parent, None,
-                            {"kind": record.get("customType", ""), "data": record.get("data", {})}))
+                            {"kind": record.get("customType", ""), "data": record.get("data", {})},
+                            timestamp=record.get("timestamp", "")))
                     else:
                         metadata = {"display": record.get("display", True)}
                         if record.get("details") is not None:
                             metadata["details"] = record["details"]
                         entries.append(SessionEntry(entry_id, parent, message_from_json(record["message"]),
-                            {"kind": record.get("customType", ""), "data": metadata}))
+                            {"kind": record.get("customType", ""), "data": metadata},
+                            timestamp=record.get("timestamp", "")))
                     leaf = entry_id
                 else:
                     entry_id = record["id"] if kind == "message" else f"legacy-{len(entries)}"
@@ -396,7 +415,7 @@ class SessionManager:
                     if entry_id in {e.id for e in entries} or (parent is not None and parent not in {e.id for e in entries}):
                         raise ValueError("Invalid session entry")
                     message = message_from_json(record["message"] if kind == "message" else record)
-                    entries.append(SessionEntry(entry_id, parent, message))
+                    entries.append(SessionEntry(entry_id, parent, message, timestamp=record.get("timestamp", "")))
                     leaf = entry_id
         self.session_file = path
         self.entries = entries
@@ -412,7 +431,8 @@ class SessionManager:
         entries = []
         leaf = None
         for record in parsed["records"]:
-            entry = SessionEntry(record["id"], record["parent_id"], record.get("message"), record.get("custom"))
+            entry = SessionEntry(record["id"], record["parent_id"], record.get("message"), record.get("custom"),
+                                 timestamp=record.get("timestamp", ""))
             if record["parent_id"] is not None and record["parent_id"] not in {e.id for e in entries}:
                 raise ValueError("Invalid TS session entry")
             entries.append(entry)
@@ -448,6 +468,12 @@ class SessionManager:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _now_iso() -> str:
+    """UTC ISO timestamp in the TS ``toISOString`` shape (millisecond precision)."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + ("%03dZ" % (now.microsecond // 1000))
 
 
 def _branch_digest(entries: List[SessionEntry]) -> str:

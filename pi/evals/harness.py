@@ -401,7 +401,8 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
         session_manager = SessionManager(session_dir=os.path.join(root, "sessions"), cwd=workspace)
         session_manager.start_new()
         args.set_artifact("runId", Path(session_manager.session_file).stem)
-        agent.compactor.on_summary = session_manager.append_compaction
+        agent.compactor.on_summary = (
+            lambda summary, usage=None: session_manager.append_compaction(summary, usage=usage))
         for message in list(agent.messages):
             session_manager.append(message)
 
