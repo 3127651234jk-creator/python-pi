@@ -1,24 +1,43 @@
-"""Process @file CLI arguments into text content and image attachments.
+"""Process @file CLI arguments into text content and image/media attachments.
 
 Port of ``packages/coding-agent/src/cli/file-processor.ts``. Images go through
 ``process_image``; the one-shot CLI passes ``auto_resize_images=False`` because
-resize runs later against the request model's profile.
+resize runs later against the request model's profile. Audio and video files
+are attached by extension with no re-encoding; oversized payloads are rejected
+by the provider.
 """
 
 from __future__ import annotations
 
+import base64
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
-from ..ai.types import ImageContent
-from .images import ProcessImageOptions, detect_supported_image_mime_type_from_file, process_image
+from ..ai.types import AudioContent, ImageContent, VideoContent
+from ..images import ProcessImageOptions, detect_supported_image_mime_type_from_file, process_image
+
+# Media attachments are extension-based: no re-encoding, provider validates.
+_MEDIA_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+}
 
 
 @dataclass
 class ProcessedFiles:
     text: str = ""
     images: List[ImageContent] = field(default_factory=list)
+    media: List[Union[AudioContent, VideoContent]] = field(default_factory=list)
 
 
 def strip_bom(text: str) -> str:
@@ -50,6 +69,16 @@ async def process_file_arguments(
         if os.path.getsize(absolute_path) == 0:
             continue
 
+        media_mime = _MEDIA_MIME_TYPES.get(os.path.splitext(absolute_path)[1].lower())
+        if media_mime:
+            with open(absolute_path, "rb") as handle:
+                data = base64.b64encode(handle.read()).decode("ascii")
+            if media_mime.startswith("audio/"):
+                result.media.append(AudioContent(data=data, mime_type=media_mime))
+            else:
+                result.media.append(VideoContent(data=data, mime_type=media_mime))
+            result.text += f'<file name="{absolute_path}"></file>\n'
+            continue
         mime_type = detect_supported_image_mime_type_from_file(absolute_path)
         if mime_type:
             with open(absolute_path, "rb") as handle:

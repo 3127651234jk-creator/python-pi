@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, Union
 
 from ...ai.types import ImageContent, TextContent
 from ...agent.types import AgentTool, AgentToolResult
-from ..images import (
+from ...images import (
     ProcessImageOptions,
     detect_supported_image_mime_type_from_file,
     process_image,

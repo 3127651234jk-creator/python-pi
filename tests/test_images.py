@@ -25,7 +25,7 @@ from pi.ai.models import Model, ModelCost, parse_input_limits
 from pi.ai.providers.openrouter_images import build_params, parse_image_response
 from pi.ai.types import AssistantImages, ImageContent, ImagesContext, TextContent, ToolResultMessage, UserMessage
 from pi.coding_agent.file_processor import process_file_arguments
-from pi.coding_agent.images import (
+from pi.images import (
     ImageResizeOptions,
     ProcessImageOptions,
     detect_supported_image_mime_type,

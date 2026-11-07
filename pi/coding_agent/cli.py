@@ -244,7 +244,7 @@ class CliRenderer:
 async def run_prompt(agent: Agent, text: str, renderer: CliRenderer, session: Optional[SessionManager],
                      resources: Optional[ResourceCatalog] = None, extensions: Optional[ExtensionManager] = None,
                      mcp: Optional[McpManager] = None,
-                     images: Optional[List[ImageContent]] = None) -> None:
+                     images: Optional[List[Any]] = None) -> None:
     """Run one prompt with abort handling and session persistence."""
 
     if mcp is not None and mcp.lazy_servers:
@@ -330,7 +330,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                            resources: Optional[ResourceCatalog] = None, mcp: Optional[McpManager] = None,
                            extensions: Optional[ExtensionManager] = None, ui: Optional[TerminalUI] = None,
                            packages: Optional[PackageManager] = None,
-                           initial: Optional[Tuple[str, List[ImageContent]]] = None) -> None:
+                           initial: Optional[Tuple[str, List[Any]]] = None) -> None:
     loop = asyncio.get_running_loop()
     print(BANNER)
     if initial is not None and (initial[0] or initial[1]):
@@ -971,7 +971,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     file_args = [arg[1:] for arg in args.prompt if arg.startswith("@")]
     message_args = [arg for arg in args.prompt if not arg.startswith("@")]
     prompt_text = " ".join(message_args)
-    prompt_images: Optional[List[ImageContent]] = None
+    prompt_images: Optional[List[Any]] = None
     if file_args:
         try:
             processed = await process_file_arguments(file_args, cwd=cwd, auto_resize_images=False)
@@ -979,9 +979,10 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         # AgentSession-equivalent resize runs per model after hooks; the CLI
-        # attachment pass only normalizes formats.
+        # attachment pass only normalizes formats. Media files ride the same
+        # attachment list; providers reject payloads they cannot accept.
         prompt_text = processed.text + prompt_text
-        prompt_images = processed.images or None
+        prompt_images = (processed.images + processed.media) or None
     if args.mode == "rpc" and args.prompt or args.mode == "json" and not args.prompt:
         print("error: rpc accepts prompts through stdin; json requires a prompt argument", file=sys.stderr)
         return 2

@@ -1,6 +1,7 @@
 """Inline-image pipeline: MIME sniffing, PNG conversion, model-fit resizing.
 
-Port of ``packages/coding-agent/src/utils/{mime,image-convert,image-resize-core,
+Shared by the coding-agent tools and the durable tools. Port of
+``packages/coding-agent/src/utils/{mime,image-convert,image-resize-core,
 image-process}.ts``. MIME detection is magic-byte based because extensions lie;
 formats the providers do not accept inline are converted to PNG with Pillow,
 the stand-in for the TS Photon WASM module. If Pillow is missing, conversion

@@ -98,13 +98,13 @@ class Agent:
         queue.clear()
         return messages
 
-    def steer(self, text: str) -> None:
+    def steer(self, text: str, images: Optional[List[Any]] = None) -> None:
         """Queue a message to inject at the next drain point (mid-run)."""
-        self._steering_queue.append(UserMessage(content=text, timestamp=_now_ms()))
+        self._steering_queue.append(_user_input(text, images))
 
-    def follow_up(self, text: str) -> None:
+    def follow_up(self, text: str, images: Optional[List[Any]] = None) -> None:
         """Queue a message to process after the agent would otherwise stop."""
-        self._follow_up_queue.append(UserMessage(content=text, timestamp=_now_ms()))
+        self._follow_up_queue.append(_user_input(text, images))
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -222,6 +222,14 @@ class Agent:
             unsubscribe()
             if task is not None:
                 await task
+
+
+def _user_input(text: str, images: Optional[List[Any]]) -> UserMessage:
+    """One queued user message: plain text, or text plus image blocks."""
+    if images:
+        content: Any = ([TextContent(text=text)] if text else []) + list(images)
+        return UserMessage(content=content, timestamp=_now_ms())
+    return UserMessage(content=text, timestamp=_now_ms())
 
 
 def _create_task(coro: Any) -> Any:
