@@ -51,7 +51,10 @@ from .system_prompt import SystemPromptOptions, build_system_prompt
 from .tools import create_default_tools, tool_prompt_contributions
 from .trust import TrustStore, project_trust_parent_path, resolve_project_trusted, trust_options
 from .config import Configuration, read_json
-from .custom_api import RESERVED_PROVIDER_ID, WizardIO, run_custom_api_wizard
+from .custom_api import (RESERVED_PROVIDER_ID, ConcurrentConfigChange, CustomApiSaver,
+                         CustomApiForm, SaveError, WizardIO, run_custom_api_wizard,
+                         validate_form_values)
+from .custom_api_form import SaveResult
 from .model_registry import ModelRegistry
 from .auth import login_device, login_openrouter
 from .subscription_auth import get_or_create_device_id, login_claude, login_codex, login_copilot, login_kimi_coding, login_openai_chatgpt, login_radius, login_xai
@@ -945,70 +948,104 @@ class TextWizardIO:
         print(message)
 
 
-class TUIWizardIO:
-    """Wizard UI backed by the enhanced terminal dialogs."""
+def _apply_custom_api_choices(registry: ModelRegistry, agent: Optional[Agent],
+                              session: Optional[SessionManager], form: CustomApiForm,
+                              use_now: Optional[bool], set_default: Optional[bool]) -> List[str]:
+    """Set the default and switch models after a successful save.
 
-    def __init__(self, ui: TerminalUI) -> None:
-        self.ui = ui
+    Returns the lines to show in the main UI. Post-save failures are reported
+    separately from the save itself so the user never retries the save.
+    """
+    identifier = form.provider_id + "/" + form.model_id
+    messages = [f"saved provider '{form.provider_id}' with model '{identifier}'"]
+    if set_default:
+        try:
+            registry.config.save_many({"provider": form.provider_id, "model": form.model_id})
+            messages.append(
+                f"default model: {identifier} (project settings or --provider/--model still override it)")
+        except (OSError, ValueError) as exc:
+            messages.append(f"model saved, but setting the default failed: {describe_error(exc)}")
+    else:
+        messages.append("default model: unchanged")
+    if agent is not None:
+        if use_now:
+            try:
+                registry.reload()
+                agent.model = registry.resolve(form.provider_id, form.model_id)
+                if not agent.model.reasoning and agent.thinking_level != "off":
+                    agent.thinking_level = "off"
+                    if session:
+                        session.append_thinking_change("off")
+                if session:
+                    session.append_model_change(agent.model.provider, agent.model.id)
+                messages.append(f"model: {identifier}")
+            except (ModelError, ValueError) as exc:
+                messages.append(f"model saved, but switching failed: {describe_error(exc)}")
+            except (OSError, RuntimeError) as exc:
+                messages.append(f"warning: could not record the switch in the session: {describe_error(exc)}")
+        else:
+            messages.append("current model: unchanged")
+    messages.append("note: the connection has not been verified yet; the first prompt sends the first real request")
+    return messages
 
-    async def choose(self, title: str, values, default: Optional[str] = None) -> Optional[str]:
-        return await self.ui.choose(title, values, default=default)
 
-    async def text_input(self, title: str, default: str = "", password: bool = False,
-                         allow_cancel_word: bool = True,
-                         validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
-        # The dialogs cancel through Escape or Ctrl+C; ":cancel" is text-only.
-        return await self.ui.input(title, default=default, password=password, validate=validate)
+async def _custom_login_single_page(registry: ModelRegistry, agent: Optional[Agent],
+                                    session: Optional[SessionManager], ui) -> None:
+    """One-page flow for the enhanced terminal: validate, save, then report."""
+    saver = CustomApiSaver(registry.config)
 
-    async def confirm(self, title: str, default: bool) -> Optional[bool]:
-        result = await self.ui.choose(title, [("yes", "Yes"), ("no", "No")],
-                                      default="yes" if default else "no")
-        return None if result is None else result == "yes"
+    def validate(values):
+        return validate_form_values(values, registry.providers, registry.config)
 
-    def say(self, message: str) -> None:
+    async def save(form: CustomApiForm, use_now: bool, set_default: bool) -> SaveResult:
+        try:
+            saver.save(registry, form)
+        except ConcurrentConfigChange:
+            try:
+                registry.reload()
+            except (ModelError, ValueError) as exc:
+                raise SaveError(
+                    f"configuration changed on disk and could not be reloaded: {describe_error(exc)}") from exc
+            saver.adopt_current()
+            # Keep the draft; the page shows fresh provider conflicts and asks
+            # the user to press Save model again.
+            raise
+        return SaveResult(_apply_custom_api_choices(
+            registry, agent, session, form, use_now, set_default))
+
+    result = await ui.custom_api_form(validate, save)
+    if result is None:
+        print("custom API model login cancelled")
+        return
+    for message in result.messages:
         print(message)
 
 
 async def custom_login_command(registry: ModelRegistry, agent: Optional[Agent] = None,
                                session: Optional[SessionManager] = None,
                                ui: Optional[TerminalUI] = None) -> None:
-    """Run the add-custom-API-model wizard and apply the post-save choices."""
+    """Run the add-custom-API-model wizard and apply the post-save choices.
+
+    The enhanced terminal gets the single-page form; the plain REPL and
+    ``--login custom`` keep the text wizard.
+    """
     if RESERVED_PROVIDER_ID in registry.providers:
         raise ModelError("provider ID 'custom' is reserved for this login entry; "
                          "rename it in models.json to use the wizard")
     if agent is not None and agent.is_streaming:
         raise ValueError("cannot change the configuration while a request is running")
-    io: WizardIO = TUIWizardIO(ui) if ui else TextWizardIO()
+    if ui is not None:
+        await _custom_login_single_page(registry, agent, session, ui)
+        return
+    io: WizardIO = TextWizardIO()
     form = await run_custom_api_wizard(registry.config, registry, io)
     if form is None:
         io.say("custom API model login cancelled")
         return
-    identifier = form.provider_id + "/" + form.model_id
-    io.say(f"saved provider '{form.provider_id}' with model '{identifier}'")
     use_now = await io.confirm("Use this model now?", default=True) if agent is not None else None
     set_default = await io.confirm("Set as default for future launches?", default=False)
-    if set_default:
-        try:
-            registry.config.save_many({"provider": form.provider_id, "model": form.model_id})
-            io.say(f"default model: {identifier} (project settings or --provider/--model still override it)")
-        except (OSError, ValueError) as exc:
-            io.say(f"model saved, but setting the default failed: {describe_error(exc)}")
-    if use_now:
-        try:
-            registry.reload()
-            agent.model = registry.resolve(form.provider_id, form.model_id)
-            if not agent.model.reasoning and agent.thinking_level != "off":
-                agent.thinking_level = "off"
-                if session:
-                    session.append_thinking_change("off")
-            if session:
-                session.append_model_change(agent.model.provider, agent.model.id)
-            io.say(f"model: {identifier}")
-        except (ModelError, ValueError) as exc:
-            io.say(f"model saved, but switching failed: {describe_error(exc)}")
-        except (OSError, RuntimeError) as exc:
-            io.say(f"warning: could not record the switch in the session: {describe_error(exc)}")
-    io.say("note: the connection has not been verified yet; the first prompt sends the first real request")
+    for message in _apply_custom_api_choices(registry, agent, session, form, use_now, set_default):
+        io.say(message)
 
 
 async def _choose_console(title: str, values):

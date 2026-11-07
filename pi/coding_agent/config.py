@@ -102,7 +102,7 @@ def validate_settings(settings: dict) -> None:
     if settings.get("theme", "dark") not in ("dark", "light", "mono"):
         raise ValueError("theme must be dark, light or mono")
     bindings = settings.get("keybindings", {})
-    if not isinstance(bindings, dict) or set(bindings) - {"submit", "newline", "abort", "models", "sessions", "exit", "complete"}:
+    if not isinstance(bindings, dict) or set(bindings) - {"submit", "newline", "abort", "models", "sessions", "exit", "complete", "save"}:
         raise ValueError("Invalid keybindings actions")
     if not all(isinstance(keys, list) and keys and all(isinstance(key, str) and key.strip() for key in keys) for keys in bindings.values()):
         raise ValueError("Each keybindings action requires a nonempty list of shortcuts")

@@ -10,9 +10,9 @@ writer; no new request protocol is introduced.
 import copy
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 from urllib.parse import urlsplit
 
 from .config import Configuration, read_json, write_json
@@ -55,7 +55,7 @@ class CustomApiForm:
     api: str = "openai-completions"
     provider_id: str = ""
     base_url: str = ""
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     model_id: str = ""
     display_name: str = ""
     context_window: int = DEFAULT_CONTEXT_WINDOW
@@ -195,6 +195,128 @@ def validate_limits(context_window: int, max_tokens: int) -> None:
         raise ValueError("Context window must be greater than max output tokens")
 
 
+@dataclass
+class FormValidation:
+    """Whole-form result: the normalized form, or one error per bad field."""
+
+    form: Optional[CustomApiForm]
+    errors: Dict[str, str]
+    suggestion: Optional[SuffixCheck] = None
+    request_url: Optional[str] = None
+
+
+def form_values(form: CustomApiForm) -> Dict[str, object]:
+    """Raw values of an already-parsed form, for whole-form validation."""
+    return {
+        "api": form.api,
+        "provider_id": form.provider_id,
+        "base_url": form.base_url,
+        "api_key": form.api_key,
+        "model_id": form.model_id,
+        "display_name": form.display_name,
+        "context_window": str(form.context_window),
+        "max_tokens": str(form.max_tokens),
+        "image_input": form.image_input,
+        "reasoning": form.reasoning,
+    }
+
+
+def validate_form_values(values: Dict[str, object], existing_providers, config: Configuration) -> FormValidation:
+    """Validate every raw string as one unit, without prompting.
+
+    The single-page form calls this after each edit and on save; the text
+    wizard uses the same underlying field rules. Cross-field checks live here
+    so both surfaces agree. No network access and no writes.
+    """
+    errors: Dict[str, str] = {}
+
+    api = "openai-completions"
+    try:
+        api = validate_api(str(values.get("api", "")))
+    except ValueError as exc:
+        errors["api"] = str(exc)
+
+    provider_id = ""
+    try:
+        provider_id = validate_provider_id(str(values.get("provider_id", "")), existing_providers, config)
+    except ValueError as exc:
+        errors["provider_id"] = str(exc)
+
+    base_url = ""
+    request_url = None
+    suggestion = None
+    try:
+        base_url = validate_base_url(str(values.get("base_url", "")))
+    except ValueError as exc:
+        errors["base_url"] = str(exc)
+    else:
+        if "api" not in errors:
+            try:
+                suggestion = check_endpoint_suffix(base_url, api)
+            except ValueError as exc:
+                errors["base_url"] = str(exc)
+            else:
+                if suggestion.matching_api is not None:
+                    errors["base_url"] = (
+                        f"This looks like a {dict(API_FORMATS)[suggestion.matching_api]} endpoint; "
+                        "choose that API format or change the address")
+                elif suggestion.suggested_root is not None:
+                    errors["base_url"] = (
+                        f"This looks like a full endpoint; use the root {suggestion.suggested_root}")
+        if "api" not in errors:
+            request_url = endpoint_preview(api, base_url)
+
+    api_key = ""
+    try:
+        api_key = validate_api_key(str(values.get("api_key", "")))
+    except ValueError as exc:
+        errors["api_key"] = str(exc)
+
+    model_id = ""
+    try:
+        model_id = validate_model_id(str(values.get("model_id", "")))
+    except ValueError as exc:
+        errors["model_id"] = str(exc)
+
+    name = ""
+    raw_name = str(values.get("display_name", ""))
+    raw_model = str(values.get("model_id", ""))
+    try:
+        name = validate_display_name(raw_name, raw_model)
+    except ValueError as exc:
+        # An empty display name falls back to Model ID and is not an error on
+        # its own; only a bad explicit value needs its own message.
+        if raw_name.strip():
+            errors["display_name"] = str(exc)
+
+    context_window = 0
+    try:
+        context_window = validate_positive_int(str(values.get("context_window", "")), "Context window")
+    except ValueError as exc:
+        errors["context_window"] = str(exc)
+    max_tokens = 0
+    try:
+        max_tokens = validate_positive_int(str(values.get("max_tokens", "")), "Max output tokens")
+    except ValueError as exc:
+        errors["max_tokens"] = str(exc)
+    if "context_window" not in errors and "max_tokens" not in errors:
+        try:
+            validate_limits(context_window, max_tokens)
+        except ValueError as exc:
+            errors["context_window"] = str(exc)
+
+    form = None
+    if not errors:
+        form = CustomApiForm(
+            api=api, provider_id=provider_id, base_url=base_url, api_key=api_key,
+            model_id=model_id, display_name=name,
+            context_window=context_window, max_tokens=max_tokens,
+            image_input=bool(values.get("image_input", False)),
+            reasoning=bool(values.get("reasoning", False)),
+        )
+    return FormValidation(form=form, errors=errors, suggestion=suggestion, request_url=request_url)
+
+
 def provider_configuration(form: CustomApiForm) -> dict:
     return {"api": form.api, "base_url": form.base_url, "models": [model_configuration(form)]}
 
@@ -329,12 +451,20 @@ async def run_custom_api_wizard(config: Configuration, registry: ModelRegistry, 
                     return None
                 if action == "back":
                     break  # re-enter the fields; values kept, key stays in memory
+                validation = validate_form_values(form_values(form), registry.providers, config)
+                if validation.form is None:
+                    # The on-disk configuration drifted since collection (for
+                    # example a provider now conflicts); re-enter the fields.
+                    for message in validation.errors.values():
+                        io.say(f"error: {message}")
+                    break
                 try:
                     saver.save(registry, form)
                 except ConcurrentConfigChange as exc:
                     # Keep the in-memory form and require re-confirmation; the
                     # re-confirmed save merges onto the current on-disk state.
                     io.say(f"warning: {exc}")
+                    registry.reload()
                     saver.adopt_current()
                     continue
                 return form

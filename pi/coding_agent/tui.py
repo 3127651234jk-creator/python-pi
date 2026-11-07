@@ -27,11 +27,12 @@ from prompt_toolkit.validation import ValidationError, Validator
 from prompt_toolkit.widgets import Button, Dialog, TextArea, ValidationToolbar
 
 from ..agent.agent import Agent
+from .custom_api_form import CustomApiFormApp, CustomApiFormResult, SaveForm, ValidateForm
 
 DEFAULT_KEYBINDINGS = {
     "submit": ["enter"], "newline": ["escape enter"], "abort": ["c-c"],
     "models": ["c-l"], "sessions": ["c-o"], "exit": ["c-d"],
-    "complete": ["tab"],
+    "complete": ["tab"], "save": ["c-s"],
 }
 THEMES = {
     "dark": {
@@ -53,6 +54,19 @@ THEMES = {
         "dialog.selected.marker": "bg:#dbe6ff #1d5fd0 bold",
         "dialog.button": "bg:#e8ebf4 #23262f",
         "dialog.button.focused": "bg:#1d5fd0 #ffffff bold",
+        "dialog.group": "bg:#f7f8fb #1d5fd0 bold",
+        "dialog.label": "bg:#f7f8fb #23262f",
+        "dialog.label.focused": "bg:#f7f8fb #0d1c3d bold underline",
+        "dialog.field": "bg:#eceff7 #23262f",
+        "dialog.field.focused": "bg:#dbe6ff #0d1c3d underline",
+        "dialog.error": "bg:#f7f8fb #b3261e",
+        "dialog.warning": "bg:#f7f8fb #8a5a00",
+        "dialog.status": "bg:#f7f8fb #1d5fd0",
+        "dialog.separator": "bg:#f7f8fb #c3c9d8",
+        "dialog.checkbox.row": "bg:#f7f8fb #23262f",
+        "dialog.checkbox": "#23262f",
+        "dialog.checkbox.checked": "#1d5fd0 bold",
+        "dialog.checkbox.focused": "bg:#dbe6ff #0d1c3d",
     },
     "mono": {
         "prompt": "bold", "bottom-toolbar": "reverse",
@@ -62,6 +76,12 @@ THEMES = {
         "dialog.marker": "", "dialog.text": "",
         "dialog.selected": "reverse", "dialog.selected.marker": "reverse bold",
         "dialog.button": "", "dialog.button.focused": "reverse bold",
+        "dialog.group": "bold", "dialog.label": "", "dialog.label.focused": "bold underline",
+        "dialog.field": "", "dialog.field.focused": "reverse",
+        "dialog.error": "bold", "dialog.warning": "", "dialog.status": "",
+        "dialog.separator": "", "dialog.checkbox.row": "",
+        "dialog.checkbox": "", "dialog.checkbox.checked": "bold",
+        "dialog.checkbox.focused": "reverse",
     },
 }
 
@@ -80,6 +100,19 @@ DIALOG_STYLES = {
     "dialog.selected.marker": "bg:#26304a #8ab4ff bold",
     "dialog.button": "bg:#222738 #c6cbe0",
     "dialog.button.focused": "bg:#8ab4ff #14171f bold",
+    "dialog.group": "bg:#191c26 #8ab4ff bold",
+    "dialog.label": "bg:#191c26 #c6cbe0",
+    "dialog.label.focused": "bg:#191c26 #ffffff bold underline",
+    "dialog.field": "bg:#222738 #e6eaf5",
+    "dialog.field.focused": "bg:#2a3552 #ffffff underline",
+    "dialog.error": "bg:#191c26 #ff8f8f",
+    "dialog.warning": "bg:#191c26 #ffc66d",
+    "dialog.status": "bg:#191c26 #8ab4ff",
+    "dialog.separator": "bg:#191c26 #3f4866",
+    "dialog.checkbox.row": "bg:#191c26 #c6cbe0",
+    "dialog.checkbox": "#c6cbe0",
+    "dialog.checkbox.checked": "#8ab4ff bold",
+    "dialog.checkbox.focused": "bg:#26304a #eef2ff",
 }
 
 
@@ -615,6 +648,9 @@ class TerminalUI:
         self.style = Style.from_dict(_theme_styles(self.themes[self.settings.get("theme", "dark")]))
         bindings = KeyBindings()
         keys = {**DEFAULT_KEYBINDINGS, **self.settings.get("keybindings", {})}
+        # "save" belongs to modal forms (the custom API page); the prompt has
+        # no save target, so it is not registered here.
+        self.form_keybindings = keys
 
         def submit(event):
             event.current_buffer.validate_and_handle()
@@ -660,6 +696,8 @@ class TerminalUI:
 
         registered = set()
         for action, shortcuts in keys.items():
+            if action == "save":
+                continue
             for shortcut in shortcuts:
                 binding = bindings.add(*shortcut.split(), eager=True)
                 binding(handlers[action])
@@ -1073,6 +1111,34 @@ class TerminalUI:
         text and shows the rule's error message."""
         with create_app_session(input=self.session.app.input, output=self.session.app.output):
             return await _TextDialog(title, default, password, self.style, validate).run()
+
+    async def custom_api_form(self, validate: ValidateForm,
+                              save: SaveForm) -> Optional[CustomApiFormResult]:
+        """Run the single-page custom API form.
+
+        Uses the same suspend/resume path as extension views so the main
+        editor prompt is never running underneath the form.
+        """
+        app = CustomApiFormApp(
+            validate=validate, save=save, style=self.style,
+            shortcuts=self.form_keybindings.get("save", ["c-s"]),
+            mono=self.settings.get("theme", "dark") == "mono",
+            input=self.session.app.input, output=self.session.app.output,
+        )
+        suspended = self.session.app.is_running
+        if suspended:
+            self._suspend_read = True
+            self._resume_event.clear()
+            self.session.app.exit(result="")
+            while self.session.app.is_running:
+                await asyncio.sleep(0.01)
+        try:
+            with create_app_session(input=self.session.app.input, output=self.session.app.output):
+                return await app.run()
+        finally:
+            if suspended:
+                self._suspend_read = False
+                self._resume_event.set()
 
     async def run(self, coroutine):
         task = asyncio.create_task(coroutine)
