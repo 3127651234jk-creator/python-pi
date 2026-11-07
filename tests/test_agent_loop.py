@@ -269,3 +269,91 @@ def test_truncated_message_fails_tool_calls():
         assert calls["count"] == 2
 
     asyncio.run(scenario())
+
+
+def test_hosted_tool_calls_are_not_executed():
+    """Provider-executed (hosted) tool calls replay via raw_item: no execution,
+    no tool result, and the loop continues to the next turn."""
+
+    async def scenario():
+        import time
+
+        from pi.ai.providers.base import make_partial
+        from pi.ai.types import DoneEvent, StreamStartEvent, Usage
+
+        raw_item = {"type": "web_search_call", "id": "ws_1", "status": "completed",
+                    "action": {"type": "search", "query": "q"}}
+
+        async def stream_fn(model, context, options=None):
+            partial = make_partial(model, 0)
+            yield StreamStartEvent(partial=partial)
+            done = make_partial(model, 0)
+            done.content = [
+                ToolCall(id="ws_1", name="web_search", arguments={}, raw_item=raw_item),
+                TextContent(text="answer"),
+            ]
+            done.stop_reason = "stop"
+            done.usage = Usage()
+            yield DoneEvent(reason="stop", message=done)
+
+        executed = []
+        tools = [AgentTool(name="web_search", label="web_search", description="hosted",
+                           parameters={"type": "object"},
+                           execute=lambda *args, **kwargs: executed.append(args))]
+
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=tools),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+        assert executed == []
+        assert [getattr(m, "role", None) for m in messages] == ["system", "user", "assistant"]
+        assert messages[2].content[0].raw_item == raw_item
+
+    asyncio.run(scenario())
+
+
+def test_hosted_tool_declaration_preserved_in_changes():
+    """Hosted tools registered on the context re-declare with their payload."""
+
+    async def scenario():
+        import time
+
+        from pi.ai.providers.base import make_partial
+        from pi.ai.types import DoneEvent, StreamStartEvent, Tool, Usage
+
+        async def stream_fn(model, context, options=None):
+            partial = make_partial(model, 0)
+            yield StreamStartEvent(partial=partial)
+            done = make_partial(model, 0)
+            done.content = [TextContent(text="ok")]
+            done.stop_reason = "stop"
+            done.usage = Usage()
+            yield DoneEvent(reason="stop", message=done)
+
+        captured = {}
+
+        async def run(model, context, options=None):
+            captured["context"] = context
+            async for event in stream_fn(model, context, options):
+                yield event
+
+        tools = [AgentTool(name="web_search", label="web_search", description="hosted",
+                           parameters={"type": "object"},
+                           hosted={"type": "web_search", "search_context_size": "medium"})]
+        await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=tools),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=run,
+        )
+        declared = [t for m in captured["context"].messages if getattr(m, "role", None) == "system"
+                    for t in (m.tools_added or [])]
+        assert [t.hosted for t in declared] == [{"type": "web_search", "search_context_size": "medium"}]
+
+    asyncio.run(scenario())
