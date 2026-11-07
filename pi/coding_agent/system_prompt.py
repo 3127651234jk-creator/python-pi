@@ -96,6 +96,8 @@ def build_rules(options: SystemPromptOptions) -> str:
 
     has_bash = "bash" in options.selected_tools
     has_search_tools = any(t in options.selected_tools for t in ("grep", "find", "ls"))
+    if os.name == "nt":
+        add_rule("This host runs Windows. Follow each tool's declared shell. Prefer powershell for Windows commands; use Get-ChildItem, Select-String and Select-Object -First instead of ls -la, grep and head. Use $null instead of /dev/null in PowerShell. Prefer dedicated read, ls, find and grep tools when available.")
     if has_bash and not has_search_tools:
         add_rule("Use bash for file operations like ls, rg, find")
     for name in options.selected_tools:

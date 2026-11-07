@@ -10,6 +10,7 @@ full output is saved to a temp file when truncation occurs.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shutil
 import signal
@@ -85,6 +86,20 @@ BASH_DESCRIPTION = (
 BASH_PROMPT_SNIPPET = f"Execute {_SHELL_LABEL} commands ({_SHELL_EXAMPLES})"
 
 
+def powershell_command(command: str) -> Tuple[list, bool]:
+    executable = shutil.which("pwsh") or shutil.which("powershell")
+    if executable is None:
+        raise FileNotFoundError("PowerShell is unavailable; install pwsh and add it to PATH")
+    prefix = (
+        "$ProgressPreference = 'SilentlyContinue'\n"
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        "$OutputEncoding = [Console]::OutputEncoding\n"
+    )
+    encoded = base64.b64encode((prefix + command).encode("utf-16-le")).decode("ascii")
+    return [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text",
+            "-EncodedCommand", encoded], False
+
+
 class OutputAccumulator:
     """Collect streamed output; tail-truncate snapshots; persist overflow."""
 
@@ -129,7 +144,7 @@ def _shell_command(command: str) -> Tuple[list, bool]:
         bash = _WINDOWS_BASH or _find_windows_bash()
         if bash is not None:
             return [bash, "-c", command], False
-        return ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], False
+        return powershell_command(command)
     return ["bash", "-c", command], False
 
 
