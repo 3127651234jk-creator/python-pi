@@ -240,18 +240,20 @@ def test_login_without_provider_uses_pickers(config, monkeypatch):
     asyncio.run(interactive_loop(Agent(resolve_model("faux")), CliRenderer(quiet=True), None, registry, ui=ui))
     assert recorded == [("radius", True)]
     assert ui.prompts[0][0] == "Sign in"
+    assert "Add custom API model" in ui.prompts[0][1]
     assert ui.prompts[1][0] == "Provider"
     assert "radius" in ui.prompts[1][1] and "anthropic" in ui.prompts[1][1]
 
 
 def test_login_without_provider_lists_providers_in_plain_mode(config, monkeypatch, capsys):
     registry = ModelRegistry(config)
-    inputs = iter(["/login", "/exit"])
+    inputs = iter(["/login", "1", ":cancel", "/exit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
     asyncio.run(interactive_loop(Agent(resolve_model("faux")), CliRenderer(quiet=True), None, registry))
     output = capsys.readouterr().out
-    assert "Usage: /login <provider> [oauth]" in output
-    assert "radius" in output
+    assert "Sign in" in output and "Add custom API model" in output
+    assert "Provider" in output
+    assert "radius" in output and "anthropic" in output
 
 
 def test_login_provider_options_cover_both_methods(config):

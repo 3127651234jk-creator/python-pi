@@ -401,6 +401,7 @@ Prompt caching 默认开启（`cache_retention: "5m"`，设为 `"1h"` 或 `false
 python -m pi --login openai
 python -m pi --login anthropic
 python -m pi --login openrouter --oauth
+python -m pi --login custom     # 自定义 API 模型向导（保存后退出）
 python -m pi --logout openrouter
 python -m pi --list-models
 ```
@@ -409,21 +410,24 @@ API key 通过隐藏输入提示录入。凭据优先级为 `--api-key` > 已保
 
 OpenRouter 登录会打印授权链接，需在本机浏览器打开；程序等待随机本地端口上的回调，五分钟后超时。实现使用 [OpenRouter PKCE 协议](https://openrouter.ai/docs/guides/overview/auth/oauth)。其他兼容服务可配置 [RFC 8628 设备码流程](https://www.rfc-editor.org/rfc/rfc8628)，专用订阅登录使用独立适配，命令如下：
 
-```bash
-python -m pi --login claude --oauth
-python -m pi --login codex
-python -m pi --login copilot
-python -m pi --login openai --oauth
-python -m pi --login kimi-coding
-python -m pi --login xai
-python -m pi --login radius
-python -m pi --provider anthropic "hello"
-python -m pi --provider openai-codex "hello"
-python -m pi --provider github-copilot "hello"
-python -m pi --provider radius "hello"
-```
-
 Claude 使用 PKCE 授权链接并要求粘贴授权码；Codex 和 Copilot 使用设备码；`--login openai --oauth` 走 Sign in with ChatGPT（不带 `--oauth` 时保存 API key；`chatgpt` / `openai-chatgpt` 为同一目标的别名）；Kimi 与 xAI 使用各自的设备码流程；Radius 可选浏览器回调或设备码，登录成功后立即刷新一次网关模型目录。适配包含令牌自动刷新、Claude OAuth 请求头与工具名转换、Codex 账户标识及 Responses 请求、Copilot 服务端点及请求来源头。以上流程已通过离线模拟测试，未验证真实账号授权或订阅可用性。
+
+### 添加自定义 API 模型（Add custom API model）
+
+`/login` 菜单第三项「Add custom API model」（或 `/login custom`、`python -m pi --login custom`）打开向导：选择 API 格式后依次录入 Provider ID、Base URL、API Key、模型 ID 和显示名称，可选展开高级设置（上下文窗口、最大输出 token、图片输入、reasoning），确认页 Save 后写入用户目录的 `models.json` 与 `auth.json`，模型立即出现在 `/model` 选择器中，重启后可用。保存后可独立选择「立即使用」和「设为未来启动的默认模型」；项目 `.pi/settings.json` 或 `--provider`/`--model` 参数仍会覆盖用户默认值。非交互 stdin 下 `--login custom` 直接报错，不读取管道内容。
+
+三种格式的地址规则（向导只追加路径后缀，不自动补 `/v1`）：
+
+| 格式 | Base URL 示例 | 最终请求地址 |
+| --- | --- | --- |
+| OpenAI Chat Completions | `https://gateway.example.com/v1` | `https://gateway.example.com/v1/chat/completions` |
+| OpenAI Responses | `https://gateway.example.com/v1` | `https://gateway.example.com/v1/responses` |
+| Claude Messages | `https://gateway.example.com` | `https://gateway.example.com/v1/messages` |
+| Claude Messages | `https://gateway.example.com/anthropic` | `https://gateway.example.com/anthropic/v1/messages` |
+
+粘贴完整端点时向导会识别三种已知后缀并建议根地址；后缀与所选协议不匹配时要求重新选择协议或地址，不静默改写协议。Provider ID 代表「端点 + 协议 + 凭据」的组合，须匹配 `^[a-z][a-z0-9-]{0,63}$`，不能为保留字 `custom`，也不能与现有 provider 重名；同一网关换用不同协议时应建立不同 ID（如 `gateway-chat` 与 `gateway-responses`）。允许本地 `http://` 地址；非本机 HTTP 地址需要确认「API Key 将通过未加密连接发送」。高级设置中的限制只是客户端配置，不代表服务端真实能力，应按服务文档修改；成本不要求填写，界面不会把未配置成本描述成免费。
+
+保存成功仅表示配置有效并已落盘，连接尚未验证，首条真实 prompt 才发出模型请求。`/logout <id>` 只清除凭据，模型配置保留；之后可通过 `/login <id>` 重新录入密钥恢复调用。写入过程采用快照校验加有限回滚：保存前其他进程改动了配置会要求重新确认，写入或 reload 失败时撤销本次新增条目，回滚失败会明确提示需要手工修复的文件。若此前异常退出留下了孤立密钥（`auth.json` 有记录但 provider 不存在），向导会拒绝同 ID 并提示先 `/logout <id>` 清理。
 
 `models.json` 示例（字段使用 Python 的 snake_case）：
 
@@ -460,7 +464,8 @@ provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 head
 /models                         列出模型与能力参数
 /model openai/gpt-4o             切换 provider 和模型
 /model gpt-4o-mini               在当前 provider 内切换
-/login                          交互选择登录方式与 provider
+/login                          交互选择登录方式与 provider（含自定义 API 模型）
+/login custom                   打开自定义 API 模型向导
 /login openai                   保存 API key
 /login openrouter oauth         OAuth 登录
 /logout openrouter              移除本地凭据

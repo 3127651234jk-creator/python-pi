@@ -78,9 +78,13 @@ class Configuration:
         self.settings = merged
 
     def save(self, key: str, value: object, project: bool = False) -> None:
+        self.save_many({key: value}, project)
+
+    def save_many(self, values: dict, project: bool = False) -> None:
+        """Persist several settings keys as one file update."""
         path = (self.cwd / ".pi" if project else self.agent_dir) / "settings.json"
         settings = read_json(path)
-        settings[key] = value
+        settings.update(values)
         validate_settings(settings)
         write_json(path, settings)
         self.reload()

@@ -23,6 +23,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.utils import get_cwidth
+from prompt_toolkit.widgets import Button, Dialog, TextArea
 
 from ..agent.agent import Agent
 
@@ -514,6 +515,46 @@ class _ChoiceDialog:
         return await app.run_async()
 
 
+class _TextDialog:
+    """Centered card-style single-line input used by :meth:`TerminalUI.input`.
+
+    Enter submits, Escape or Ctrl+C cancels, Cancel is clickable. The buffer
+    carries no history, so password entry never lands in an input history.
+    """
+
+    def __init__(self, title, default: str, password: bool, style) -> None:
+        self.textfield = TextArea(text=default, multiline=False, password=password)
+        cancel_button = Button(text="Cancel", handler=self._cancel)
+        ok_button = Button(text="OK", handler=self._accept)
+        dialog = Dialog(title=_dialog_text(title), body=HSplit([self.textfield]),
+                        buttons=[ok_button, cancel_button], with_background=True)
+        bindings = KeyBindings()
+
+        @bindings.add("enter", eager=True)
+        def _submit(event) -> None:
+            if event.app.layout.has_focus(cancel_button):
+                self._cancel()
+            else:
+                self._accept()
+
+        @bindings.add("escape")
+        @bindings.add("c-c")
+        def _cancel(event) -> None:
+            self._cancel()
+
+        self.app = Application(layout=Layout(dialog), key_bindings=bindings,
+                               mouse_support=True, style=style, full_screen=True)
+
+    def _accept(self) -> None:
+        get_app().exit(result=self.textfield.text)
+
+    def _cancel(self) -> None:
+        get_app().exit(result=None)
+
+    async def run(self):
+        return await self.app.run_async()
+
+
 class TerminalUI:
     def __init__(self, agent: Agent, commands: Callable[[], List[str]], settings: Optional[dict] = None,
                  input=None, output=None, extra_bindings: Optional[List[tuple]] = None,
@@ -990,6 +1031,12 @@ class TerminalUI:
             return None
         with create_app_session(input=self.session.app.input, output=self.session.app.output):
             return await _ChoiceDialog(title, values, self.style).run()
+
+    async def input(self, title: str, default: str = "", password: bool = False) -> Optional[str]:
+        """Modal single-line text entry; None when cancelled. The buffer keeps
+        no history, so password entry never lands in an input history."""
+        with create_app_session(input=self.session.app.input, output=self.session.app.output):
+            return await _TextDialog(title, default, password, self.style).run()
 
     async def run(self, coroutine):
         task = asyncio.create_task(coroutine)

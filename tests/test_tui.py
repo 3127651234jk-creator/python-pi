@@ -82,6 +82,27 @@ def test_selector_arrows_and_escape():
         asyncio.run(check(pipe))
 
 
+def test_text_dialog_submit_default_and_cancel():
+    async def check(pipe):
+        with create_app_session(input=pipe, output=DummyOutput()):
+            ui = TerminalUI(Agent(resolve_model("faux")), lambda: [])
+            task = asyncio.create_task(ui.input("API Key", password=True))
+            await asyncio.sleep(0.1)
+            pipe.send_text("secret\r")
+            assert await asyncio.wait_for(task, 3) == "secret"
+            assert "secret" not in ui.session.history.get_strings()  # no input history
+            task = asyncio.create_task(ui.input("Provider ID", default="my-gateway"))
+            await asyncio.sleep(0.1)
+            pipe.send_text("\r")
+            assert await asyncio.wait_for(task, 3) == "my-gateway"
+            task = asyncio.create_task(ui.input("Provider ID"))
+            await asyncio.sleep(0.1)
+            pipe.send_text("\x1b")
+            assert await asyncio.wait_for(task, 3) is None
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
 def test_abort_during_run():
     async def check(pipe):
         agent = Agent(resolve_model("faux"))

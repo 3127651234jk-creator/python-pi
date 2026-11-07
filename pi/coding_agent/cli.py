@@ -51,6 +51,7 @@ from .system_prompt import SystemPromptOptions, build_system_prompt
 from .tools import create_default_tools, tool_prompt_contributions
 from .trust import TrustStore, project_trust_parent_path, resolve_project_trusted, trust_options
 from .config import Configuration, read_json
+from .custom_api import RESERVED_PROVIDER_ID, WizardIO, run_custom_api_wizard
 from .model_registry import ModelRegistry
 from .auth import login_device, login_openrouter
 from .subscription_auth import get_or_create_device_id, login_claude, login_codex, login_copilot, login_kimi_coding, login_openai_chatgpt, login_radius, login_xai
@@ -332,7 +333,8 @@ SLASH_HELP = """Commands:
   /model <id>    switch model id (provider unchanged)
   /models        list catalog and capabilities
   /thinking [level]  show or set the thinking level
-  /login [provider] [oauth]  sign in (provider picker when omitted)
+  /login [provider] [oauth]  sign in (provider picker when omitted; /login custom
+                 adds a custom API model with base URL, key and settings)
   /logout <provider>        remove saved credentials
   /settings [key JSON]     view or save user defaults
   /reload        reload settings and model catalog
@@ -424,15 +426,16 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         continue
                     rest = selected
                 elif command == "/login" and registry:
-                    method = await ui.choose("Sign in", [
-                        ("oauth", "Sign in with an account (OAuth)"),
-                        ("api_key", "Sign in with an API key")])
+                    method = await ui.choose("Sign in", LOGIN_METHODS)
                     if not method:
                         continue
-                    selected = await ui.choose("Provider", login_provider_options(registry, method == "oauth"))
-                    if not selected:
-                        continue
-                    rest = selected + (" oauth" if method == "oauth" else "")
+                    if method == "custom":
+                        rest = "custom"
+                    else:
+                        selected = await ui.choose("Provider", login_provider_options(registry, method == "oauth"))
+                        if not selected:
+                            continue
+                        rest = selected + (" oauth" if method == "oauth" else "")
             if command in ("/exit", "/quit"):
                 break
             if command == "/help":
@@ -577,10 +580,26 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         print_models(registry)
                     elif command == "/login":
                         parts = rest.split()
+                        if not parts and not ui:
+                            # Plain terminal: numbered menu instead of the picker.
+                            # _choose_console takes (label, value) pairs.
+                            method = await _choose_console("Sign in", [(label, value) for value, label in LOGIN_METHODS])
+                            if method is None:
+                                continue
+                            if method == "custom":
+                                parts = ["custom"]
+                            else:
+                                selected = await _choose_console("Provider", login_provider_options(registry, method == "oauth"))
+                                if selected is None:
+                                    continue
+                                parts = [selected] + (["oauth"] if method == "oauth" else [])
                         if not parts:
                             raise ValueError("Usage: /login <provider> [oauth]\nProviders: "
                                              + ", ".join(sorted(registry.providers)))
-                        await authenticate(registry, parts[0], "oauth" in parts[1:])
+                        if parts[0] == "custom":
+                            await custom_login_command(registry, agent, session, ui)
+                        else:
+                            await authenticate(registry, parts[0], "oauth" in parts[1:])
                     elif command == "/logout":
                         if not rest.strip():
                             raise ValueError("Usage: /logout <provider>")
@@ -860,6 +879,125 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
             print(f"warning: could not sync the Radius model catalog: {describe_error(exc)}")
 
 
+# Sign-in choices shared by the TUI picker and the plain numbered menu.
+LOGIN_METHODS = [
+    ("oauth", "Sign in with an account (OAuth)"),
+    ("api_key", "Sign in with an API key"),
+    ("custom", "Add custom API model"),
+]
+
+
+class TextWizardIO:
+    """Numbered-prompt UI for the custom API wizard in plain terminals.
+
+    Normal fields accept ":cancel" to abort; the password field does not parse
+    it, so a key may legitimately contain that text (Ctrl+C/EOF cancel instead).
+    """
+
+    async def choose(self, title: str, values, default: Optional[str] = None) -> Optional[str]:
+        print(title)
+        for index, (value, label) in enumerate(values, 1):
+            print(f"  {index}. {label}{'  [default]' if value == default else ''}")
+        hint = f"Choose [1-{len(values)}]"
+        if default is not None:
+            hint += ", Enter for default"
+        while True:
+            raw = await asyncio.get_running_loop().run_in_executor(None, input, hint + ": ")
+            text = raw.strip()
+            if text.lower() == ":cancel":
+                return None
+            if not text:
+                if default is not None:
+                    return default
+                print("error: choose a number")
+                continue
+            if text.isdigit() and 1 <= int(text) <= len(values):
+                return values[int(text) - 1][0]
+            print(f"error: enter a number between 1 and {len(values)}")
+
+    async def text_input(self, title: str, default: str = "", password: bool = False,
+                         allow_cancel_word: bool = True) -> Optional[str]:
+        if password:
+            raw = await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, f"{title}: ")
+        else:
+            shown = f" [{default}]" if default else ""
+            raw = await asyncio.get_running_loop().run_in_executor(None, input, f"{title}{shown}: ")
+        if allow_cancel_word and raw.strip() == ":cancel":
+            return None
+        return raw
+
+    async def confirm(self, title: str, default: bool) -> Optional[bool]:
+        result = await self.choose(title, [("yes", "Yes"), ("no", "No")], default="yes" if default else "no")
+        return None if result is None else result == "yes"
+
+    def say(self, message: str) -> None:
+        print(message)
+
+
+class TUIWizardIO:
+    """Wizard UI backed by the enhanced terminal dialogs."""
+
+    def __init__(self, ui: TerminalUI) -> None:
+        self.ui = ui
+
+    async def choose(self, title: str, values, default: Optional[str] = None) -> Optional[str]:
+        return await self.ui.choose(title, values)
+
+    async def text_input(self, title: str, default: str = "", password: bool = False,
+                         allow_cancel_word: bool = True) -> Optional[str]:
+        # The dialogs cancel through Escape or Ctrl+C; ":cancel" is text-only.
+        return await self.ui.input(title, default=default, password=password)
+
+    async def confirm(self, title: str, default: bool) -> Optional[bool]:
+        result = await self.ui.choose(title, [("yes", "Yes"), ("no", "No")])
+        return None if result is None else result == "yes"
+
+    def say(self, message: str) -> None:
+        print(message)
+
+
+async def custom_login_command(registry: ModelRegistry, agent: Optional[Agent] = None,
+                               session: Optional[SessionManager] = None,
+                               ui: Optional[TerminalUI] = None) -> None:
+    """Run the add-custom-API-model wizard and apply the post-save choices."""
+    if RESERVED_PROVIDER_ID in registry.providers:
+        raise ModelError("provider ID 'custom' is reserved for this login entry; "
+                         "rename it in models.json to use the wizard")
+    if agent is not None and agent.is_streaming:
+        raise ValueError("cannot change the configuration while a request is running")
+    io: WizardIO = TUIWizardIO(ui) if ui else TextWizardIO()
+    form = await run_custom_api_wizard(registry.config, registry, io)
+    if form is None:
+        io.say("custom API model login cancelled")
+        return
+    identifier = form.provider_id + "/" + form.model_id
+    io.say(f"saved provider '{form.provider_id}' with model '{identifier}'")
+    use_now = await io.confirm("Use this model now?", default=True) if agent is not None else None
+    set_default = await io.confirm("Set as default for future launches?", default=False)
+    if set_default:
+        try:
+            registry.config.save_many({"provider": form.provider_id, "model": form.model_id})
+            io.say(f"default model: {identifier} (project settings or --provider/--model still override it)")
+        except (OSError, ValueError) as exc:
+            io.say(f"model saved, but setting the default failed: {describe_error(exc)}")
+    if use_now:
+        try:
+            registry.reload()
+            agent.model = registry.resolve(form.provider_id, form.model_id)
+            if not agent.model.reasoning and agent.thinking_level != "off":
+                agent.thinking_level = "off"
+                if session:
+                    session.append_thinking_change("off")
+            if session:
+                session.append_model_change(agent.model.provider, agent.model.id)
+            io.say(f"model: {identifier}")
+        except (ModelError, ValueError) as exc:
+            io.say(f"model saved, but switching failed: {describe_error(exc)}")
+        except (OSError, RuntimeError) as exc:
+            io.say(f"warning: could not record the switch in the session: {describe_error(exc)}")
+    io.say("note: the connection has not been verified yet; the first prompt sends the first real request")
+
+
 async def _choose_console(title: str, values):
     """Numbered input() selector for flows that run before the TUI exists."""
     print(title)
@@ -1133,6 +1271,19 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 print(f"synced {radius_count} Radius models from the gateway")
             return 0
         if args.login:
+            if args.login == "custom":
+                if args.oauth:
+                    print("error: --login custom cannot be combined with --oauth", file=sys.stderr)
+                    return 2
+                if RESERVED_PROVIDER_ID in registry.providers:
+                    print("error: provider ID 'custom' is reserved for this login entry; "
+                          "rename it in models.json to use the wizard", file=sys.stderr)
+                    return 2
+                if not sys.stdin.isatty():
+                    print("error: --login custom requires an interactive terminal", file=sys.stderr)
+                    return 2
+                await custom_login_command(registry)
+                return 0
             await authenticate(registry, args.login, args.oauth)
             return 0
         if args.logout:
