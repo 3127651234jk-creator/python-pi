@@ -254,7 +254,8 @@ def test_loopback_provider_client_bypasses_the_system_proxy(monkeypatch):
                 status_code = 200
 
                 async def aiter_lines(self):
-                    for line in ('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
+                    for line in ('data: {"choices":[{"delta":{"content":"Hi"},'
+                                 '"finish_reason":"stop"}]}\n\n'
                                  'data: [DONE]\n\n').splitlines():
                         yield line
 
@@ -280,6 +281,102 @@ def test_loopback_provider_client_bypasses_the_system_proxy(monkeypatch):
     assert seen["trust_env"] is False
     asyncio.run(run("https://api.example.com/v1"))
     assert seen["trust_env"] is True
+
+
+def _canned_send(monkeypatch, payloads):
+    async def fake_send(self, request, stream=False):
+        class FakeResponse:
+            status_code = 200
+
+            async def aiter_lines(self):
+                for payload in payloads:
+                    yield "data: " + (payload if isinstance(payload, str) else json.dumps(payload))
+                    yield ""
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                return None
+
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+
+
+def test_finish_reason_sharing_the_usage_chunk_is_applied(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    _canned_send(monkeypatch, [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",
+                                                "function": {"name": "ls", "arguments": ""}}]},
+                      "finish_reason": None}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0,
+                                                "function": {"arguments": '{"path": "."}'}}]},
+                      "finish_reason": None}]},
+        # Some gateways put the finish reason and the usage on the same chunk.
+        {"choices": [{"delta": {"role": "assistant"}, "finish_reason": "tool_calls"}],
+         "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+        "[DONE]",
+    ])
+
+    async def run():
+        return [event async for event in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.reason == "toolUse"
+    assert done.message.stop_reason == "toolUse"
+    assert done.message.raw_stop_reason == "tool_calls"
+    call = next(block for block in done.message.content if isinstance(block, ToolCall))
+    assert call.arguments == {"path": "."}
+
+
+def test_stream_without_finish_reason_infers_the_stop_reason(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    _canned_send(monkeypatch, [
+        {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]},
+        "[DONE]",
+    ])
+
+    async def run():
+        return [event async for event in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.reason == "stop"
+    assert done.message.stop_reason == "stop"
+
+
+def test_stream_without_finish_reason_still_parses_tool_arguments(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    _canned_send(monkeypatch, [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",
+                                                "function": {"name": "ls", "arguments": ""}}]},
+                      "finish_reason": None}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0,
+                                                "function": {"arguments": '{"path": "."}'}}]},
+                      "finish_reason": None}]},
+        "[DONE]",
+    ])
+
+    async def run():
+        return [event async for event in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.reason == "toolUse"
+    assert done.message.stop_reason == "toolUse"
+    call = next(block for block in done.message.content if isinstance(block, ToolCall))
+    assert call.arguments == {"path": "."}
 
 
 def test_openai_http_error_with_empty_body_still_explains_itself(monkeypatch):

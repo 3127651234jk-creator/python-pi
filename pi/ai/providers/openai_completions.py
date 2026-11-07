@@ -187,8 +187,15 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
     partial = state.partial
 
     if data == "[DONE]":
-        raw = partial.raw_stop_reason or "stop"
-        yield DoneEvent(reason=_FINISH_REASON_MAP.get(raw, "stop"), message=state.snapshot())
+        if partial.raw_stop_reason is None:
+            # Some gateways end with [DONE] but never send finish_reason. Infer
+            # the reason and close the blocks; otherwise tool arguments stay as
+            # {"__raw__": ...} and every call fails while the model retries.
+            has_tool_calls = any(isinstance(block, ToolCall) for block in partial.content)
+            partial.stop_reason = "toolUse" if has_tool_calls else "stop"
+            for event in _close_blocks(state):
+                yield event
+        yield DoneEvent(reason=partial.stop_reason, message=state.snapshot())
         return
     if not isinstance(data, dict):
         return
@@ -219,10 +226,10 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
             reasoning=completion_details.get("reasoning_tokens"),
         )
         # Usage arrives in its own final chunk; the [DONE] handler skips the
-        # shared cost application, so price it here.
+        # shared cost application, so price it here. Keep going: some gateways
+        # attach usage to the same chunk that carries finish_reason.
         counted.cost = state.model.calculate_cost(counted)
         state.set_usage(counted)
-        return
 
     choices = data.get("choices") or []
     if not choices:
@@ -282,26 +289,33 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
     finish_reason = choice.get("finish_reason")
     if finish_reason:
         state.set_raw_stop_reason(finish_reason)
-        # Close any open text/thinking/tool-call blocks.
-        for index, block in enumerate(list(partial.content)):
-            if isinstance(block, TextContent):
-                yield TextEndEvent(content_index=index, content=block.text, partial=state.snapshot())
-            elif isinstance(block, ThinkingContent):
-                yield ThinkingEndEvent(content_index=index, content=block.thinking, partial=state.snapshot())
-            elif isinstance(block, ToolCall):
-                raw = block.arguments.pop("__raw__", "")
-                if raw:
-                    try:
-                        parsed = json.loads(raw)
-                        block.arguments = parsed if isinstance(parsed, dict) else {"value": parsed}
-                    except (json.JSONDecodeError, ValueError):
-                        block.arguments = {"__invalid__": raw}
-                else:
-                    block.arguments = {}
-                yield ToolCallEndEvent(
-                    content_index=index, tool_call=block, partial=state.snapshot()
-                )
+        partial.stop_reason = _FINISH_REASON_MAP.get(finish_reason, "stop")
+        for event in _close_blocks(state):
+            yield event
         return
+
+
+def _close_blocks(state: ProviderState) -> List[Any]:
+    """End events for open blocks, parsing accumulated tool-call arguments."""
+    partial = state.partial
+    events: List[Any] = []
+    for index, block in enumerate(list(partial.content)):
+        if isinstance(block, TextContent):
+            events.append(TextEndEvent(content_index=index, content=block.text, partial=state.snapshot()))
+        elif isinstance(block, ThinkingContent):
+            events.append(ThinkingEndEvent(content_index=index, content=block.thinking, partial=state.snapshot()))
+        elif isinstance(block, ToolCall):
+            raw = block.arguments.pop("__raw__", "")
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    block.arguments = parsed if isinstance(parsed, dict) else {"value": parsed}
+                except (json.JSONDecodeError, ValueError):
+                    block.arguments = {"__invalid__": raw}
+            else:
+                block.arguments = {}
+            events.append(ToolCallEndEvent(content_index=index, tool_call=block, partial=state.snapshot()))
+    return events
 
 
 def _ensure_text(partial: AssistantMessage) -> TextContent:
