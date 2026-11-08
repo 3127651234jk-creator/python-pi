@@ -23,7 +23,7 @@ pi（TypeScript monorepo）的 Python 移植版。目标是 1:1 复刻整个 mon
 | `pi.coding_agent.system_prompt` | `coding-agent/src/core/system-prompt.ts` | 分节系统提示词 + AGENTS.md 项目上下文 |
 | `pi.coding_agent.session` | `coding-agent/src/core/session-manager.ts` | JSONL 会话树、分支、切换、命名、导出、`--continue` 恢复 |
 | `pi.coding_agent.cli` | `coding-agent/src/cli` | 单次模式 + 交互 REPL + 斜杠命令 + Ctrl+C 中止 |
-| `pi.coding_agent.codemode` | `packages/codemode` | codemode 工具：模型编写的 Python 在隔离子进程中经 Agent 管线组合调用其他工具，含按 token 预算的延迟暴露 |
+| `pi.codemode` | `packages/codemode` | codemode 工具：模型编写的 Python 在隔离子进程中经 Agent 管线组合调用其他工具，含按 token 预算的延迟暴露 |
 | `pi.coding_agent.catalog_sync` / `pi.coding_agent.radius_catalog` | models.dev 目录 + `packages/ai/src/providers/radius-config.ts` | 在线模型目录同步与 Radius 网关发现，缓存叠加进模型注册表 |
 | `pi.evals.harness` | `packages/evals/src/harness.ts` | 隔离评测 harness：临时工作区、凭据注入、会话录制、用量统计、POSIX 工具沙箱、文档变体 |
 | `pi.evals.plan` | `packages/evals/src/plan.ts` | 发现用例解析与 (case, variant, run) 任务计划 |
@@ -344,7 +344,7 @@ Python CLI 自动读取用户目录的 `mcp.json` 和项目 `.pi/mcp.json`。项
 
 ## Codemode
 
-`packages/codemode` 的移植版（`pi.coding_agent.codemode`）。settings 中配置后启用：
+`packages/codemode` 的移植版（`pi.codemode` 子包：`tool` 适配 Agent 工具、`host` 管理子进程、`worker_source` 内嵌 worker 程序）。settings 中配置后启用：
 
 ```json
 {

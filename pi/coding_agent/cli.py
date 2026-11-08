@@ -34,7 +34,7 @@ from ..agent.types import (
 )
 from .catalog_sync import fetch_catalog, save_cache
 from .radius_catalog import refresh_radius_catalog
-from .codemode import create_codemode_tool
+from ..codemode import create_codemode_tool
 from .nested_tool_calls import execute_tool as execute_nested_tool
 from .crash_log import clear_crash_log, crash_log_path, read_crash_log, record_crash, take_unnotified_crash
 from .diagnostics import Diagnostic, deduplicate_diagnostics, report_diagnostics, settings_diagnostics

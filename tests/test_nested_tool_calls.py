@@ -33,7 +33,7 @@ from pi.ai.types import (
     Usage,
     UserMessage,
 )
-from pi.coding_agent.codemode import create_codemode_tool
+from pi.codemode import create_codemode_tool
 from pi.coding_agent.nested_tool_calls import (
     NestedCallContext,
     NestedCallRecorder,
