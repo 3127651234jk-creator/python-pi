@@ -2,8 +2,9 @@
 
 Port of ``packages/coding-agent/src/core/usage-totals.ts`` (totals and the
 per-model cost breakdown) plus the ``getSessionStats`` summary. Totals are
-derived from assistant messages on the transcript, so they survive resume and
-need no sidecar state.
+derived from assistant messages and top-level tool result messages on the
+transcript, so they survive resume and need no sidecar state. Nested tool call
+usage is already merged into its top-level result and is never counted again.
 """
 
 from __future__ import annotations
@@ -72,22 +73,29 @@ def usage_cost_breakdown(messages: Iterable, registry=None,
                          extra_usage: Optional[Iterable[tuple]] = None) -> UsageTotals:
     """Total usage grouped by provider/model; unpriced calls fall back to the catalog.
 
-    ``extra_usage`` carries non-message billing such as compaction summary
-    requests; the TypeScript implementation attributes those to the
-    "Tools/summaries" bucket.
+    Counted sources: assistant messages, top-level tool result messages (whose
+    usage already includes their nested calls), and ``extra_usage`` for work
+    without a model message such as compaction summaries. Nested calls are not
+    traversed here: their usage was merged into the top-level result exactly
+    once. Tool usage without model attribution goes to the "Tools/summaries"
+    bucket. ``requests`` counts measurable model/tool usage records.
     """
     totals = UsageTotals()
     for message in messages:
-        if not isinstance(message, AssistantMessage):
-            continue
-        usage = message.usage
-        if usage.total_tokens == 0 and not usage.cost.get("total"):
-            continue
-        key = f"{message.provider}/{message.response_model or message.model}"
-        model = None
-        if registry is not None:
-            model = registry.models.get(key) or registry.models.get(f"{message.provider}/{message.model}")
-        totals.add(usage, _usage_cost(usage, model, registry), key)
+        if isinstance(message, AssistantMessage):
+            usage = message.usage
+            if usage.total_tokens == 0 and not usage.cost.get("total"):
+                continue
+            key = f"{message.provider}/{message.response_model or message.model}"
+            model = None
+            if registry is not None:
+                model = registry.models.get(key) or registry.models.get(f"{message.provider}/{message.model}")
+            totals.add(usage, _usage_cost(usage, model, registry), key)
+        elif isinstance(message, ToolResultMessage) and message.usage is not None:
+            usage = message.usage
+            if usage.total_tokens == 0 and not usage.cost.get("total"):
+                continue
+            totals.add(usage, _usage_cost(usage, None, registry), TOOLS_SUMMARIES_KEY)
     for key, usage in extra_usage or []:
         if usage.total_tokens == 0 and not usage.cost.get("total"):
             continue
@@ -151,6 +159,8 @@ def session_stats(messages: list, model=None, session_file: Optional[str] = None
     tool_calls = sum(1 for m in messages if isinstance(m, AssistantMessage)
                      for block in m.content if isinstance(block, ToolCall))
     tool_results = sum(1 for m in messages if isinstance(m, ToolResultMessage))
+    nested_records = [m.nested_calls for m in messages
+                      if isinstance(m, ToolResultMessage) and m.nested_calls is not None]
     totals = usage_cost_breakdown(messages, extra_usage=extra_usage)
     return {
         "session_file": session_file,
@@ -158,6 +168,9 @@ def session_stats(messages: list, model=None, session_file: Optional[str] = None
         "assistant_messages": assistant,
         "tool_calls": tool_calls,
         "tool_results": tool_results,
+        # Retained nested records; a lower bound when complete is False.
+        "nested_tool_calls": sum(len(calls.calls) for calls in nested_records),
+        "nested_tool_calls_complete": all(calls.complete for calls in nested_records),
         "total_messages": len(messages),
         "tokens": {"input": totals.input, "output": totals.output,
                    "cache_read": totals.cache_read, "cache_write": totals.cache_write,

@@ -10,7 +10,7 @@ import html
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, List, Optional
-from ..ai.json_io import message_from_json, usage_from_json
+from ..ai.json_io import message_from_json, nested_calls_from_json, usage_from_json
 from ..ai.types import Message, get_message_text
 
 from ..ai.types import (
@@ -92,6 +92,7 @@ def _from_dict(data: dict) -> Any:
             timestamp=data.get("timestamp", 0),
             details=data.get("details"),
             usage=Usage(**{k: v for k, v in usage_data.items() if k in Usage.__dataclass_fields__}) if usage_data else None,
+            nested_calls=nested_calls_from_json(data.get("nested_calls")),
         )
     raise ValueError(f"Unknown message role: {role!r}")
 

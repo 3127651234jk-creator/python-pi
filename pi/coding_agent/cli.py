@@ -35,6 +35,7 @@ from ..agent.types import (
 from .catalog_sync import fetch_catalog, save_cache
 from .radius_catalog import refresh_radius_catalog
 from .codemode import create_codemode_tool
+from .nested_tool_calls import execute_tool as execute_nested_tool
 from .crash_log import clear_crash_log, crash_log_path, read_crash_log, record_crash, take_unnotified_crash
 from .diagnostics import Diagnostic, deduplicate_diagnostics, report_diagnostics, settings_diagnostics
 from .bug_report import (BUG_REPORT_CUSTOM_ENTRY_TYPE, bug_report_archive_file_name,
@@ -228,37 +229,41 @@ class CliRenderer:
         elif isinstance(event, ToolExecutionStartEvent):
             args = event.args or {}
             self.tool_args[event.tool_call_id] = args
+            indent = "  " if event.parent_tool_call_id else ""
             if self.extensions is not None:
                 lines = await self.extensions.render_tool(event.tool_name, "call", args,
                     {"args": args, "toolCallId": event.tool_call_id, "expanded": not bool(self.fold),
-                     "isPartial": False, "executionStarted": True, "argsComplete": True}, 80)
+                     "isPartial": False, "executionStarted": True, "argsComplete": True,
+                     "parentToolCallId": event.parent_tool_call_id}, 80)
                 if lines is not None:
-                    print("\n" + "\n".join(lines), flush=True)
+                    print("\n" + "\n".join(indent + line for line in lines), flush=True)
                     return
             shown = args.get("command") or args.get("path") or args.get("pattern") or ""
-            print(f"\n[{event.tool_name}] {shown}", flush=True)
+            print(f"\n{indent}[{event.tool_name}] {shown}", flush=True)
         elif isinstance(event, ToolExecutionEndEvent):
             result = event.result
+            indent = "  " if event.parent_tool_call_id else ""
             if self.extensions is not None and result is not None:
                 lines = await self.extensions.render_tool(event.tool_name, "result", to_json_value(result),
                     {"args": self.tool_args.pop(event.tool_call_id, {}), "toolCallId": event.tool_call_id,
                      "expanded": not bool(self.fold), "isPartial": False, "isError": event.is_error,
-                     "executionStarted": True, "argsComplete": True}, 80)
+                     "executionStarted": True, "argsComplete": True,
+                     "parentToolCallId": event.parent_tool_call_id}, 80)
                 if lines is not None:
                     if lines:
-                        print("\n".join(lines), flush=True)
+                        print("\n".join(indent + line for line in lines), flush=True)
                     return
             text = ""
             if result is not None and getattr(result, "content", None):
                 text = result.content[0].text
             if event.is_error:
-                print(f"  error: {text}", flush=True)
+                print(f"{indent}  error: {text}", flush=True)
             elif self.fold and result is not None and text:
                 lines = text.splitlines()
                 for line in lines[: self.fold]:
-                    print(f"  {line}", flush=True)
+                    print(f"{indent}  {line}", flush=True)
                 if len(lines) > self.fold:
-                    print(f"  [+{len(lines) - self.fold} lines folded; /set fold_output 0 shows all]", flush=True)
+                    print(f"{indent}  [+{len(lines) - self.fold} lines folded; /set fold_output 0 shows all]", flush=True)
             for block in getattr(result, "content", None) or []:
                 if isinstance(block, ImageContent):
                     self.print_image_block(block)
@@ -268,9 +273,10 @@ class CliRenderer:
                     "args": self.tool_args.get(event.tool_call_id, {}),
                     "toolCallId": event.tool_call_id, "expanded": not bool(self.fold),
                     "isPartial": True, "isError": False, "executionStarted": True,
-                    "argsComplete": True}, 80)
+                    "argsComplete": True, "parentToolCallId": event.parent_tool_call_id}, 80)
             if lines:
-                print("\n".join(lines), flush=True)
+                indent = "  " if event.parent_tool_call_id else ""
+                print("\n".join(indent + line for line in lines), flush=True)
         elif isinstance(event, TurnEndEvent):
             message = event.message
             usage = getattr(message, "usage", None)
@@ -1427,7 +1433,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         registry.register_extension_providers(extensions.all_providers())
         if registry.config.settings.get("codemode", {}).get("enabled"):
             agent.tools.append(create_codemode_tool(
-                agent.tools, session, registry.config.settings.get("codemode", {})))
+                agent.tools, session, registry.config.settings.get("codemode", {}),
+                execute_tool=execute_nested_tool))
         timings.time("extensions")
         for name, error in mcp.errors.items():
             print(f"MCP {name}: {error}", file=sys.stderr)
@@ -1484,6 +1491,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 
 def _route_durable_command(argv: List[str]) -> Optional[int]:
     """Delegate the routed-protocol commands, so installed ``pi <command>`` works too."""
+    if not argv:
+        return None
     first = argv[0]
     if first == "durable":
         from ..durable.cli import main as routed_main

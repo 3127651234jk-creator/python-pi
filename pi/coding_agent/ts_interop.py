@@ -23,6 +23,8 @@ from ..ai.json_io import usage_from_json
 from ..ai.types import (
     AssistantMessage,
     ImageContent,
+    NestedToolCallRecord,
+    NestedToolCalls,
     SystemMessage,
     TextContent,
     ThinkingContent,
@@ -68,6 +70,46 @@ def usage_to_ts(usage: Usage) -> dict:
     }
 
 
+def _nested_calls_from_ts(data: Optional[dict]) -> Optional[NestedToolCalls]:
+    if not isinstance(data, dict):
+        return None
+    calls: List[NestedToolCallRecord] = []
+    for item in data.get("calls") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        call_id = item["id"]
+        parent = item.get("parentToolCallId")
+        if parent is None and "/" in call_id:
+            parent = call_id.rsplit("/", 1)[0] or None
+        calls.append(NestedToolCallRecord(
+            id=call_id,
+            parent_tool_call_id=parent,
+            name=item.get("name", ""),
+            arguments=item.get("arguments"),
+            arguments_bytes=item.get("argumentsBytes"),
+            status=item.get("status", "unfinished"),
+            duration_ms=item.get("durationMs"),
+            error=item.get("error"),
+        ))
+    return NestedToolCalls(calls=calls, complete=bool(data.get("complete", True)))
+
+
+def _nested_calls_to_ts(nested: NestedToolCalls) -> dict:
+    calls = []
+    for record in nested.calls:
+        item: Dict[str, Any] = {"id": record.id, "name": record.name, "status": record.status}
+        if record.arguments is not None:
+            item["arguments"] = record.arguments
+        if record.arguments_bytes is not None:
+            item["argumentsBytes"] = record.arguments_bytes
+        if record.duration_ms is not None:
+            item["durationMs"] = record.duration_ms
+        if record.error is not None:
+            item["error"] = record.error
+        calls.append(item)
+    return {"calls": calls, "complete": nested.complete}
+
+
 def ts_message_to_ours(data: dict):
     """Convert one TS AgentMessage JSON object to this port's dataclasses."""
     role = data.get("role")
@@ -108,7 +150,8 @@ def ts_message_to_ours(data: dict):
         usage = data.get("usage")
         return ToolResultMessage(tool_call_id=data.get("toolCallId", ""), tool_name=data.get("toolName", ""),
             content=blocks, is_error=bool(data.get("isError", False)), timestamp=timestamp,
-            details=data.get("details"), usage=_ts_usage(usage) if usage else None)
+            details=data.get("details"), usage=_ts_usage(usage) if usage else None,
+            nested_calls=_nested_calls_from_ts(data.get("nestedCalls")))
     raise ValueError(f"Unknown TS message role: {role!r}")
 
 
@@ -140,6 +183,8 @@ def our_message_to_ts(message) -> dict:
             result["details"] = message.details
         if message.usage is not None:
             result["usage"] = usage_to_ts(message.usage)
+        if message.nested_calls is not None:
+            result["nestedCalls"] = _nested_calls_to_ts(message.nested_calls)
         return result
     # AssistantMessage
     blocks = []

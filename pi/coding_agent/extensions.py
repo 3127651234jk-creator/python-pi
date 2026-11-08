@@ -180,6 +180,12 @@ class ExtensionAPI:
             return await invoke(original, *args)
         self.tools.append(replace(tool, execute=execute))
 
+    async def execute_tool(self, name: str, args: Any = None, signal=None, on_update=None):
+        """Run another tool as a child of the currently running tool call."""
+        from .nested_tool_calls import execute_tool as nested_execute_tool
+
+        return await nested_execute_tool(name, args, signal, on_update)
+
     def register_provider(self, name: str, config: dict):
         """Register a model provider in models.json provider format.
 

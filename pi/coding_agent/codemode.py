@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from ..agent.types import AgentTool, AgentToolResult
 from ..ai.types import ImageContent, TextContent
+from .nested_tool_calls import NestedToolCallOutcome
 from .session import SessionManager
 
 STORE_TYPE = "codemode-store"
@@ -780,9 +781,15 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
                          settings: Optional[dict] = None, execute_tool=None) -> AgentTool:
     """Build the ``codemode`` AgentTool over the given callable tools.
 
-    ``execute_tool(name, args, signal)`` defaults to invoking the matching tool
-    from ``tools`` directly; callers route through the agent pipeline so nested
-    calls run the same validation, hooks, and permission checks as direct calls.
+    ``execute_tool(name, args, signal)`` returns a
+    :class:`~pi.coding_agent.nested_tool_calls.NestedToolCallOutcome` and runs
+    the call through the agent pipeline, so nested calls get the same
+    validation, hooks, permission checks, events, and usage accounting as
+    direct calls. The CLI always passes the unified callback.
+
+    Without a callback the tool falls back to calling ``tool.execute``
+    directly. That path is for standalone use: it has no agent hooks, no
+    parent id, no events, and its usage is not aggregated.
     """
 
     settings = settings or {}
@@ -809,20 +816,30 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
                                               tool.parameters or {}, tool.output_schema),
         })
 
-    async def run_tool(name: str, args: dict, signal) -> Any:
+    async def run_tool(name: str, args: dict, signal,
+                       fallback_id: str = "") -> NestedToolCallOutcome:
         if execute_tool is not None:
             return await execute_tool(name, args, signal)
         tool = allowed.get(name)
         if tool is None:
             raise ValueError(f"tool not available: {name}")
-        result = await tool.execute("codemode-" + name, args, signal, None)
-        if getattr(result, "is_error", False):
-            text = "\n".join(block.text for block in result.content if isinstance(block, TextContent))
-            raise RuntimeError(text or f'tool "{name}" failed')
-        structured = getattr(result, "structured_content", None)
+        call_id = fallback_id or f"codemode-{name}"
+        result = await tool.execute(call_id, args, signal, None)
+        return NestedToolCallOutcome(
+            tool_call_id=call_id, result=result, is_error=bool(result.is_error)
+        )
+
+    async def run_script_tool(name: str, args: dict, signal, record: dict) -> Any:
+        """Execute one script call and convert the full outcome for the script."""
+        outcome = await run_tool(name, args, signal, record["id"])
+        # Show the id the runner actually assigned, not a local guess.
+        record["id"] = outcome.tool_call_id
+        if outcome.is_error:
+            raise RuntimeError(_result_text(outcome.result) or f'tool "{name}" failed')
+        structured = outcome.result.structured_content
         if structured is not None:
             return structured
-        return "\n".join(block.text for block in result.content if isinstance(block, TextContent))
+        return _result_text(outcome.result)
 
     async def execute(call_id: str, params: dict, signal=None, on_update=None) -> AgentToolResult:
         code = params.get("code")
@@ -908,7 +925,7 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
             calls.append(record)
             publish()
             started = asyncio.get_event_loop().time()
-            future = asyncio.ensure_future(run_tool(message["tool"], args, signal))
+            future = asyncio.ensure_future(run_script_tool(message["tool"], args, signal, record))
             pending[message["id"]] = future
 
             def done(fut):
@@ -1034,6 +1051,10 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
                     "required": ["code"]},
         execute=execute,
     )
+
+
+def _result_text(result: AgentToolResult) -> str:
+    return "\n".join(block.text for block in (result.content or []) if isinstance(block, TextContent))
 
 
 def _build_output_items(output_items: List[dict], extra_text: str) -> List[Union[TextContent, ImageContent]]:

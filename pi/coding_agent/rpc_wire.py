@@ -166,13 +166,22 @@ def event_to_ts(event) -> dict:
     if kind in ("message_start", "message_end"):
         return {"type": kind, "message": message_to_ts(event.message)}
     if kind == "tool_execution_start":
-        return {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name, "args": event.args}
+        result = {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name, "args": event.args}
+        if event.parent_tool_call_id is not None:
+            result["parentToolCallId"] = event.parent_tool_call_id
+        return result
     if kind == "tool_execution_update":
-        return {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name,
-                "args": event.args, "partialResult": tool_result_to_ts(event.partial_result)}
+        result = {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name,
+                  "args": event.args, "partialResult": tool_result_to_ts(event.partial_result)}
+        if event.parent_tool_call_id is not None:
+            result["parentToolCallId"] = event.parent_tool_call_id
+        return result
     if kind == "tool_execution_end":
-        return {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name,
-                "result": tool_result_to_ts(event.result), "isError": event.is_error}
+        result = {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name,
+                  "result": tool_result_to_ts(event.result), "isError": event.is_error}
+        if event.parent_tool_call_id is not None:
+            result["parentToolCallId"] = event.parent_tool_call_id
+        return result
     if kind == "agent_end":
         # The Python loop has no retry engine, so willRetry is always false.
         return {"type": "agent_end", "messages": [message_to_ts(item) for item in event.messages],
@@ -260,6 +269,8 @@ def stats_to_ts(stats: dict, session_id: str) -> dict:
     result["assistantMessages"] = stats.get("assistant_messages", 0)
     result["toolCalls"] = stats.get("tool_calls", 0)
     result["toolResults"] = stats.get("tool_results", 0)
+    result["nestedToolCalls"] = stats.get("nested_tool_calls", 0)
+    result["nestedToolCallsComplete"] = stats.get("nested_tool_calls_complete", True)
     result["totalMessages"] = stats.get("total_messages", 0)
     result["tokens"] = {
         "input": tokens.get("input", 0),
