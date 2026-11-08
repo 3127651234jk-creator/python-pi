@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -207,3 +208,20 @@ def test_truncate_head_and_tail():
 
     byte_bound = truncate_head("x" * 100 + "\n" + "y" * 100, max_bytes=150)
     assert byte_bound.truncated and byte_bound.truncated_by == "bytes"
+
+
+def test_import_does_not_spin_up_an_event_loop():
+    """Instantiating asyncio primitives at module import time creates (and
+    leaks) an event loop on Python 3.9; the mutation-queue guards are created
+    lazily on first use instead."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    probe = (
+        "import asyncio, sys\n"
+        f"sys.path.insert(0, {root!r})\n"
+        "import pi.coding_agent.tools.common, pi.durable.tools.mutation_queue\n"
+        "policy = asyncio.get_event_loop_policy()\n"
+        "loop = getattr(getattr(policy, '_local', None), '_loop', None)\n"
+        "assert loop is None, f'import created an event loop: {loop!r}'\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")

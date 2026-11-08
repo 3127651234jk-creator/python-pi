@@ -9,12 +9,21 @@ got. Other files, and other file systems, never wait. Not a lock against
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..env import Context, ExecutionEnv, Result, get_or_throw
 
 _QUEUES: Dict[str, asyncio.Lock] = {}
-_GUARD = asyncio.Lock()
+_GUARD: Optional[asyncio.Lock] = None
+
+
+def _guard() -> asyncio.Lock:
+    """The guard, created on first use: an asyncio primitive instantiated at
+    import time would spin up (and leak) an event loop on Python 3.9."""
+    global _GUARD
+    if _GUARD is None:
+        _GUARD = asyncio.Lock()
+    return _GUARD
 
 
 async def _mutation_key(env: ExecutionEnv, path: str, context: Context) -> str:
@@ -45,7 +54,7 @@ async def with_file_mutation_queue(
 ) -> Any:
     """Run ``fn`` while holding the mutation slot of one file; concurrent calls queue in key order."""
     key = await _mutation_key(env, path, context)
-    async with _GUARD:
+    async with _guard():
         lock = _QUEUES.get(key)
         if lock is None:
             lock = asyncio.Lock()
@@ -54,7 +63,7 @@ async def with_file_mutation_queue(
         try:
             return await fn()
         finally:
-            async with _GUARD:
+            async with _guard():
                 # Only the current holder cleans up, so a queued waiter never drops a fresh lock.
                 if _QUEUES.get(key) is lock and not lock.locked():
                     _QUEUES.pop(key, None)

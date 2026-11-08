@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 IMAGE_MIME_TYPES = {
     ".jpg": "image/jpeg",
@@ -32,13 +32,22 @@ def detect_image_mime_type(path: str):
 
 
 _MUTATION_LOCKS: Dict[str, asyncio.Lock] = {}
-_LOCKS_GUARD = asyncio.Lock()
+_LOCKS_GUARD: Optional[asyncio.Lock] = None
+
+
+def _locks_guard() -> asyncio.Lock:
+    """The guard, created on first use: an asyncio primitive instantiated at
+    import time would spin up (and leak) an event loop on Python 3.9."""
+    global _LOCKS_GUARD
+    if _LOCKS_GUARD is None:
+        _LOCKS_GUARD = asyncio.Lock()
+    return _LOCKS_GUARD
 
 
 async def with_file_mutation_queue(absolute_path: str, fn: Callable[[], Awaitable[Any]]) -> Any:
     """Run ``fn`` while holding the mutation lock for ``absolute_path``."""
 
-    async with _LOCKS_GUARD:
+    async with _locks_guard():
         lock = _MUTATION_LOCKS.setdefault(absolute_path, asyncio.Lock())
     async with lock:
         return await fn()
