@@ -361,6 +361,10 @@ Python CLI 自动读取用户目录的 `mcp.json` 和项目 `.pi/mcp.json`。项
 
 延迟暴露（deferred exposure）：工具目录按 MCP 命名空间分组、按 token 预算截取（默认 3000 token，超出部分不内联列出）；未列出的工具经 `search_tools(query, {limit, namespace})`、`describe_tool(name)`、`describe_namespace(name)` 按需查找。输出超过 `max_output_tokens`（默认 10000）时保留首尾并截断，完整输出落盘到临时文件。
 
+嵌套调用记录：脚本内的每次工具调用都经统一入口执行，获得稳定 ID（顶层调用 A 的子调用为 A/1，更深为 A/1/1）和直接父 ID；`tool_execution_*` 事件带 `parent_tool_call_id`。顶层工具结果消息只保存一份结果，并附带 `nested_calls` 摘要（参数、状态、耗时）。每个顶层调用的记录上限为 256 条、单条参数 8 KiB（UTF-8 JSON 字节）、保留参数合计 32 KiB；超限时省略参数或丢弃调用并置 `complete=false`，不影响执行和用量累计。
+
+用量口径：`AgentToolResult.usage` 只表示该工具自身产生的用量，不包含子工具。顶层结果落盘前合并一次：`ToolResultMessage.usage = 顶层工具自身 usage + 全部嵌套工具自身 usage`；`take_record` 具有消费语义，不会在多个消息事件中重复合并。`/usage` 与 `session_stats` 只统计 assistant 消息、顶层工具结果消息和显式额外用量（如压缩摘要），不遍历 `nested_calls`；缺少模型归属的工具用量归入 `Tools/summaries` 桶。`tool_calls` 仍是顶层模型发起的调用数，`nested_tool_calls` 是已保留的子调用记录数，`nested_tool_calls_complete=false` 时该数是下界。
+
 ## Skills 与提示词模板
 
 启动时自动扫描以下位置：
@@ -669,6 +673,6 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 目标是 1:1 复刻，以下为与 TS 版的剩余差距：
 
 - TS TUI 的通用组件布局（转录区内任意组件的横向组合、焦点栈与滚动视口）；Python 已有全屏对话布局（`--tui fullscreen`）、多行编辑、补全、选择器、主题、快捷键、ANSI Markdown、工具输出折叠、终端图片显示（Kitty/iTerm2 协议，全屏模式为半块字符）、扩展 `ctx.ui.custom` 交互视图（按键/鼠标转发、overlay 几何与 handle）、widget/header/footer 组件工厂及 `setEditorComponent` 编辑器接管
-- prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）与嵌套工具调用的记录/用量聚合（TS nested-tool-calls）
+- prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）
 - 其余 provider 的专属认证流程；已实现 Claude、Codex、Copilot、Kimi、xAI、Radius 登录，OpenAI 的 Sign in with ChatGPT、OpenRouter PKCE 及可配置标准设备码 OAuth
 - models.dev 在线目录仅在显式触发（`--sync-models` / `/sync-models` / `sync_models`）时刷新，Radius 发现在启动或登录后刷新；TS 版每次启动都会刷新目录。未收录的模型 id 以默认参数运行
