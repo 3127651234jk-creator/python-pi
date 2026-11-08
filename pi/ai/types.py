@@ -240,6 +240,53 @@ def append_assistant_message_diagnostic(message: AssistantMessage, diagnostic: A
 
 
 @dataclass
+class NestedToolCallRecord:
+    """A tool call that another tool made while it ran, for example from a codemode script."""
+
+    id: str
+    parent_tool_call_id: Optional[str]
+    name: str
+    # Omitted when over the size limits; arguments_bytes then gives their size.
+    arguments: Optional[Dict[str, Any]] = None
+    # UTF-8 size of the arguments as compact JSON, set when arguments is omitted.
+    arguments_bytes: Optional[int] = None
+    # unfinished: the call was still running when the calling tool finished.
+    status: str = "unfinished"
+    duration_ms: Optional[int] = None
+    # Error text, truncated.
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "id": self.id,
+            "parent_tool_call_id": self.parent_tool_call_id,
+            "name": self.name,
+            "status": self.status,
+        }
+        if self.arguments is not None:
+            data["arguments"] = self.arguments
+        if self.arguments_bytes is not None:
+            data["arguments_bytes"] = self.arguments_bytes
+        if self.duration_ms is not None:
+            data["duration_ms"] = self.duration_ms
+        if self.error is not None:
+            data["error"] = self.error
+        return data
+
+
+@dataclass
+class NestedToolCalls:
+    """Bounded record of the nested calls a tool made. Results are not recorded."""
+
+    calls: List[NestedToolCallRecord] = field(default_factory=list)
+    # False when calls were dropped, arguments omitted, or calls had not finished.
+    complete: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"calls": [call.to_dict() for call in self.calls], "complete": self.complete}
+
+
+@dataclass
 class ToolResultMessage:
     role: str = field(default="toolResult", init=False)
     tool_call_id: str
@@ -249,6 +296,8 @@ class ToolResultMessage:
     timestamp: int
     details: Any = None
     usage: Optional[Usage] = None
+    # Calls this tool made to other tools. Kept for the session record; not sent to the model.
+    nested_calls: Optional[NestedToolCalls] = None
 
 
 Message = Union[SystemMessage, UserMessage, AssistantMessage, ToolResultMessage]

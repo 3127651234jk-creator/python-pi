@@ -75,8 +75,10 @@ def wire_message(message):
             return [convert(item) for item in value]
         if not isinstance(value, dict):
             return value
+        # nested_calls is a session record, not model context.
         return {WIRE_NAMES.get(key, key): (item if key in ("arguments", "parameters", "details", "sections")
-                                         else convert(item)) for key, item in value.items() if item is not None}
+                                         else convert(item))
+                for key, item in value.items() if item is not None and key != "nested_calls"}
     return convert(data)
 
 

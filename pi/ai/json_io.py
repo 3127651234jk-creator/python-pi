@@ -16,6 +16,8 @@ from .types import (
     AudioContent,
     DiagnosticErrorInfo,
     ImageContent,
+    NestedToolCallRecord,
+    NestedToolCalls,
     SystemMessage,
     TextContent,
     ThinkingContent,
@@ -100,8 +102,29 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             timestamp=data.get("timestamp", 0),
             details=data.get("details"),
             usage=usage_from_json(usage_data) if usage_data else None,
+            nested_calls=nested_calls_from_json(data.get("nested_calls")),
         )
     raise ValueError(f"Unknown message role: {role!r}")
+
+
+def nested_calls_from_json(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return None
+    calls = []
+    for item in data.get("calls") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        calls.append(NestedToolCallRecord(
+            id=item["id"],
+            parent_tool_call_id=item.get("parent_tool_call_id"),
+            name=item.get("name", ""),
+            arguments=item.get("arguments"),
+            arguments_bytes=item.get("arguments_bytes"),
+            status=item.get("status", "unfinished"),
+            duration_ms=item.get("duration_ms"),
+            error=item.get("error"),
+        ))
+    return NestedToolCalls(calls=calls, complete=bool(data.get("complete", True)))
 
 
 def messages_from_json(items: List[Dict[str, Any]]) -> List[Any]:
