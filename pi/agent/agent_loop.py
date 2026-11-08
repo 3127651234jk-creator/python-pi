@@ -20,6 +20,8 @@ from ..ai.types import (
     ToolCall,
     ToolResultMessage,
     TranscriptContext,
+    Usage,
+    combine_usage,
 )
 from ..ai.utils import (
     NO_CHANGES,
@@ -61,9 +63,14 @@ async def run_agent_loop(
         await emit(MessageStart(message))
         await emit(MessageEnd(message))
 
-    await run_loop(
-        current_context, new_messages, config, signal, emit, stream_fn or get_default_stream_fn()
-    )
+    config, owned_runner = _ensure_nested_runner(config, emit)
+    try:
+        await run_loop(
+            current_context, new_messages, config, signal, emit, stream_fn or get_default_stream_fn()
+        )
+    finally:
+        if owned_runner is not None:
+            await owned_runner.close()
     return new_messages
 
 
@@ -85,7 +92,12 @@ async def run_agent_loop_continue(
     await emit(AgentStartEventType())
     await emit(TurnStartEventType())
 
-    await run_loop(current_context, new_messages, config, signal, emit, stream_fn or get_default_stream_fn())
+    config, owned_runner = _ensure_nested_runner(config, emit)
+    try:
+        await run_loop(current_context, new_messages, config, signal, emit, stream_fn or get_default_stream_fn())
+    finally:
+        if owned_runner is not None:
+            await owned_runner.close()
     return new_messages
 
 
@@ -269,6 +281,17 @@ def _replace_config(config: AgentLoopConfig, **changes: Any) -> AgentLoopConfig:
     return dataclasses.replace(config, **changes)
 
 
+def _ensure_nested_runner(config: AgentLoopConfig, emit: EmitFn):
+    """Use the configured session runner, or own one for this run."""
+    runner = getattr(config, "nested_tool_call_runner", None)
+    if runner is not None and not getattr(runner, "closed", False):
+        return config, None
+    from ..coding_agent.nested_tool_calls import LoopToolHost, NestedToolCallRunner
+
+    runner = NestedToolCallRunner(LoopToolHost(emit))
+    return _replace_config(config, nested_tool_call_runner=runner), runner
+
+
 def declare_tool_changes(context: AgentContext, pending_messages: List[Any]) -> List[Any]:
     """Declare tool loadout changes to the model via system messages."""
     system_index = -1
@@ -425,6 +448,75 @@ async def fail_tool_calls_from_truncated_message(
     return {"messages": messages, "terminate": False}
 
 
+def _enter_call_context(config: AgentLoopConfig, context: AgentContext,
+                        assistant_message: AssistantMessage, signal: Optional[AbortSignal],
+                        tool_call: ToolCall, holds_queue: bool):
+    """Make ``tool_call`` the active call for execute_tool and nested runners."""
+    runner = getattr(config, "nested_tool_call_runner", None)
+    if runner is None:
+        return None
+    from ..coding_agent.nested_tool_calls import NestedCallContext, set_current_call
+
+    return set_current_call(NestedCallContext(
+        root_id=tool_call.id,
+        caller_id=tool_call.id,
+        assistant_message=assistant_message,
+        context=context,
+        config=config,
+        signal=signal,
+        holds_queue=holds_queue,
+        runner=runner,
+    ))
+
+
+def _leave_call_context(token) -> None:
+    if token is None:
+        return
+    from ..coding_agent.nested_tool_calls import reset_current_call
+
+    reset_current_call(token)
+
+
+async def _attach_nested_record(config: AgentLoopConfig, root_id: str,
+                                finalized: Dict[str, Any]) -> Dict[str, Any]:
+    """Consume one top-level call's nested record so content and usage land once."""
+    runner = getattr(config, "nested_tool_call_runner", None)
+    if runner is None:
+        return finalized
+    summary = await runner.collect_record(root_id)
+    if summary is None:
+        return finalized
+    if summary.calls is not None:
+        finalized["nested_calls"] = summary.calls
+    if summary.usage is not None:
+        finalized["nested_usage"] = summary.usage
+    return finalized
+
+
+async def run_single_tool_call(
+    current_context: AgentContext,
+    assistant_message: AssistantMessage,
+    tool_call: ToolCall,
+    config: AgentLoopConfig,
+    signal: Optional[AbortSignal],
+    on_update,
+    parent_tool_call_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Prepare, execute and finalize one call through the shared pipeline."""
+    preparation = await prepare_tool_call(
+        current_context, assistant_message, tool_call, config, signal,
+        parent_tool_call_id=parent_tool_call_id,
+    )
+    if preparation["kind"] == "immediate":
+        return {"tool_call": tool_call, "result": preparation["result"],
+                "is_error": preparation["is_error"]}
+    executed = await execute_prepared_tool_call(preparation, signal, on_update)
+    return await finalize_executed_tool_call(
+        current_context, assistant_message, preparation, executed, config, signal,
+        parent_tool_call_id=parent_tool_call_id,
+    )
+
+
 async def execute_tool_calls(
     current_context: AgentContext,
     assistant_message: AssistantMessage,
@@ -468,14 +560,24 @@ async def execute_tool_calls_sequential(
                 tool_call_id=tool_call.id, tool_name=tool_call.name, args=tool_call.arguments
             )
         )
-        preparation = await prepare_tool_call(current_context, assistant_message, tool_call, config, signal)
-        if preparation["kind"] == "immediate":
-            finalized = {"tool_call": tool_call, "result": preparation["result"], "is_error": preparation["is_error"]}
-        else:
-            executed = await execute_prepared_tool_call(preparation, signal, _update_sink(tool_call, emit))
-            finalized = await finalize_executed_tool_call(
-                current_context, assistant_message, preparation, executed, config, signal
-            )
+        # A sequential batch owns the tool pipeline; nested exclusive calls
+        # inherit that lease instead of waiting on it.
+        token = _enter_call_context(
+            config, current_context, assistant_message, signal, tool_call, holds_queue=True
+        )
+        try:
+            preparation = await prepare_tool_call(current_context, assistant_message, tool_call, config, signal)
+            if preparation["kind"] == "immediate":
+                finalized = {"tool_call": tool_call, "result": preparation["result"],
+                             "is_error": preparation["is_error"]}
+            else:
+                executed = await execute_prepared_tool_call(preparation, signal, _update_sink(tool_call, emit))
+                finalized = await finalize_executed_tool_call(
+                    current_context, assistant_message, preparation, executed, config, signal
+                )
+        finally:
+            _leave_call_context(token)
+        finalized = await _attach_nested_record(config, tool_call.id, finalized)
 
         await emit(
             ToolExecutionEndEvent(
@@ -537,12 +639,20 @@ async def execute_tool_calls_parallel(
                     "result": create_error_tool_result("Operation aborted"),
                     "is_error": True,
                 }
+                finalized = await _attach_nested_record(config, tool_call.id, finalized)
                 await emit(TEE(tool_call_id=tool_call.id, tool_name=tool_call.name, result=finalized["result"], is_error=True))
                 return finalized
-            executed = await execute_prepared_tool_call(preparation, signal, _update_sink(tool_call, emit))
-            finalized = await finalize_executed_tool_call(
-                current_context, assistant_message, preparation, executed, config, signal
+            token = _enter_call_context(
+                config, current_context, assistant_message, signal, tool_call, holds_queue=False
             )
+            try:
+                executed = await execute_prepared_tool_call(preparation, signal, _update_sink(tool_call, emit))
+                finalized = await finalize_executed_tool_call(
+                    current_context, assistant_message, preparation, executed, config, signal
+                )
+            finally:
+                _leave_call_context(token)
+            finalized = await _attach_nested_record(config, tool_call.id, finalized)
             await emit(
                 TEE(
                     tool_call_id=tool_call.id,
@@ -601,6 +711,7 @@ async def prepare_tool_call(
     config: AgentLoopConfig,
     signal: Optional[AbortSignal],
     tools: Optional[List[AgentTool]] = None,
+    parent_tool_call_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     tools = tools if tools is not None else (current_context.tools or [])
     tool = next((t for t in tools if t.name == tool_call.name), None)
@@ -633,6 +744,7 @@ async def prepare_tool_call(
                     tool_arguments=tool_call.arguments,
                     args=validated_args,
                     context=current_context,
+                    parent_tool_call_id=parent_tool_call_id,
                 ),
                 signal,
             )
@@ -699,6 +811,7 @@ async def finalize_executed_tool_call(
     executed: Dict[str, Any],
     config: AgentLoopConfig,
     signal: Optional[AbortSignal],
+    parent_tool_call_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     from .types import AfterToolCallContext
 
@@ -717,6 +830,7 @@ async def finalize_executed_tool_call(
                     result=result,
                     is_error=is_error,
                     context=current_context,
+                    parent_tool_call_id=parent_tool_call_id,
                 ),
                 signal,
             )
@@ -749,6 +863,12 @@ def create_error_tool_result(message: str) -> AgentToolResult:
 
 def create_tool_result_message(finalized: Dict[str, Any]) -> ToolResultMessage:
     result: AgentToolResult = finalized["result"]
+    # The top-level message is the only persisted result: its usage is the
+    # tool's own usage plus the recorder's sum of nested tool usage.
+    usage = result.usage
+    nested_usage: Optional[Usage] = finalized.get("nested_usage")
+    if nested_usage is not None:
+        usage = combine_usage(usage, nested_usage) if usage is not None else nested_usage
     return ToolResultMessage(
         tool_call_id=finalized["tool_call"].id,
         tool_name=finalized["tool_call"].name,
@@ -756,7 +876,8 @@ def create_tool_result_message(finalized: Dict[str, Any]) -> ToolResultMessage:
         is_error=finalized["is_error"],
         timestamp=_now_ms(),
         details=result.details,
-        usage=result.usage,
+        usage=usage,
+        nested_calls=finalized.get("nested_calls"),
     )
 
 

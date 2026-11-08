@@ -91,6 +91,7 @@ class BeforeToolCallContext:
     tool_arguments: Dict[str, Any]
     args: Any
     context: AgentContext
+    parent_tool_call_id: Optional[str] = None
 
 
 @dataclass
@@ -103,6 +104,7 @@ class AfterToolCallContext:
     result: AgentToolResult
     is_error: bool
     context: AgentContext
+    parent_tool_call_id: Optional[str] = None
 
 
 @dataclass
@@ -163,6 +165,8 @@ class AgentLoopConfig:
     telemetry_context: Any = None
     # Prompt-caching breakpoint TTL ("5m"/"1h"); None disables cache markers.
     cache_retention: Optional[str] = "5m"
+    # Session-scoped nested-call runner; the loop creates one per run when unset.
+    nested_tool_call_runner: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +222,7 @@ class ToolExecutionStartEvent:
     tool_call_id: str = ""
     tool_name: str = ""
     args: Any = None
+    parent_tool_call_id: Optional[str] = None
 
 
 @dataclass
@@ -227,6 +232,7 @@ class ToolExecutionUpdateEvent:
     tool_name: str = ""
     args: Any = None
     partial_result: Any = None
+    parent_tool_call_id: Optional[str] = None
 
 
 @dataclass
@@ -236,6 +242,7 @@ class ToolExecutionEndEvent:
     tool_name: str = ""
     result: Any = None
     is_error: bool = False
+    parent_tool_call_id: Optional[str] = None
 
 
 AgentEvent = Union[
