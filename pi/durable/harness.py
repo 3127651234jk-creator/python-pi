@@ -420,23 +420,17 @@ class Harness:
         return await self.session.commit(change, _scope_for(self, task_id))
 
     async def _abort_now(self, task: TaskRecord, definition: TaskDefinition) -> None:
+        """Run the abort handler outside any transaction (mirrors the TS
+        scheduler's #runAbort): its runtime.commit opens its own commit on
+        the line. Invoking the handler inside session.commit would deadlock
+        on the non-reentrant line lock."""
+
         signal = asyncio.Event()
         runtime = TaskRuntime(self, task.id, signal)
-
-        async def run_abort():
-            scope = _scope_for(self, task.id)
-
-            async def tx_change(tx):
-                current = await tx.task(task.id)
-                if current is None or current.state.status in ("completing", "terminal"):
-                    return None
-                await definition.abort(current, runtime, self)
-                return None
-
-            await self.session.commit(tx_change, scope)
-
         try:
-            await run_abort()
+            current = await self._get_task(task.id)
+            if current is not None and current.state.status not in ("completing", "terminal"):
+                await definition.abort(current, runtime, self)
         except Exception as exc:  # noqa: BLE001
             current = await self._get_task(task.id)
             if current is not None and current.state.status not in ("completing", "terminal"):
