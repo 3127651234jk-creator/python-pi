@@ -253,7 +253,7 @@ class _Truncation:
         warning = (f"Warning: truncated output (original token count: {math.ceil(len(combined) / CHARS_PER_TOKEN)})\n"
                    f"Total output lines: {combined.count(chr(10)) + 1}\n\n"
                    f"{head}...{math.ceil(removed / CHARS_PER_TOKEN)} tokens truncated...{tail}")
-        spill = self.workdir / f"codemode_{call_id}_full_output.txt"
+        spill = self.workdir / f"codemode_{host.to_codemode_file_stem(call_id)}_full_output.txt"
         try:
             spill.write_text(combined, encoding="utf-8")
             warning += f"\n\n[Full output: {spill} (read with offset/limit)]"
@@ -281,7 +281,7 @@ def _save_images(items: List[Union[TextContent, ImageContent]], workdir: Path, c
                 result.append(item)
                 continue
             counter += 1
-            path = str(workdir / f"codemode_{call_id}_img{counter}{extension}")
+            path = str(workdir / f"codemode_{host.to_codemode_file_stem(call_id)}_img{counter}{extension}")
             try:
                 Path(path).write_bytes(base64.b64decode(item.data))
             except OSError as exc:

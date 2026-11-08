@@ -424,6 +424,31 @@ def test_workdir_is_shared_across_executions(tmp_path):
     asyncio.run(scenario())
 
 
+def test_nested_style_call_id_writes_safe_scratch_files():
+    async def scenario():
+        tool = create_codemode_tool([leaf("echo")])
+
+        # Script and spill files: used to raise FileNotFoundError on write.
+        result = await tool.execute("parent/1", {
+            "code": '# @options: {"max_output_tokens": 1}\ntext("abcdefghij")\n'}, None, None)
+        assert result.is_error is False
+        spill = Path(texts_of(result)[1].split("[Full output: ", 1)[1]
+                     .split(" (read with offset/limit)]")[0])
+        assert spill.name == "codemode_parent_1_full_output.txt"
+        assert spill.read_text(encoding="utf-8") == "abcdefghij"
+
+        # Image files use the same sanitized stem.
+        result = await tool.execute("parent/2", {
+            "code": "image('data:image/png;base64," + PNG_1PX + "')\n"}, None, None)
+        assert result.is_error is False
+        note = next(text for text in texts_of(result) if text.startswith("[Image saved to "))
+        image_path = Path(note.split("[Image saved to ", 1)[1].split(" (image/png, 70 bytes)]")[0])
+        assert image_path.name == "codemode_parent_2_img1.png"
+        assert image_path.read_bytes() == base64.b64decode(PNG_1PX)
+
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # Input validation and settings
 # ---------------------------------------------------------------------------

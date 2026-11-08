@@ -306,6 +306,21 @@ def test_worker_crash_is_classified_with_exit_code():
     asyncio.run(scenario())
 
 
+def test_nested_style_root_id_lands_in_the_workdir_itself():
+    async def scenario():
+        runtime = host.prepare_runtime()
+        outcome = await run_host("result = tools.echo({})", runtime=runtime, root_id="parent/1")
+
+        assert outcome.status == host.STATUS_OK
+        assert outcome.value == {"called": "echo", "args": {}}
+        # The sanitized stem keeps the script inside the workdir instead of
+        # trying to create a subdirectory for the path separator.
+        assert (runtime.workdir / "script_parent_1.py").exists()
+        assert not [path for path in runtime.workdir.iterdir() if path.is_dir()]
+
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # Bridge failure (synthetic: pump raises while the host waits)
 # ---------------------------------------------------------------------------
@@ -314,12 +329,19 @@ def test_worker_crash_is_classified_with_exit_code():
 class FakeStream:
     def __init__(self, script=None):
         self.script = list(script or [])
+        self.closed = False
 
     def write(self, data):
         pass
 
     async def drain(self):
         pass
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
 
     async def readline(self):
         if self.script:

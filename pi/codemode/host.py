@@ -118,6 +118,18 @@ def to_codemode_identifier(name: str) -> str:
     return identifier
 
 
+def to_codemode_file_stem(call_id: str) -> str:
+    """Filesystem-safe file stem for scratch names derived from a call id.
+
+    Call ids may carry path separators (nested runners use ``parent/1``-style
+    ids), which would otherwise escape the workdir and crash the run; safe ids
+    pass through unchanged.
+    """
+
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id)
+    return stem or "call"
+
+
 def parse_codemode_source(code: str) -> tuple:
     """Split the optional ``# @options:`` first line from the script source."""
 
@@ -158,7 +170,7 @@ async def execute_codemode(
     same points the monolithic implementation published its snapshot.
     """
 
-    code_path = runtime.workdir / f"script_{root_id}.py"
+    code_path = runtime.workdir / f"script_{to_codemode_file_stem(root_id)}.py"
     code_path.write_text(code, encoding="utf-8")
     init = {"tools": tools_meta, "store": store}
     started_at = asyncio.get_event_loop().time()
@@ -303,6 +315,17 @@ async def execute_codemode(
         if process.returncode is None:
             process.kill()
         await process.wait()
+        stdin = process.stdin
+        if stdin is not None:
+            # Drain the stdin transport: a killed worker can leave a pending
+            # pipe write whose BrokenPipeError must be retrieved here instead
+            # of surfacing later as an unretrieved-future warning.
+            stdin.close()
+            try:
+                await asyncio.wait_for(stdin.wait_closed(), timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionError,
+                    OSError, RuntimeError):
+                pass
     for record in calls:
         if record.status == "running":
             record.status = "cancelled"
