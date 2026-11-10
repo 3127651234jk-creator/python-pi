@@ -266,25 +266,28 @@ def create_bash_tool(
 
             read_task = asyncio.ensure_future(read_stream())
             wait_task = asyncio.ensure_future(proc.wait())
+            failed = False
             try:
                 await asyncio.sleep(0)
                 while True:
                     if signal is not None and getattr(signal, "aborted", False):
                         aborted = True
                         break
-                    if proc.returncode is not None and read_task.done():
+                    if read_task.done():
                         read_task.result()
-                        break
+                        if proc.returncode is not None:
+                            break
                     if timeout is not None and (time.monotonic() - started_at) > timeout:
                         timed_out = True
                         break
-                    try:
-                        await asyncio.wait({read_task} if proc.returncode is not None else {wait_task}, timeout=0.1)
-                    except asyncio.TimeoutError:
-                        pass
+                    pending = {task for task in (read_task, wait_task) if not task.done()}
+                    await asyncio.wait(pending, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
                     await maybe_emit_update()
+            except BaseException:
+                failed = True
+                raise
             finally:
-                if aborted or timed_out or proc.returncode is None:
+                if failed or aborted or timed_out or proc.returncode is None:
                     if job is not None:
                         job.terminate()
                     else:
@@ -295,7 +298,7 @@ def create_bash_tool(
                         except asyncio.TimeoutError:
                             proc.kill()
                 try:
-                    if aborted or timed_out or proc.returncode is None:
+                    if failed or aborted or timed_out or proc.returncode is None:
                         try:
                             await asyncio.wait_for(asyncio.shield(read_task), timeout=0.2)
                         except asyncio.TimeoutError:

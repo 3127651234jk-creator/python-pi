@@ -185,3 +185,37 @@ def test_windows_interrupt_kills_orphan_descendants(tmp_path, abort):
                     job._api.CloseHandle(handle)
     finally:
         job.close()
+
+
+def test_output_failure_terminates_command_immediately(tmp_path, monkeypatch):
+    processes = []
+    original_spawn = asyncio.create_subprocess_exec
+
+    async def spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    failure = OSError("disk full")
+
+    def append(self, data):
+        raise failure
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(OutputAccumulator, "append", append)
+    monkeypatch.setattr(bash_module.tempfile, "tempdir", str(tmp_path))
+    script = tmp_path / "output.py"
+    script.write_text("import time\nprint('output', flush=True)\ntime.sleep(30)\n")
+    tool = create_bash_tool(str(tmp_path), shell_command=lambda command: ([sys.executable, str(script)], False))
+
+    async def scenario():
+        start = asyncio.get_running_loop().time()
+        with pytest.raises(OSError, match="disk full") as error:
+            await asyncio.wait_for(tool.execute("test", {"command": "unused"}), 3)
+        assert error.value is failure
+        assert asyncio.get_running_loop().time() - start < 2
+        assert processes and all(process.returncode is not None for process in processes)
+        assert not list(tmp_path.glob("pi-py-bash-*.log"))
+        assert not any(task.get_coro().__qualname__ == "Process.wait" for task in asyncio.all_tasks())
+
+    asyncio.run(scenario())
