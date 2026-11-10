@@ -77,7 +77,10 @@ def safe_extract_tar(data: bytes, target: Path) -> None:
         root = None
         for member in members:
             parts = PurePosixPath(member.name).parts
-            if member.name.startswith("/") or ".." in parts:
+            if (member.name.startswith("/") or ".." in parts
+                    or "\\" in member.name or ":" in member.name):
+                raise ValueError(f"Unsafe tarball path: {member.name}")
+            if not (target / Path(*parts)).resolve().is_relative_to(target.resolve()):
                 raise ValueError(f"Unsafe tarball path: {member.name}")
             if root is None and parts:
                 root = parts[0]
@@ -215,9 +218,15 @@ class PackageManager:
         url, ref = parsed["url"], parsed["ref"]
         parsed_url = urllib.parse.urlsplit(url)
         relative = (parsed_url.path or "").removesuffix(".git").strip("/")
-        if not relative:
+        hostname = parsed_url.hostname
+        if (not relative or not hostname or "\\" in relative or ":" in relative
+                or ".." in PurePosixPath(relative).parts
+                or "\\" in hostname or ":" in hostname or hostname in (".", "..")):
             raise ValueError(f"Cannot derive a git target directory from: {url}")
-        target = self.config.agent_dir / "git" / parsed_url.host / relative
+        cache_root = (self.config.agent_dir / "git").resolve()
+        target = cache_root / hostname / relative
+        if not target.resolve().is_relative_to(cache_root):
+            raise ValueError(f"Cannot derive a git target directory from: {url}")
         if target.exists() and not (target / ".git").exists():
             shutil.rmtree(target)
         if not target.exists():
@@ -266,9 +275,10 @@ class PackageManager:
                         placed.setdefault("prompts", []).append(str(target_file))
                     continue
                 destination = self.config.agent_dir / kind / name
-                if destination.exists():
-                    shutil.rmtree(destination)
-                destination.mkdir(parents=True)
+                if kind not in placed:
+                    if destination.exists():
+                        shutil.rmtree(destination)
+                    destination.mkdir(parents=True)
                 if origin.is_dir():
                     shutil.copytree(origin, destination / origin.name)
                     placed.setdefault(kind, []).append(str(destination / origin.name))
