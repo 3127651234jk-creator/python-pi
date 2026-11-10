@@ -44,6 +44,7 @@ class Session:
         self._line_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
+        self._close_task: Optional[asyncio.Task] = None
         self._poison: Optional[BaseException] = None
         self._document_cache: Dict[str, Optional[Any]] = {}
         self.host = SessionHost(self)
@@ -184,20 +185,30 @@ class Session:
 
     async def close(self) -> None:
         """Seal admission, drain the line, then close storage."""
-        if self._closing:
-            while not self._closed:
-                await asyncio.sleep(0.01)
-            return
-        self._closing = True
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._finish_close())
+        await asyncio.shield(self._close_task)
+
+    async def _finish_close(self) -> None:
         listeners = list(self._close_listeners)
         self._close_listeners.clear()
+        listener_error: Optional[BaseException] = None
         for listener in listeners:
-            listener()
-        async with self._line_lock:
-            self._commit_listeners.clear()
-            self._document_cache.clear()
-            await self.storage.close()
-        self._closed = True
+            try:
+                listener()
+            except BaseException as exc:
+                if listener_error is None:
+                    listener_error = exc
+        try:
+            async with self._line_lock:
+                self._commit_listeners.clear()
+                self._document_cache.clear()
+                await self.storage.close()
+        finally:
+            self._closed = True
+        if listener_error is not None:
+            raise listener_error
 
     def _assert_usable(self) -> None:
         if self._closing or self._closed:
