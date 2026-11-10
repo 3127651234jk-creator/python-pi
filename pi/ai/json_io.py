@@ -47,7 +47,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
     if role == "system":
         content = data.get("content", "")
         return SystemMessage(
-            content=content,
+            content=_content_from_json(content),
             timestamp=data.get("timestamp", 0),
             sections=data.get("sections"),
             tools_added=[_tool_from_json(t) for t in (data.get("tools_added") or [])] or None,
@@ -163,7 +163,7 @@ def _block_from_json(block: Dict[str, Any]) -> Any:
     cls = _MEDIA_BLOCK_TYPES.get(block.get("type"))
     if cls is not None:
         return cls(data=block.get("data", ""), mime_type=block.get("mime_type", ""))
-    return TextContent(text=block.get("text", ""))
+    return TextContent(text=block.get("text", ""), text_signature=block.get("text_signature"))
 
 
 def _content_from_json(content: Any) -> Any:

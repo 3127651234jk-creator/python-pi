@@ -7,7 +7,7 @@ Ports of the AbortSignal contract and ``EventStream`` from
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator, Callable, Generic, Optional, TypeVar
+from typing import AsyncIterator, Callable, Generic, Optional, TypeVar, cast
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -59,8 +59,8 @@ class AbortSignal:
 class EventStream(Generic[T, U]):
     """Push-based async stream that terminates with a final result value.
 
-    ``end()`` closes the stream; ``result()`` returns the terminal value after
-    the stream is fully consumed. Consumers iterate with ``async for``.
+    ``end()`` or a terminal event closes the stream; ``result()`` waits for
+    completion without consuming events. Consumers iterate with ``async for``.
     """
 
     def __init__(self, is_done: Callable[[T], bool], get_result: Callable[[T], U]) -> None:
@@ -69,26 +69,26 @@ class EventStream(Generic[T, U]):
         self._get_result = get_result
         self._result: Optional[U] = None
         self._ended = False
+        self._completion = asyncio.Event()
 
     def push(self, event: T) -> None:
         if self._ended:
             raise RuntimeError("EventStream already ended")
         self._queue.put_nowait(event)
+        if self._is_done(event):
+            self.end(self._get_result(event))
 
     def end(self, result: U) -> None:
         if self._ended:
             return
         self._result = result
         self._ended = True
+        self._completion.set()
         self._queue.put_nowait(None)
 
     async def result(self) -> U:
-        if not self._ended:
-            # Drain remaining events so a producer task can settle.
-            async for _ in self:
-                pass
-        assert self._result is not None
-        return self._result
+        await self._completion.wait()
+        return cast(U, self._result)
 
     def __aiter__(self) -> "EventStream[T, U]":
         return self
@@ -96,6 +96,8 @@ class EventStream(Generic[T, U]):
     async def __anext__(self) -> T:
         event = await self._queue.get()
         if event is None:
+            # Keep completion visible to later and concurrent consumers.
+            self._queue.put_nowait(None)
             raise StopAsyncIteration
         return event
 
