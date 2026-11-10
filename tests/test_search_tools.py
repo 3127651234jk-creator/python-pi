@@ -90,6 +90,54 @@ def without_ripgrep(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None if name == "rg" else real(name))
 
 
+@pytest.mark.parametrize("tool", ["find", "grep"])
+def test_fallback_nested_gitignore_stays_in_its_directory(tmp_path, monkeypatch, tool):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    for directory in ("sub", "sibling", "submarine"):
+        (tmp_path / directory).mkdir()
+    (tmp_path / "sub" / ".gitignore").write_text("*.log\ncache/\n", encoding="utf-8")
+    (tmp_path / "sub" / "cache").mkdir()
+    paths = ["root.log", "sibling/keep.log", "submarine/keep.log", "sub/hidden.log", "sub/cache/hidden.txt"]
+    for path in paths:
+        (tmp_path / path).write_text("needle\n", encoding="utf-8")
+    params = {"pattern": "*" if tool == "find" else "needle"}
+    text = execute(tmp_path, tool, params).content[0].text.replace("\\", "/")
+    for path in paths[:3]:
+        assert path in text
+    for path in paths[3:]:
+        assert path not in text
+
+
+@pytest.mark.parametrize("tool", ["find", "grep"])
+@pytest.mark.parametrize("scope", ["", "sub"])
+def test_fallback_anchored_ignore(tmp_path, monkeypatch, tool, scope):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    base = tmp_path / scope
+    base.mkdir(exist_ok=True)
+    (base / "nested").mkdir()
+    (base / ".gitignore").write_text("/root.log\n/cache/\n", encoding="utf-8")
+    (base / "cache").mkdir()
+    (base / "nested" / "cache").mkdir()
+    for path in ("root.log", "nested/root.log", "cache/a.txt", "nested/cache/a.txt"):
+        (base / path).write_text("needle\n", encoding="utf-8")
+    params = {"pattern": "*" if tool == "find" else "needle"}
+    lines = execute(tmp_path, tool, params).content[0].text.replace("\\", "/").splitlines()
+    prefix = scope + "/" if scope else ""
+    assert any(prefix + "nested/root.log" in line for line in lines)
+    assert any(prefix + "nested/cache/a.txt" in line for line in lines)
+    assert not any(line.startswith(prefix + "root.log") for line in lines)
+    assert not any(line.startswith(prefix + "cache/") for line in lines)
+
+
+def test_fallback_grep_marks_overlapping_context_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    (tmp_path / "a.txt").write_text("before\nneedle one\nneedle two\nafter\n", encoding="utf-8")
+    result = execute(tmp_path, "grep", {"pattern": "needle", "context": 1})
+    assert result.content[0].text.splitlines() == [
+        "a.txt-1-before", "a.txt:2:needle one", "a.txt:3:needle two", "a.txt-4-after",
+    ]
+
+
 def test_grep_falls_back_without_ripgrep(files, monkeypatch):
     (files / ".gitignore").write_text("ignored.txt\nignored.py\n", encoding="utf-8")
     (files / "ignored.py").write_text("secret match", encoding="utf-8")

@@ -50,11 +50,12 @@ def create_write_tool(cwd: str) -> AgentTool:
 
         async def mutate() -> AgentToolResult:
             check_aborted()
+            encoded_content = content.encode("utf-8")
             if directory:
                 os.makedirs(directory, exist_ok=True)
             check_aborted()
-            with open(absolute_path, "w", encoding="utf-8", newline="") as handle:
-                handle.write(content)
+            with open(absolute_path, "wb") as handle:
+                handle.write(encoded_content)
             check_aborted()
             return AgentToolResult(content=[TextContent(text=f"Successfully wrote to {path}")])
 

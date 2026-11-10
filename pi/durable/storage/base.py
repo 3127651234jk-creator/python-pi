@@ -322,7 +322,7 @@ class BaseStorage:
                 record = DocumentRecord(
                     id=_record_field(created, "id"),
                     kind=_record_field(created, "kind"),
-                    scope=_record_field(created, "scope"),
+                    scope=_copy.deepcopy(_record_field(created, "scope")),
                     created_at=seq,
                     key=_record_field(created, "key"),
                     retired_at=seq if action["retire"] else None,

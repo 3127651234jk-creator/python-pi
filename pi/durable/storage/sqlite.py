@@ -47,6 +47,8 @@ class SqliteStorage(MemoryStorage):
             item = dict(write)
             if "value" in item and not isinstance(item["value"], dict):
                 item["value"] = record_to_dict(item["value"])
+            if "record" in item and not isinstance(item["record"], dict):
+                item["record"] = record_to_dict(item["record"])
             encoded.append(item)
         return encoded
 
@@ -68,11 +70,14 @@ class SqliteStorage(MemoryStorage):
         self.check_global_ids(resolved)
         actions = self.prepare_document_actions(resolved)
         self.check_document_actions(actions)
+        payload = json.dumps(self._encode_writes(resolved), ensure_ascii=False)
+        # sqlite3 encodes text parameters as UTF-8 when binding them.
+        payload.encode("utf-8")
         try:
             self.conn.execute("BEGIN")
             self.conn.execute(
                 "INSERT INTO commits (seq, writes) VALUES (?, ?)",
-                (seq, json.dumps(self._encode_writes(resolved), ensure_ascii=False)),
+                (seq, payload),
             )
             self.conn.execute("COMMIT")
         except sqlite3.Error as exc:

@@ -40,6 +40,32 @@ def test_write_then_read(tmp_path):
     asyncio.run(scenario())
 
 
+def test_write_encoding_failure_preserves_original(tmp_path):
+    path = tmp_path / "original.txt"
+    path.write_bytes(b"original")
+
+    async def scenario():
+        with pytest.raises(UnicodeEncodeError):
+            await get_tool(str(tmp_path), "write").execute(
+                "t1", {"path": "original.txt", "content": "\ud800"}
+            )
+
+    asyncio.run(scenario())
+    assert path.read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("name", ["offset", "limit"])
+@pytest.mark.parametrize("value", [-1, 0, 1.5, True, "1"])
+def test_read_rejects_invalid_pagination(tmp_path, name, value):
+    (tmp_path / "file.txt").write_text("one\ntwo\nthree", encoding="utf-8")
+
+    async def scenario():
+        with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+            await get_tool(str(tmp_path), "read").execute("t1", {"path": "file.txt", name: value})
+
+    asyncio.run(scenario())
+
+
 def test_read_truncation_notice(tmp_path):
     cwd = str(tmp_path)
     lines = [f"line {i}" for i in range(50)]
@@ -94,6 +120,37 @@ def test_edit_single_and_multi(tmp_path):
         assert "def bee():" in read_result.content[0].text
 
     asyncio.run(scenario())
+
+
+def test_edit_rejects_invalid_utf8_without_modifying_file(tmp_path):
+    path = tmp_path / "invalid.txt"
+    original = b"hello\n\xff\n"
+    path.write_bytes(original)
+
+    async def scenario():
+        edit = get_tool(str(tmp_path), "edit")
+        with pytest.raises(UnicodeDecodeError):
+            await edit.execute(
+                "t1", {"path": "invalid.txt", "edits": [{"oldText": "hello", "newText": "world"}]}
+            )
+
+    asyncio.run(scenario())
+    assert path.read_bytes() == original
+
+
+def test_edit_encoding_failure_preserves_original(tmp_path):
+    path = tmp_path / "original.txt"
+    original = b"hello\nkeep this\n"
+    path.write_bytes(original)
+
+    async def scenario():
+        with pytest.raises(UnicodeEncodeError):
+            await get_tool(str(tmp_path), "edit").execute(
+                "t1", {"path": "original.txt", "edits": [{"oldText": "hello", "newText": "\ud800"}]}
+            )
+
+    asyncio.run(scenario())
+    assert path.read_bytes() == original
 
 
 def test_edit_rejects_duplicate_match(tmp_path):

@@ -23,8 +23,8 @@ READ_SCHEMA = {
     "type": "object",
     "properties": {
         "path": {"type": "string", "description": "Path to the file to read (relative or absolute)"},
-        "offset": {"type": "number", "description": "Line number to start reading from (1-indexed)"},
-        "limit": {"type": "number", "description": "Maximum number of lines to read"},
+        "offset": {"type": "integer", "minimum": 1, "description": "Line number to start reading from (1-indexed)"},
+        "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines to read"},
     },
     "required": ["path"],
 }
@@ -74,6 +74,9 @@ def create_read_tool(
         path: str = params["path"]
         offset: Optional[int] = params.get("offset")
         limit: Optional[int] = params.get("limit")
+        for name, value in (("offset", offset), ("limit", limit)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
         absolute_path = resolve_to_cwd(path, cwd)
 
         if not os.path.isfile(absolute_path):

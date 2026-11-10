@@ -208,7 +208,7 @@ def record_to_dict(record: Any) -> Dict[str, Any]:
     if dataclass_type is ContextEdit:
         out = {"target": record.target, "action": record.action}
         if record.messages is not None:
-            out["messages"] = record.messages
+            out["messages"] = ai_to_json(record.messages)
         return out
     fields = _RECORD_FIELDS.get(dataclass_type)
     if fields is None:
@@ -220,6 +220,8 @@ def record_to_dict(record: Any) -> Dict[str, Any]:
             continue
         if dataclass_type is EntryRecord and name == "model":
             out[name] = ai_to_json(value)
+        elif dataclass_type is EntryRecord and name == "edits":
+            out[name] = [record_to_dict(edit) for edit in value]
         elif isinstance(value, (ConversationRecord, EntryRecord, SubmissionRecord, TaskRecord, DocumentRecord, TaskState, TaskOutcome, ContextEdit)):
             out[name] = record_to_dict(value)
         else:

@@ -7,6 +7,7 @@ so tests are order-independent.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 
@@ -15,9 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from pi.durable.errors import StorageRejected
+from pi.ai.types import UserMessage
 from pi.durable.storage import JsonlStorage, MemoryStorage, SqliteStorage
 from pi.durable.types import (
     ConversationRecord,
+    ContextEdit,
     DocumentRecord,
     EntryRecord,
     SubmissionRecord,
@@ -242,6 +245,30 @@ def test_documents_create_change_retire(storage):
     asyncio.run(scenario())
 
 
+def test_document_scope_is_detached_from_input(storage):
+    async def scenario():
+        cid = await storage.mint_id()
+        rid = await storage.mint_id()
+        await storage.commit([write_conversation(conversation(cid))])
+        scope = {"kind": "conversation", "conversation_id": cid}
+        record = {"id": rid, "kind": "pi.test.doc", "scope": scope, "history": "rewindable", "fork": "current"}
+        await storage.commit([write_document_create(record, 1, {})])
+        scope["conversation_id"] = 99
+
+        stored = await storage.document(rid)
+        assert stored is not None
+        assert stored.record.scope == {"kind": "conversation", "conversation_id": cid}
+        address = {"kind": "pi.test.doc", "scope": {"kind": "conversation", "conversation_id": cid}}
+        found = await storage.find_document(address)
+        assert found is not None and found.id == rid
+        page = await storage.scan_documents({"scope": address["scope"], "at": "current"}, 10)
+        assert [item.id for item in page.items] == [rid]
+        await storage.commit([write_document_retire(rid)])
+        assert await storage.find_document(address) is None
+
+    asyncio.run(scenario())
+
+
 def test_record_json_roundtrip(storage):
     record = task_record(5, 2)
     rebuilt = record_from_dict(record_to_dict(record))
@@ -274,6 +301,40 @@ def test_jsonl_reopens_with_state(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("tail", [b'{"seq":2,"writes":[', b'{"text":"\xe4\xb8', b'{"seq":2,"writes":[]}'])
+def test_jsonl_recovers_unfinished_tail_and_can_append(tmp_path, tail):
+    async def scenario():
+        path = tmp_path / "log.jsonl"
+        first = JsonlStorage(str(path))
+        await first.commit([write_conversation(conversation(2))])
+        await first.close()
+        complete = path.read_bytes()
+        path.write_bytes(complete + tail)
+
+        recovered = JsonlStorage(str(path))
+        assert path.read_bytes() == complete
+        assert await recovered.conversation(2) is not None
+        assert recovered.next_seq == 2
+        assert await recovered.commit([write_entry(entry(3, 2))]) == 2
+        await recovered.close()
+
+        reopened = JsonlStorage(str(path))
+        assert await reopened.entry_global(3) is not None
+        assert reopened.next_seq == 3
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
+def test_jsonl_rejects_corrupt_complete_line_without_truncating(tmp_path):
+    path = tmp_path / "log.jsonl"
+    original = b'{broken}\n{"seq":2,"writes":[]}\n'
+    path.write_bytes(original)
+    with pytest.raises(json.JSONDecodeError):
+        JsonlStorage(str(path))
+    assert path.read_bytes() == original
+
+
 def test_sqlite_reopens_with_state(tmp_path):
     async def scenario():
         path = str(tmp_path / "store.db")
@@ -288,6 +349,59 @@ def test_sqlite_reopens_with_state(tmp_path):
         assert stored is not None and stored.kind == "pi.test"
         assert second.next_seq == 2
         await second.close()
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_document_record_survives_reopen(tmp_path):
+    async def scenario():
+        path = str(tmp_path / "document.db")
+        storage = SqliteStorage(path)
+        record = DocumentRecord(id=2, kind="example", scope={"kind": "session"})
+        await storage.commit([write_document_create(record, 1, {"count": 7})])
+        await storage.close()
+        reopened = SqliteStorage(path)
+        stored = await reopened.document(2)
+        assert stored is not None and stored.value == {"count": 7}
+        assert stored.record.kind == "example"
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("invalid", [object(), "\ud800"])
+def test_sqlite_encoding_failure_leaves_connection_usable(tmp_path, invalid):
+    async def scenario():
+        storage = SqliteStorage(str(tmp_path / "failure.db"))
+        with pytest.raises((TypeError, UnicodeEncodeError)):
+            await storage.commit([write_entry(entry(2, 3, data=invalid))])
+        assert not storage.conn.in_transaction
+        assert storage.next_seq == 1
+        assert await storage.entry_global(2) is None
+        assert storage.conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == 0
+        assert await storage.commit([write_conversation(conversation(3))]) == 1
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["jsonl", "sqlite"])
+def test_context_edits_survive_reopen(tmp_path, backend):
+    async def scenario():
+        storage = make_storage(backend, tmp_path)
+        edits = [
+            ContextEdit(target=3, action="omit"),
+            ContextEdit(target=3, action="replace", messages=[UserMessage(content="replacement", timestamp=123)]),
+        ]
+        record = entry(4, 2, edits=edits)
+        # Exercise the actual JSON boundary, not just dict conversion.
+        assert record_from_dict(json.loads(json.dumps(record_to_dict(record)))) == record
+        await storage.commit([write_conversation(conversation(2)), write_entry(entry(3, 2)), write_entry(record)])
+        await storage.close()
+        reopened = make_storage(backend, tmp_path)
+        found = await reopened.entry_global(4)
+        assert found is not None and found[0] == record
+        await reopened.close()
 
     asyncio.run(scenario())
 

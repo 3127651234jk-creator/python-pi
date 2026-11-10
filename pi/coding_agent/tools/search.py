@@ -143,10 +143,11 @@ class _IgnoreRule:
     pattern: str
     negate: bool
     directory_only: bool
+    base: str
 
 
 def _load_ignore_rules(root: str) -> List[_IgnoreRule]:
-    """Read every .gitignore under root (rules apply at any depth)."""
+    """Read .gitignore rules with their directory scope, parents first."""
     rules: List[_IgnoreRule] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [name for name in dirnames if name not in SKIPPED_DIRS]
@@ -157,6 +158,8 @@ def _load_ignore_rules(root: str) -> List[_IgnoreRule]:
                 lines = handle.read().splitlines()
         except OSError:
             continue
+        base = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        base = "" if base == "." else base + "/"
         for raw in lines:
             line = raw.strip()
             if not line or line.startswith("#"):
@@ -165,13 +168,18 @@ def _load_ignore_rules(root: str) -> List[_IgnoreRule]:
             if negate:
                 line = line[1:].lstrip()
             directory_only = line.endswith("/")
-            pattern = line.rstrip("/").lstrip("/")
+            pattern = line.rstrip("/")
             if pattern:
-                rules.append(_IgnoreRule(pattern, negate, directory_only))
+                rules.append(_IgnoreRule(pattern, negate, directory_only, base))
     return rules
 
 
 def _matches_ignore(rel_path: str, pattern: str) -> bool:
+    if pattern.startswith("/"):
+        anchored_pattern = pattern[1:]
+        if "/" in anchored_pattern:
+            return matches_glob(rel_path, anchored_pattern)
+        return fnmatch.fnmatchcase(rel_path.split("/")[0], anchored_pattern)
     if "/" not in pattern:
         return any(fnmatch.fnmatchcase(part, pattern) for part in rel_path.split("/"))
     parts = rel_path.split("/")
@@ -180,16 +188,19 @@ def _matches_ignore(rel_path: str, pattern: str) -> bool:
 
 def _is_ignored(rel_path: str, is_dir: bool, rules: List[_IgnoreRule]) -> bool:
     """Last matching rule wins, like git; dir-only rules also cover ancestors."""
-    parts = rel_path.split("/")
-    directories = ["/".join(parts[:index]) for index in range(1, len(parts))]
-    if is_dir:
-        directories.append(rel_path)
     ignored = False
     for rule in rules:
+        if not rel_path.startswith(rule.base):
+            continue
+        scoped_path = rel_path[len(rule.base):]
+        parts = scoped_path.split("/")
+        directories = ["/".join(parts[:index]) for index in range(1, len(parts))]
+        if is_dir:
+            directories.append(scoped_path)
         if rule.directory_only:
             matched = any(_matches_ignore(directory, rule.pattern) for directory in directories)
         else:
-            matched = _matches_ignore(rel_path, rule.pattern)
+            matched = _matches_ignore(scoped_path, rule.pattern)
         if matched:
             ignored = not rule.negate
     return ignored
@@ -300,6 +311,7 @@ async def grep_python(root: str, pattern: str, *, glob: Optional[str] = None, ig
         matches = [index for index, line in enumerate(content) if regex.search(line)]
         if not matches:
             continue
+        matching_lines = set(matches)
         emitted = set()
         for index in matches:
             count += 1
@@ -315,7 +327,7 @@ async def grep_python(root: str, pattern: str, *, glob: Optional[str] = None, ig
                 line = content[line_number]
                 if len(line) > FALLBACK_MAX_LINE_CHARS:
                     line = line[:FALLBACK_MAX_LINE_CHARS] + " [line truncated]"
-                marker = ":" if line_number == index else "-"
+                marker = ":" if line_number in matching_lines else "-"
                 rendered = f"{relative}{marker}{line_number + 1}{marker}{line}"
                 lines.append(rendered)
                 size += len(rendered.encode("utf-8")) + 1

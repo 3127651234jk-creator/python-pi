@@ -127,7 +127,7 @@ def create_edit_tool(cwd: str) -> AgentTool:
                 raise FileNotFoundError(f"Could not edit file: {path}. File does not exist.")
             check_aborted()
 
-            with open(absolute_path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+            with open(absolute_path, "r", encoding="utf-8", newline="") as handle:
                 raw_content = handle.read()
             check_aborted()
 
@@ -139,8 +139,9 @@ def create_edit_tool(cwd: str) -> AgentTool:
             check_aborted()
 
             final_content = ("\ufeff" if bom else "") + restore_line_endings(new_content, original_ending)
-            with open(absolute_path, "w", encoding="utf-8", newline="") as handle:
-                handle.write(final_content)
+            encoded_content = final_content.encode("utf-8")
+            with open(absolute_path, "wb") as handle:
+                handle.write(encoded_content)
             check_aborted()
 
             diff, first_changed_line = generate_diff_string(base_content, new_content)

@@ -31,9 +31,20 @@ class JsonlStorage(MemoryStorage):
                 pass
 
     def _replay(self) -> None:
-        with open(self.path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
+        with open(self.path, "r+b") as handle:
+            while True:
+                start = handle.tell()
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                # The newline completes a log record. A crash can leave a
+                # partial JSON value or even a partial UTF-8 character at EOF.
+                if not raw_line.endswith(b"\n"):
+                    handle.truncate(start)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    break
+                line = raw_line.decode("utf-8").strip()
                 if not line:
                     continue
                 batch = json.loads(line)
