@@ -129,6 +129,24 @@ def test_fallback_anchored_ignore(tmp_path, monkeypatch, tool, scope):
     assert not any(line.startswith(prefix + "cache/") for line in lines)
 
 
+@pytest.mark.parametrize("tool", ["find", "grep"])
+@pytest.mark.parametrize("scope", ["", "sub"])
+@pytest.mark.parametrize("pattern", ["foo/bar", "foo/bar/", "foo/b*"])
+def test_fallback_slash_ignore_is_relative_to_its_directory(tmp_path, monkeypatch, tool, scope, pattern):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    base = tmp_path / scope
+    base.mkdir(exist_ok=True)
+    (base / ".gitignore").write_text(pattern + "\n", encoding="utf-8")
+    for path in ("foo/bar/hidden.txt", "nested/foo/bar/keep.txt"):
+        target = base / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("needle\n", encoding="utf-8")
+    params = {"pattern": "*.txt" if tool == "find" else "needle"}
+    text = execute(tmp_path, tool, params).content[0].text.replace("\\", "/")
+    assert "nested/foo/bar/keep.txt" in text
+    assert "foo/bar/hidden.txt" not in text
+
+
 def test_fallback_grep_marks_overlapping_context_matches(tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     (tmp_path / "a.txt").write_text("before\nneedle one\nneedle two\nafter\n", encoding="utf-8")

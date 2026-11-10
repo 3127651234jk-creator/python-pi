@@ -182,8 +182,8 @@ def _matches_ignore(rel_path: str, pattern: str) -> bool:
         return fnmatch.fnmatchcase(rel_path.split("/")[0], anchored_pattern)
     if "/" not in pattern:
         return any(fnmatch.fnmatchcase(part, pattern) for part in rel_path.split("/"))
-    parts = rel_path.split("/")
-    return any(matches_glob("/".join(parts[start:]), pattern) for start in range(len(parts)))
+    # A slash makes the pattern relative to the directory containing .gitignore.
+    return matches_glob(rel_path, pattern)
 
 
 def _is_ignored(rel_path: str, is_dir: bool, rules: List[_IgnoreRule]) -> bool:
