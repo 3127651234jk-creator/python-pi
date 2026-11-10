@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 
 from ...ai.types import TextContent
 from ...agent.types import AgentTool, AgentToolResult
+from .windows_process import spawn_windows_command
 from .truncate import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
@@ -208,6 +209,7 @@ def create_bash_tool(
         if not os.path.isdir(cwd):
             raise FileNotFoundError(f"Working directory does not exist: {cwd}")
 
+        job = None
         output = OutputAccumulator()
         last_update_at = 0.0
         update_dirty = False
@@ -252,12 +254,7 @@ def create_bash_tool(
                     start_new_session=True,
                 )
             else:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=cwd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
+                proc, job = await spawn_windows_command(argv, cwd)
             assert proc.stdout is not None
 
             async def read_stream() -> None:
@@ -288,7 +285,10 @@ def create_bash_tool(
                     await maybe_emit_update()
             finally:
                 if aborted or timed_out or proc.returncode is None:
-                    _kill_tree(proc.pid)
+                    if job is not None:
+                        job.terminate()
+                    else:
+                        _kill_tree(proc.pid)
                     if proc.returncode is None:
                         try:
                             await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
@@ -312,7 +312,11 @@ def create_bash_tool(
                     await asyncio.gather(wait_task, return_exceptions=True)
 
         finally:
-            output.close()
+            try:
+                output.close()
+            finally:
+                if job is not None:
+                    job.close()
 
         content, truncation, full_path = output.snapshot()
         text = truncation.content or "(no output)"

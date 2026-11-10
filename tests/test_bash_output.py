@@ -1,5 +1,6 @@
 """Regression coverage for bounded shell output."""
 import asyncio
+from ctypes import wintypes
 import os
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 from pi.coding_agent.tools import bash as bash_module
 from pi.coding_agent.tools.bash import DEFAULT_MAX_BYTES, OutputAccumulator, create_bash_tool
 from pi.coding_agent.tools.truncate import truncate_tail
+from pi.coding_agent.tools.windows_process import WindowsJob
 
 
 def test_accumulator_bounds_memory_and_preserves_log():
@@ -136,3 +138,50 @@ def test_structured_prefix_is_bounded_utf8(text):
     finally:
         output.close()
         os.unlink(output._log.name)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job lifetime")
+@pytest.mark.parametrize("abort", [False, True])
+def test_windows_interrupt_kills_orphan_descendants(tmp_path, abort):
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "Path('pids').write_text(str(os.getpid()) + ' ' + str(grandchild.pid))\n"
+        "time.sleep(30)\n"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text("import subprocess, sys\nsubprocess.Popen([sys.executable, 'child.py'])\n")
+    signal = SimpleNamespace(aborted=False)
+    tool = create_bash_tool(str(tmp_path), shell_command=lambda command: ([sys.executable, str(parent)], False))
+
+    async def scenario():
+        async def interrupt():
+            while not (tmp_path / "pids").exists():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)
+            signal.aborted = True
+
+        interrupt_task = asyncio.create_task(interrupt()) if abort else None
+        try:
+            with pytest.raises(RuntimeError, match="aborted" if abort else "timed out"):
+                await asyncio.wait_for(tool.execute("test", {"command": "unused", "timeout": 10 if abort else 1}, signal), 5)
+        finally:
+            if interrupt_task is not None:
+                interrupt_task.cancel()
+                await asyncio.gather(interrupt_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    job = WindowsJob()
+    try:
+        for pid in map(int, (tmp_path / "pids").read_text().split()):
+            handle = job._api.OpenProcess(0x00100000, False, pid)
+            if handle:
+                try:
+                    job._api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                    assert job._api.WaitForSingleObject(handle, 1000) == 0
+                finally:
+                    job._api.CloseHandle(handle)
+    finally:
+        job.close()
