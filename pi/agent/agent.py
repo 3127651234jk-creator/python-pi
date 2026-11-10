@@ -6,6 +6,7 @@ steering and follow-up queues, event subscription, prompt/abort lifecycle.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from typing import Any, AsyncIterator, Callable, Deque, List, Optional
@@ -18,7 +19,6 @@ from .agent_loop import default_convert_to_llm, run_agent_loop
 from .compaction import CompactionSettings, ContextCompactor
 from .types import (
     AgentContext,
-    AgentEndEvent,
     AgentEvent,
     AgentLoopConfig,
     AgentTool,
@@ -136,15 +136,16 @@ class Agent:
         self.is_streaming = True
         self.error_message = None
         self._abort = AbortSignal()
-        config = self._build_config()
         new_messages: List[Any] = []
-        stream = get_default_stream_fn()
-
-        async def compacted_stream(model, context, options):
-            async for event in self.compactor.stream(model, context, options, stream):
-                yield event
 
         try:
+            config = self._build_config()
+            stream = get_default_stream_fn()
+
+            async def compacted_stream(model, context, options):
+                async for event in self.compactor.stream(model, context, options, stream):
+                    yield event
+
             new_messages = await run_agent_loop(
                 prompts=prompts,
                 context=AgentContext(messages=list(self.messages), tools=list(self.tools)),
@@ -200,28 +201,32 @@ class Agent:
         """Run a prompt while yielding every event (subscribe-free helper)."""
 
         queue: Deque[AgentEvent] = deque()
-        done = {"flag": False}
-
         async def listener(event: AgentEvent) -> None:
             queue.append(event)
-            if isinstance(event, AgentEndEvent):
-                done["flag"] = True
 
         unsubscribe = self.subscribe(listener)
         task = None
         try:
-            task = _create_task(self.prompt(text))
+            task = asyncio.create_task(self.prompt(text))
             while True:
                 if queue:
                     yield queue.popleft()
                     continue
-                if done["flag"] and not queue:
+                if task.done():
                     break
-                await _sleep_small()
+                await asyncio.sleep(0.01)
         finally:
             unsubscribe()
             if task is not None:
-                await task
+                if not task.done():
+                    self.abort()
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    await task
 
 
 def _user_input(text: str, images: Optional[List[Any]]) -> UserMessage:
@@ -230,18 +235,6 @@ def _user_input(text: str, images: Optional[List[Any]]) -> UserMessage:
         content: Any = ([TextContent(text=text)] if text else []) + list(images)
         return UserMessage(content=content, timestamp=_now_ms())
     return UserMessage(content=text, timestamp=_now_ms())
-
-
-def _create_task(coro: Any) -> Any:
-    import asyncio
-
-    return asyncio.ensure_future(coro)
-
-
-async def _sleep_small() -> None:
-    import asyncio
-
-    await asyncio.sleep(0.01)
 
 
 def _sync_messages(agent: "Agent", new_messages: List[Any]) -> List[Any]:
