@@ -97,8 +97,8 @@ def truncate_head(content: str, max_lines: int = DEFAULT_MAX_LINES, max_bytes: i
         output_lines.append(line)
         output_bytes_count += line_bytes
 
-    if len(output_lines) >= max_lines and output_bytes_count <= max_bytes:
-        truncated_by = "lines"
+    if truncated_by != "bytes":
+        truncated_by = "lines" if len(output_lines) < total_lines else "bytes"
 
     output_content = "\n".join(output_lines)
     return TruncationResult(
@@ -154,8 +154,8 @@ def truncate_tail(content: str, max_lines: int = DEFAULT_MAX_LINES, max_bytes: i
         output_lines.insert(0, line)
         output_bytes_count += line_bytes
 
-    if len(output_lines) >= max_lines and output_bytes_count <= max_bytes:
-        truncated_by = "lines"
+    if truncated_by != "bytes":
+        truncated_by = "lines" if len(output_lines) < total_lines else "bytes"
 
     output_content = "\n".join(output_lines)
     return TruncationResult(

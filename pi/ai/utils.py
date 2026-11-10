@@ -168,7 +168,7 @@ def _validate_value(tool_name: str, value: Any, schema: Dict[str, Any], path: st
         if not _type_matches(value, expected):
             raise ValueError(f"{path}: expected {expected}, got {_type_name(value)}")
 
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(value, option) for option in schema["enum"]):
         raise ValueError(f"{path}: must be one of {schema['enum']!r}")
 
     if expected == "object" or (expected is None and isinstance(value, dict)):
@@ -179,11 +179,22 @@ def _validate_value(tool_name: str, value: Any, schema: Dict[str, Any], path: st
         for key, item in value.items():
             if key in properties:
                 _validate_value(tool_name, item, properties[key], path=f"{path}.{key}")
-    elif expected == "array":
+    elif expected == "array" or (expected is None and isinstance(value, list)):
         items = schema.get("items")
         if items:
             for index, item in enumerate(value):
                 _validate_value(tool_name, item, items, path=f"{path}[{index}]")
+
+
+def _json_equal(left: object, right: object) -> bool:
+    """Compare JSON values without Python's boolean/number equivalence."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def _type_matches(value: Any, expected: str) -> bool:
