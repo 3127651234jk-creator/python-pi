@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import os
 import shutil
 import signal
@@ -104,34 +105,50 @@ class OutputAccumulator:
     """Collect streamed output; tail-truncate snapshots; persist overflow."""
 
     def __init__(self) -> None:
-        self._chunks: list = []
-        self._bytes = 0
-        self._full_output_path: Optional[str] = None
-        self._persisted_bytes = 0
+        self._tail = ""
+        self._prefix = ""
+        self._total_bytes = 0
+        self._newlines = 0
+        self._last_character = ""
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._log = tempfile.NamedTemporaryFile(prefix="pi-py-bash-", suffix=".log", delete=False)
+        self._closed = False
+        self._truncated = False
 
     def append(self, data: bytes) -> None:
-        self._chunks.append(data)
-        self._bytes += len(data)
-        if self._full_output_path is not None:
-            with open(self._full_output_path, "ab") as handle:
-                handle.write(data)
-            self._persisted_bytes += len(data)
+        self._log.write(data)
+        self._collect(self._decoder.decode(data))
+
+    def _collect(self, text: str) -> None:
+        self._total_bytes += len(text.encode("utf-8"))
+        self._newlines += text.count("\n")
+        if text:
+            self._last_character = text[-1]
+        self._prefix += text[:max(0, STRUCTURED_OUTPUT_MAX_BYTES - len(self._prefix))]
+        # Twice the byte limit in characters retains enough complete lines to
+        # apply truncate_tail without treating the retained boundary as a line.
+        self._tail = (self._tail + text)[-2 * DEFAULT_MAX_BYTES:]
 
     def snapshot(self) -> Tuple[str, TruncationResult, Optional[str]]:
-        content = b"".join(self._chunks).decode("utf-8", errors="replace")
-        truncation = truncate_tail(content)
-        full_output_path = self._full_output_path
-        if truncation.truncated and full_output_path is None:
-            handle = tempfile.NamedTemporaryFile(prefix="pi-py-bash-", suffix=".log", delete=False)
-            handle.write(b"".join(self._chunks))
-            handle.close()
-            full_output_path = handle.name
-            self._full_output_path = full_output_path
-            self._persisted_bytes = self._bytes
-        return content, truncation, full_output_path
+        truncation = truncate_tail(self._tail)
+        total_lines = self._newlines + int(bool(self._last_character) and self._last_character != "\n")
+        if total_lines > DEFAULT_MAX_LINES or self._total_bytes > DEFAULT_MAX_BYTES:
+            truncation.truncated = True
+        truncation.total_lines = total_lines
+        truncation.total_bytes = self._total_bytes
+        self._truncated = truncation.truncated
+        if not self._closed:
+            self._log.flush()
+        return self._prefix, truncation, self._log.name if truncation.truncated else None
 
     def close(self) -> None:
-        pass
+        if not self._closed:
+            self._collect(self._decoder.decode(b"", final=True))
+            self.snapshot()
+            self._log.close()
+            self._closed = True
+            if not self._truncated:
+                os.unlink(self._log.name)
 
 
 def _shell_command(command: str) -> Tuple[list, bool]:
@@ -153,7 +170,7 @@ def _kill_tree(pid: int) -> None:
         if sys.platform == "win32":
             os.system(f"taskkill /F /T /PID {pid} >nul 2>&1")
         else:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -213,60 +230,81 @@ def create_bash_tool(
                 )
             )
 
-        argv, _ = (shell_command or _shell_command)(command)
-        started_at = time.monotonic()
-        timed_out = False
-        aborted = False
-
-        if sys.platform != "win32":
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        assert proc.stdout is not None
-
-        async def read_stream() -> None:
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    return
-                handle_data(chunk)
-
-        read_task = asyncio.ensure_future(read_stream())
         try:
-            await asyncio.sleep(0)
-            while True:
-                if signal is not None and getattr(signal, "aborted", False):
-                    aborted = True
-                    break
-                if proc.returncode is not None:
-                    break
-                if timeout is not None and (time.monotonic() - started_at) > timeout:
-                    timed_out = True
-                    break
+            argv, _ = (shell_command or _shell_command)(command)
+            started_at = time.monotonic()
+            timed_out = False
+            aborted = False
+
+            if sys.platform != "win32":
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            assert proc.stdout is not None
+
+            async def read_stream() -> None:
+                while True:
+                    chunk = await proc.stdout.read(4096)
+                    if not chunk:
+                        return
+                    handle_data(chunk)
+
+            read_task = asyncio.ensure_future(read_stream())
+            wait_task = asyncio.ensure_future(proc.wait())
+            try:
+                await asyncio.sleep(0)
+                while True:
+                    if signal is not None and getattr(signal, "aborted", False):
+                        aborted = True
+                        break
+                    if proc.returncode is not None and read_task.done():
+                        read_task.result()
+                        break
+                    if timeout is not None and (time.monotonic() - started_at) > timeout:
+                        timed_out = True
+                        break
+                    try:
+                        await asyncio.wait({read_task} if proc.returncode is not None else {wait_task}, timeout=0.1)
+                    except asyncio.TimeoutError:
+                        pass
+                    await maybe_emit_update()
+            finally:
+                if aborted or timed_out or proc.returncode is None:
+                    _kill_tree(proc.pid)
+                    if proc.returncode is None:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
+                        except asyncio.TimeoutError:
+                            proc.kill()
                 try:
-                    await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=0.1)
-                except asyncio.TimeoutError:
-                    pass
-                await maybe_emit_update()
+                    if aborted or timed_out or proc.returncode is None:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(read_task), timeout=0.2)
+                        except asyncio.TimeoutError:
+                            # A descendant may retain the pipe after its parent exits.
+                            # Stop reading and close our pipe rather than wait forever.
+                            read_task.cancel()
+                            proc.stdout._transport.close()
+                            await asyncio.gather(read_task, return_exceptions=True)
+                    else:
+                        await read_task
+                finally:
+                    if not wait_task.done():
+                        wait_task.cancel()
+                    await asyncio.gather(wait_task, return_exceptions=True)
+
         finally:
-            if aborted or timed_out or proc.returncode is None:
-                _kill_tree(proc.pid)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    proc.kill()
-            await read_task
             output.close()
 
         content, truncation, full_path = output.snapshot()
@@ -293,9 +331,9 @@ def create_bash_tool(
             return f"{t}\n\n{status}" if t else status
 
         if aborted:
-            raise RuntimeError(append_status(content, "Command aborted"))
+            raise RuntimeError(append_status(text, "Command aborted"))
         if timed_out:
-            raise RuntimeError(append_status(content, f"Command timed out after {timeout} seconds"))
+            raise RuntimeError(append_status(text, f"Command timed out after {timeout} seconds"))
 
         exit_code = proc.returncode
         wall_time_seconds = round(time.monotonic() - started_at, 1)
