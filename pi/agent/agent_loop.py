@@ -7,6 +7,7 @@ messages throughout and converts to LLM messages only at the stream boundary.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
@@ -408,7 +409,7 @@ def _build_stream_options(config: AgentLoopConfig, api_key: Optional[str], signa
 
 
 async def _maybe_await(value: Any) -> Any:
-    if asyncio.iscoroutine(value):
+    if inspect.isawaitable(value):
         return await value
     return value
 
@@ -783,7 +784,7 @@ async def execute_prepared_tool_call(
 
     async def sink(partial_result: AgentToolResult) -> None:
         if accepting_updates:
-            update_tasks.append(_maybe_await(on_update(partial_result)))
+            update_tasks.append(asyncio.create_task(_maybe_await(on_update(partial_result))))
 
     tool: AgentTool = prepared["tool"]
     try:
@@ -802,6 +803,13 @@ async def execute_prepared_tool_call(
         if update_tasks:
             await asyncio.gather(*update_tasks)
         return {"result": create_error_tool_result(str(exc)), "is_error": True}
+    finally:
+        accepting_updates = False
+        for task in update_tasks:
+            if not task.done():
+                task.cancel()
+        if update_tasks:
+            await asyncio.gather(*update_tasks, return_exceptions=True)
 
 
 async def finalize_executed_tool_call(
