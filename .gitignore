@@ -3,6 +3,7 @@ __pycache__/
 .pytest-tmp/
 .pytest-tmp2/
 .pytest-review-tmp/
+.pytest-review-jobs/
 .pytest_cache/
 *.egg-info/
 build/
