@@ -107,3 +107,32 @@ def test_parent_exit_does_not_disable_interrupts(tmp_path, abort):
         assert loop.time() - start < 1.5
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("timeout", [True, False, float("nan"), float("inf"), -float("inf"), 0, -1, "1", 10 ** 1000])
+def test_invalid_timeout_rejected_before_start(tmp_path, timeout):
+    def shell(command):
+        pytest.fail("Invalid timeout must be rejected before launching a command")
+
+    tool = create_bash_tool(str(tmp_path), shell_command=shell)
+    with pytest.raises(ValueError, match="Invalid timeout"):
+        asyncio.run(tool.execute("test", {"command": "unused", "timeout": timeout}))
+
+
+@pytest.mark.parametrize("text", ["中", "😀", "a中😀"])
+def test_structured_prefix_is_bounded_utf8(text):
+    limit = bash_module.STRUCTURED_OUTPUT_MAX_BYTES
+    data = (text * limit).encode("utf-8")
+    output = OutputAccumulator()
+    try:
+        for offset in range(0, len(data), 4096):
+            output.append(data[offset:offset + 4096])
+        output.append(b"suffix")
+        output.close()
+        prefix, _, _ = output.snapshot()
+        assert len(prefix.encode("utf-8")) <= limit
+        assert prefix == data[:limit].decode("utf-8", errors="ignore")
+        assert "\ufffd" not in prefix
+    finally:
+        output.close()
+        os.unlink(output._log.name)

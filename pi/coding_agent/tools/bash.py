@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import codecs
+import math
 import os
 import shutil
 import signal
@@ -106,7 +107,7 @@ class OutputAccumulator:
 
     def __init__(self) -> None:
         self._tail = ""
-        self._prefix = ""
+        self._prefix = bytearray()
         self._total_bytes = 0
         self._newlines = 0
         self._last_character = ""
@@ -120,11 +121,12 @@ class OutputAccumulator:
         self._collect(self._decoder.decode(data))
 
     def _collect(self, text: str) -> None:
-        self._total_bytes += len(text.encode("utf-8"))
+        encoded = text.encode("utf-8")
+        self._total_bytes += len(encoded)
         self._newlines += text.count("\n")
         if text:
             self._last_character = text[-1]
-        self._prefix += text[:max(0, STRUCTURED_OUTPUT_MAX_BYTES - len(self._prefix))]
+        self._prefix.extend(encoded[:max(0, STRUCTURED_OUTPUT_MAX_BYTES - len(self._prefix))])
         # Twice the byte limit in characters retains enough complete lines to
         # apply truncate_tail without treating the retained boundary as a line.
         self._tail = (self._tail + text)[-2 * DEFAULT_MAX_BYTES:]
@@ -139,7 +141,7 @@ class OutputAccumulator:
         self._truncated = truncation.truncated
         if not self._closed:
             self._log.flush()
-        return self._prefix, truncation, self._log.name if truncation.truncated else None
+        return self._prefix.decode("utf-8", errors="ignore"), truncation, self._log.name if truncation.truncated else None
 
     def close(self) -> None:
         if not self._closed:
@@ -193,7 +195,12 @@ def create_bash_tool(
         if signal is not None and getattr(signal, "aborted", False):
             raise RuntimeError("Command aborted")
         if timeout is not None:
-            if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > MAX_TIMEOUT_SECONDS:
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not 0 < timeout <= MAX_TIMEOUT_SECONDS
+                or not math.isfinite(timeout)
+            ):
                 raise ValueError("Invalid timeout: must be a positive number of seconds")
         if command_prefix:
             command = f"{command_prefix}\n{command}"
@@ -341,7 +348,7 @@ def create_bash_tool(
             raise RuntimeError(append_status(text, "Command terminated without an exit code"))
 
         structured_content = {
-            "output": content[:STRUCTURED_OUTPUT_MAX_BYTES],
+            "output": content,
             "truncated": truncation.truncated,
             "exit_code": exit_code,
             "wall_time_seconds": wall_time_seconds,
