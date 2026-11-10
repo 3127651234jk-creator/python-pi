@@ -27,6 +27,7 @@ from .types import (
     EntryRecord,
     Page,
     SubmissionRecord,
+    StoredDocument,
     TaskDefinition,
     TaskRecord,
     TaskState,
@@ -51,10 +52,12 @@ class TransactionScope:
 class DocDraft:
     """Mutable document value staged inside one transaction."""
 
-    def __init__(self, definition: DocDefinition, record: Optional[DocumentRecord], value: Dict[str, Any]) -> None:
+    def __init__(self, definition: DocDefinition, record: Optional[DocumentRecord], value: Dict[str, Any],
+                 address: Dict[str, Any]) -> None:
         self.definition = definition
         self.record = record
         self.value = value
+        self.address = address
         self.dirty = False
         self.retired = False
 
@@ -77,6 +80,8 @@ class Transaction:
         self._created_conversations: List[ConversationRecord] = []
         self._created_tasks: List[TaskRecord] = []
         self._doc_drafts: List[DocDraft] = []
+        self._drafts_by_address: Dict[str, DocDraft] = {}
+        self._retired_documents: Dict[int, DocumentRecord] = {}
         self._pending_submission_updates: Dict[int, SubmissionRecord] = {}
         self._closed = False
 
@@ -313,28 +318,33 @@ class Transaction:
     async def doc(self, definition: DocDefinition, *args: Any) -> DocDraft:
         self._before_table_read()
         address_id, address, next_index = resolve_address(definition, list(args))
-        for draft in self._doc_drafts:
-            if draft.definition is definition and draft.record is not None:
-                pass
+        if address_id in self._drafts_by_address:
+            return self._drafts_by_address[address_id]
         loaded = await self._host.load_document(definition, address)
         if loaded is None:
             seed = args[next_index] if definition.family and next_index < len(args) else None
             if definition.family:
                 seed = args[next_index] if next_index < len(args) else None
-            draft = DocDraft(definition=definition, record=None, value=initial_value(definition, seed))
+            draft = DocDraft(definition=definition, record=None, value=initial_value(definition, seed), address=address)
         else:
             check_record_scope(definition, loaded.record)
             check_record_version(definition, loaded.record, loaded.stored_version)
-            value = materialize_document(definition, loaded)
-            draft = DocDraft(definition=definition, record=loaded.record, value=value)
+            value = materialize_document(definition, StoredDocument(
+                record=loaded.record, version=loaded.stored_version, value=loaded.value))
+            draft = DocDraft(definition=definition, record=loaded.record, value=value, address=address)
         self._doc_drafts.append(draft)
+        self._drafts_by_address[address_id] = draft
         return draft
 
     async def retire_doc(self, definition: DocDefinition, *args: Any) -> None:
         self._before_table_read()
-        _address_id, address, _next = resolve_address(definition, list(args))
+        address_id, address, _next = resolve_address(definition, list(args))
+        draft = self._drafts_by_address.get(address_id)
+        if draft is not None:
+            draft.retired = True
         record = await self._host.storage.find_document(address, "current")
         if record is not None:
+            self._retired_documents[record.id] = record
             self._writes.append(write_document_retire(record.id))
             self._mark_table_write()
 
@@ -356,7 +366,8 @@ class Transaction:
                 record = DocumentRecord(
                     id=rid,
                     kind=draft.definition.kind,
-                    scope=self._scope_for_definition(draft.definition),
+                    scope=dict(draft.address["scope"]),
+                    key=draft.address["key"],
                     history=None,
                     fork=None,
                 )
@@ -414,6 +425,8 @@ class Transaction:
         return changes
 
     def _record_of(self, rid: int) -> DocumentRecord:
+        if rid in self._retired_documents:
+            return self._retired_documents[rid]
         for draft in self._doc_drafts:
             if draft.record is not None and draft.record.id == rid:
                 return draft.record

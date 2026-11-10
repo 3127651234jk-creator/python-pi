@@ -9,6 +9,7 @@ historical bases.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -114,7 +115,9 @@ def initial_value(definition: DocDefinition, seed: Any) -> Dict[str, Any]:
 
 def materialize_document(definition: DocDefinition, stored: StoredDocument) -> Dict[str, Any]:
     """Return the document value, migrating when the stored version is older."""
-    value = stored.value
+    check_record_scope(definition, stored.record)
+    check_record_version(definition, stored.record, stored.version)
+    value = deepcopy(stored.value)
     if stored.version < definition.version and definition.migrate is not None:
         value = definition.migrate(dict(value), stored.version)
     return value
