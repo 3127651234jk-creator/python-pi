@@ -71,6 +71,15 @@ def test_grep_literal_case_context_glob_and_limit(files):
         execute(files, "grep", {"pattern": "x", "path": "missing"})
 
 
+def test_grep_glob_with_numeric_path_segments(tmp_path):
+    root = tmp_path / "project-123-copy"
+    root.mkdir()
+    (root / "a.py").write_text("needle\nneedle\n", encoding="utf-8")
+    result = execute(root, "grep", {"pattern": "needle", "glob": "*.py", "limit": 1})
+    assert "a.py:1:needle" in result.content[0].text
+    assert result.details["resultLimitReached"]
+
+
 def test_abort_and_missing_executables(files, monkeypatch):
     async def abort_check():
         signal = AbortSignal()

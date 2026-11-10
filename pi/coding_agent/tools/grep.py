@@ -33,12 +33,15 @@ def create_grep_tool(cwd: str) -> AgentTool:
         if params.get("literal"):
             args.append("--fixed-strings")
         def include(line: str) -> bool:
-            match = re.match(r"^(.*?)(?::\d+:|-\d+-)", line)
-            if match is None:
-                return False
-            filename = match.group(1)
-            relative = os.path.relpath(filename, root) if os.path.isdir(root) else os.path.basename(filename)
-            return matches_glob(relative, params["glob"])
+            # A directory may itself contain a context-like separator (-123-).
+            # Only a separator following an actual file ends the path field.
+            for match in re.finditer(r"(?::\d+:|-\d+-)", line):
+                filename = line[:match.start()]
+                if not os.path.isfile(filename):
+                    continue
+                relative = os.path.relpath(filename, root) if os.path.isdir(root) else os.path.basename(filename)
+                return matches_glob(relative, params["glob"])
+            return False
         # -e protects patterns beginning with '-' from option interpretation.
         args.extend(["-e", params["pattern"], "--", root])
         return await run_rg(cwd, args, limit, signal, matches=True,
