@@ -287,6 +287,9 @@ class Transaction:
         self._pending_submission_updates[sid] = record
 
     def _staged_or_none(self, sid: int) -> Optional[SubmissionRecord]:
+        pending = self._pending_submission_updates.get(sid)
+        if pending is not None:
+            return pending
         for write in self._writes:
             if write["type"] == "submission" and write["value"].id == sid:
                 return write["value"]

@@ -52,11 +52,15 @@ class RpcClient:
         request_id = str(self.sequence)
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
-        try:
+
+        async def send_and_receive():
             async with self.lock:
                 self.process.stdin.write((json.dumps({**params, "id": request_id, "type": command}) + "\n").encode())
                 await self.process.stdin.drain()
-            response = await asyncio.wait_for(future, timeout)
+            return await future
+
+        try:
+            response = await asyncio.wait_for(send_and_receive(), timeout)
             if not response["success"]:
                 raise RuntimeError(response.get("error", "RPC command failed"))
             return response.get("data")

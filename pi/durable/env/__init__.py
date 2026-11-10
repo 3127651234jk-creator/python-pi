@@ -14,6 +14,7 @@ Porting deviations from the TS env:
 from __future__ import annotations
 
 import asyncio
+import codecs
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Union
 
@@ -366,39 +367,9 @@ class _RangeDecoder:
             text, self._pending = self._pending.decode("utf-8", "replace"), b""
             return text
         buffered = self._pending + data
-        consumed = _safe_prefix_length(buffered)
-        text = buffered[:consumed].decode("utf-8", "replace")
+        text, consumed = codecs.utf_8_decode(buffered, "replace", False)
         self._pending = buffered[consumed:]
         return text
-
-
-def _safe_prefix_length(buffered: bytes) -> int:
-    """Length of the prefix that decodes without seeing future bytes.
-
-    An incomplete trailing sequence is held back; everything else decodes now,
-    with invalid sequences replaced like the WHATWG decoder does.
-    """
-    n = len(buffered)
-    continuation = 0
-    while continuation < n and (buffered[n - 1 - continuation] & 0xC0) == 0x80:
-        continuation += 1
-    if continuation == 0:
-        return n
-    if continuation == n:
-        # Only continuation bytes: no lead byte to complete; they are all invalid.
-        return n
-    lead = buffered[n - 1 - continuation]
-    if 0xC2 <= lead <= 0xDF:
-        needed = 2
-    elif 0xE0 <= lead <= 0xEF:
-        needed = 3
-    elif 0xF0 <= lead <= 0xF4:
-        needed = 4
-    else:
-        return n  # invalid lead byte: replaced immediately, nothing held back
-    if continuation < needed:
-        return n - 1 - continuation  # hold the incomplete sequence
-    return n
 
 
 def starts_with_bom(first_bytes: bytes) -> bool:

@@ -9,11 +9,13 @@ got. Other files, and other file systems, never wait. Not a lock against
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Optional
+from weakref import WeakValueDictionary
 
 from ..env import Context, ExecutionEnv, Result, get_or_throw
 
-_QUEUES: Dict[str, asyncio.Lock] = {}
+# Holders and queued callers keep their lock alive until they leave.
+_QUEUES: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 _GUARD: Optional[asyncio.Lock] = None
 
 
@@ -60,10 +62,4 @@ async def with_file_mutation_queue(
             lock = asyncio.Lock()
             _QUEUES[key] = lock
     async with lock:
-        try:
-            return await fn()
-        finally:
-            async with _guard():
-                # Only the current holder cleans up, so a queued waiter never drops a fresh lock.
-                if _QUEUES.get(key) is lock and not lock.locked():
-                    _QUEUES.pop(key, None)
+        return await fn()

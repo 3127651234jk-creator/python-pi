@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Optional
+from weakref import WeakValueDictionary
 
 IMAGE_MIME_TYPES = {
     ".jpg": "image/jpeg",
@@ -31,7 +32,8 @@ def detect_image_mime_type(path: str):
     return IMAGE_MIME_TYPES.get(os.path.splitext(path)[1].lower())
 
 
-_MUTATION_LOCKS: Dict[str, asyncio.Lock] = {}
+# Hold locks strongly only while a holder or queued caller needs them.
+_MUTATION_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 _LOCKS_GUARD: Optional[asyncio.Lock] = None
 
 
