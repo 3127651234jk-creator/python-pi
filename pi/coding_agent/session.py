@@ -330,7 +330,17 @@ class SessionManager:
         self._validate_branch(branch)
         self.start_new()
         for entry in branch:
-            if entry.message is not None:
+            if entry.message is not None and entry.custom is not None:
+                copied = SessionEntry(uuid.uuid4().hex, self.leaf_id, entry.message, entry.custom,
+                                      timestamp=entry.timestamp)
+                self._write({"type": "custom_message", "id": copied.id, "parent_id": copied.parent_id,
+                             "timestamp": copied.timestamp, "customType": copied.custom["kind"],
+                             "display": copied.custom["data"].get("display", True),
+                             "details": copied.custom["data"].get("details"),
+                             "message": _to_dict(copied.message)})
+                self.entries.append(copied)
+                self.leaf_id = copied.id
+            elif entry.message is not None:
                 self.append(entry.message)
             elif entry.custom is not None:
                 self.append_custom(entry.custom["kind"], entry.custom["data"])

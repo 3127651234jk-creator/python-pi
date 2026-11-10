@@ -77,6 +77,29 @@ def test_latest_session_file(tmp_path):
     assert latest != first
 
 
+def test_custom_message_can_start_session(tmp_path):
+    manager = SessionManager(str(tmp_path))
+    entry_id = manager.append_custom_message("notice", "first", display=False, details={"source": "extension"})
+    assert manager.leaf_id == entry_id
+    assert len(manager.entries) == 1
+    reader = SessionManager(str(tmp_path))
+    reader.load(manager.session_file)
+    assert reader.entries == manager.entries
+
+
+def test_fork_preserves_custom_message_metadata(tmp_path):
+    manager = SessionManager(str(tmp_path))
+    manager.start_new()
+    manager.append_custom_message("notice", "hidden", display=False, details={"source": "extension"})
+    original = manager.entries[0]
+    manager.fork()
+    assert manager.entries[0].custom == original.custom
+    assert manager.messages() == [original.message]
+    reader = SessionManager(str(tmp_path))
+    reader.load(manager.session_file)
+    assert reader.entries[0].custom == original.custom
+
+
 def test_tree_branches_survive_reopen(tmp_path):
     manager = SessionManager(str(tmp_path))
     root = manager.append(UserMessage(content="root", timestamp=0))
