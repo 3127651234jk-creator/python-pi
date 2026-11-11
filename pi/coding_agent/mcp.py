@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 
 from ..agent.types import AgentTool, AgentToolResult
+from ..ai.models import ModelError
 from ..ai.types import TextContent, ImageContent
 from .config import Configuration, read_json, write_json
 from .model_registry import expand, validate_url
@@ -550,7 +551,8 @@ class McpManager:
                     # A list_changed notification raced the connect; list again now that
                     # the client is registered.
                     await self.ensure_tools(name)
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError, asyncio.TimeoutError, httpx.HTTPError) as exc:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError, ModelError,
+                    asyncio.TimeoutError, httpx.HTTPError) as exc:
                 self.errors[name] = str(exc) or type(exc).__name__
                 if client:
                     await client.close()

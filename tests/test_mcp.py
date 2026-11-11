@@ -44,6 +44,38 @@ for line in sys.stdin:
     asyncio.run(check())
 
 
+def test_invalid_server_config_is_reported_not_raised(tmp_path, monkeypatch):
+    """One bad server must be skipped; the rest of the reload keeps going."""
+    monkeypatch.delenv("PI_M5_MISSING", raising=False)
+    script = tmp_path / "server.py"
+    script.write_text('''import sys,json
+for line in sys.stdin:
+    req=json.loads(line)
+    if "id" not in req: continue
+    result={"protocolVersion":"2025-03-26"} if req["method"]=="initialize" else {"tools":[]}
+    print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":result}),flush=True)
+''', encoding="utf-8")
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "bad-url": {"url": "notaurl"},
+        "bad-env": {"command": sys.executable, "env": {"TOKEN": "${PI_M5_MISSING}"}},
+        "good": {"command": sys.executable, "args": [str(script)]},
+    }})
+
+    async def check():
+        manager = McpManager(config)
+        try:
+            await manager.reload()
+            assert "HTTP(S) URL" in manager.errors["bad-url"]
+            assert "PI_M5_MISSING" in manager.errors["bad-env"]
+            assert "good" in manager.clients
+            assert "good" not in manager.errors
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
+
+
 def test_http_session_and_error_mapping(tmp_path, monkeypatch):
     requests = []
 
