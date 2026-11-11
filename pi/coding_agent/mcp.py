@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -832,15 +833,16 @@ class McpManager:
         lock = self._refresh_locks.setdefault(server, asyncio.Lock())
         async with lock:
             namespace = re.sub(r"[^A-Za-z0-9_]", "_", server)
-            before = len(self.tools)
-            self.tools = [tool for tool in self.tools if getattr(tool, "_mcp_server", None) != server]
+            before = [(tool.name, tool.description, tool.parameters) for tool in self.tools]
             if client.tools_changed or not client.tools:
                 await client.list_tools()
                 client.tools_changed = False
+            self.tools = [tool for tool in self.tools if getattr(tool, "_mcp_server", None) != server]
             self._register_server_tools(namespace, client)
             self.lazy_servers.discard(server)
-            if self.on_tools_changed is not None and len(self.tools) != before:
-                await _maybe_call(self.on_tools_changed)
+            after = [(tool.name, tool.description, tool.parameters) for tool in self.tools]
+            if self.on_tools_changed is not None and after != before:
+                await _maybe_call(self.on_tools_changed, server)
 
     async def refresh_changed(self) -> bool:
         """Re-list tools for servers that reported notifications/tools/list_changed."""
@@ -877,5 +879,5 @@ class McpManager:
 
 async def _maybe_call(fn, *args):
     result = fn(*args)
-    if asyncio.iscoroutine(result):
+    if inspect.isawaitable(result):
         await result

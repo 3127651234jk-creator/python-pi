@@ -65,13 +65,13 @@ def normalize_context(context: TranscriptContext) -> Tuple[Optional[SystemMessag
             if message.sections:
                 for name, section in message.sections.items():
                     sections[name] = section
+            for ref in message.tools_removed or []:
+                removed.add(ref.name)
+                tools = [t for t in tools if t.name != ref.name]
             for tool in message.tools_added or []:
                 removed.discard(tool.name)
                 tools = [t for t in tools if t.name != tool.name]
                 tools.append(tool)
-            for ref in message.tools_removed or []:
-                removed.add(ref.name)
-                tools = [t for t in tools if t.name != ref.name]
         else:
             rest.append(message)
 
@@ -111,13 +111,13 @@ def _replay_system(messages: List[Message]) -> Tuple[List[str], Dict[str, Option
         if message.sections:
             for name, section in message.sections.items():
                 sections[name] = section
+        for ref in message.tools_removed or []:
+            removed.add(ref.name)
+            tools = [t for t in tools if t.name != ref.name]
         for tool in message.tools_added or []:
             removed.discard(tool.name)
             tools = [t for t in tools if t.name != tool.name]
             tools.append(tool)
-        for ref in message.tools_removed or []:
-            removed.add(ref.name)
-            tools = [t for t in tools if t.name != ref.name]
     return prompt_parts, sections, tools, removed
 
 
@@ -125,8 +125,13 @@ def get_tool_state_changes(declared: List[Tool], executable: List[Tool]) -> Tool
     """Diff tools declared in the transcript against the executable set."""
     declared_names = {t.name for t in declared}
     executable_names = {t.name for t in executable}
-    added = [t for t in executable if t.name not in declared_names]
-    removed = [ToolReference(name=n) for n in sorted(declared_names - executable_names)]
+    previous = {t.name: t for t in declared}
+    changed = {t.name for t in executable if t.name in previous and not _json_equal(
+        [previous[t.name].description, previous[t.name].parameters, previous[t.name].hosted],
+        [t.description, t.parameters, t.hosted],
+    )}
+    added = [t for t in executable if t.name not in declared_names or t.name in changed]
+    removed = [ToolReference(name=n) for n in sorted((declared_names - executable_names) | changed)]
     return ToolStateChanges(tools_added=added, tools_removed=removed)
 
 
