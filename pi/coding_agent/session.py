@@ -269,7 +269,8 @@ class SessionManager:
             if message is None:
                 continue  # custom entries carry no tool protocol state
             if message.role == "assistant":
-                pending.update(block.id for block in message.content if isinstance(block, ToolCall))
+                pending.update(block.id for block in message.content
+                               if isinstance(block, ToolCall) and block.raw_item is None)
             elif isinstance(message, ToolResultMessage):
                 pending.discard(message.tool_call_id)
         if pending:
@@ -350,16 +351,17 @@ class SessionManager:
         """Active branch as JSONL records (same shape as a .jsonl export)."""
         records = [{"type": "name", "name": self.name}]
         for entry in self.get_branch():
+            common = {"id": entry.id, "parent_id": entry.parent_id, "timestamp": entry.timestamp}
             if entry.custom is not None and entry.message is None:
-                records.append({"type": "custom", "id": entry.id, "parent_id": entry.parent_id,
+                records.append({"type": "custom", **common,
                                 "customType": entry.custom["kind"], "data": entry.custom["data"]})
             elif entry.custom is not None:
-                records.append({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
+                records.append({"type": "custom_message", **common,
                                 "customType": entry.custom["kind"], "display": entry.custom["data"].get("display", True),
                                 "details": entry.custom["data"].get("details"),
                                 "message": _to_dict(entry.message)})
             else:
-                records.append({"type": "message", "id": entry.id, "parent_id": entry.parent_id,
+                records.append({"type": "message", **common,
                                 "message": _to_dict(entry.message)})
         return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
 

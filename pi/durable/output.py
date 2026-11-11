@@ -278,10 +278,10 @@ def _safe_length(buffered: bytes) -> int:
     continuation = 0
     while continuation < n and (buffered[n - 1 - continuation] & 0xC0) == 0x80:
         continuation += 1
-    if continuation == 0 or continuation == n:
+    if continuation == n:
         return n
     lead = buffered[n - 1 - continuation]
     needed = 2 if 0xC2 <= lead <= 0xDF else 3 if 0xE0 <= lead <= 0xEF else 4 if 0xF0 <= lead <= 0xF4 else 0
-    if needed == 0 or continuation >= needed:
+    if needed == 0 or continuation + 1 >= needed:
         return n
     return n - 1 - continuation

@@ -200,7 +200,8 @@ def entry_to_ts(entry: SessionEntry) -> dict:
     if entry.message is not None and entry.custom is not None:
         result = {"type": "custom_message", **common,
                   "customType": entry.custom["kind"],
-                  "content": content_blocks_to_ts(entry.message.content),
+                  "content": entry.message.content if isinstance(entry.message.content, str)
+                             else content_blocks_to_ts(entry.message.content),
                   "display": entry.custom["data"].get("display", True)}
         details = entry.custom["data"].get("details")
         if details is not None:

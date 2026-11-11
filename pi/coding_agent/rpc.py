@@ -306,9 +306,11 @@ class RpcServer:
                             for key, entry in totals.by_model.items()},
             }
         elif kind == "get_last_assistant_text":
-            texts = [block.text for message in self.agent.messages if isinstance(message, AssistantMessage)
-                     for block in message.content if isinstance(block, TextContent)]
-            response["data"] = {"text": texts[-1] if texts else None}
+            last = next((message for message in reversed(self.agent.messages)
+                         if isinstance(message, AssistantMessage)
+                         and not (message.stop_reason == "aborted" and not message.content)), None)
+            text = "".join(block.text for block in last.content if isinstance(block, TextContent)) if last else ""
+            response["data"] = {"text": text.strip() or None}
         elif kind == "get_available_thinking_levels":
             response["data"] = {"levels": list(_THINKING_LEVELS)}
         elif kind == "set_thinking_level":
