@@ -2,6 +2,8 @@ import asyncio
 import io
 import json
 
+import pytest
+
 from pi.agent.agent import Agent
 from pi.ai.models import resolve_model
 from pi.ai.providers.faux import reset_script_index
@@ -56,6 +58,24 @@ def test_factory_tools_commands_reload_cleanup(tmp_path, capsys):
     captured = capsys.readouterr()
     assert not captured.out
     assert "extension loading log" in captured.err
+
+
+def test_failed_flag_application_rolls_back_loaded_extensions(tmp_path):
+    async def check():
+        config = Configuration(str(tmp_path), str(tmp_path / "user"))
+        directory = tmp_path / ".pi/extensions"
+        directory.mkdir(parents=True)
+        (directory / "demo.py").write_text(SOURCE, encoding="utf-8")
+        agent = Agent(resolve_model("faux"))
+        manager = ExtensionManager(config, agent, flag_values={"unknown_flag": "x"})
+        with pytest.raises(ValueError, match="Unknown option"):
+            await manager.reload()
+        assert not manager.extensions
+        assert not agent.tools
+        assert not manager.commands
+        assert not agent._listeners
+
+    asyncio.run(check())
 
 
 def test_tool_gate_runs_in_agent_loop(tmp_path, monkeypatch):

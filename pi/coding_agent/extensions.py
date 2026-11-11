@@ -486,12 +486,21 @@ class ExtensionManager:
         await self.close()
         self.output = ExtensionOutput(sys.stdout)
         sys.stdout = self.output
-        for path in self.paths():
-            if path.suffix in (".ts", ".mts", ".js", ".mjs"):
-                await self._load_remote(path)
-            else:
-                await self._load_python(path)
-        await self.apply_flag_values()
+        try:
+            for path in self.paths():
+                if path.suffix in (".ts", ".mts", ".js", ".mjs"):
+                    await self._load_remote(path)
+                else:
+                    await self._load_python(path)
+            await self.apply_flag_values()
+        except BaseException:
+            # Do not leave half-loaded extensions behind (tools installed,
+            # hooks missing): clean up before surfacing the failure.
+            try:
+                await self.close()
+            except BaseException:  # noqa: BLE001 - keep the original failure
+                pass
+            raise
         self.sync_providers()
         self.sync_virtual_models()
         async def event(event):

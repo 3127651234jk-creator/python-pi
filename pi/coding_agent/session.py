@@ -393,6 +393,8 @@ class SessionManager:
                 if not line:
                     continue
                 record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("Session line must be a JSON object")
                 kind = record.get("type")
                 if kind == "session":
                     # TypeScript pi session header; delegate to the TS reader.

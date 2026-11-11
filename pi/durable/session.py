@@ -111,7 +111,19 @@ class Session:
         changes.extend(documents)
         publication = CommitPublication(seq=seq, changes=changes)
         for listener in list(self._commit_listeners):
-            listener(publication)
+            try:
+                listener(publication)
+            except Exception as exc:  # noqa: BLE001 - listeners must not break the commit
+                # Storage already committed. Report the listener failure to the
+                # event loop instead of making the caller retry a commit that
+                # already happened.
+                try:
+                    asyncio.get_running_loop().call_exception_handler({
+                        "message": "durable commit listener failed",
+                        "exception": exc,
+                    })
+                except RuntimeError:
+                    pass
 
     def subscribe_commits(self, listener: Callable[[CommitPublication], None]) -> Callable[[], None]:
         self._assert_usable()

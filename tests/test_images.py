@@ -161,6 +161,16 @@ def test_resize_image_dimension_note():
     assert format_dimension_note(result) == expected
 
 
+def test_resize_image_clamps_extreme_aspect_ratio():
+    options = ImageResizeOptions(max_width=10, max_height=10)
+    wide = resize_image(large_png(1000, 1), "image/png", options)
+    assert wide is not None
+    assert (wide.width, wide.height) == (10, 1)
+    tall = resize_image(large_png(1, 1000), "image/png", options)
+    assert tall is not None
+    assert (tall.width, tall.height) == (1, 10)
+
+
 def test_resize_image_shrinks_until_under_max_bytes():
     result = resize_image(large_png(), "image/png", ImageResizeOptions(max_bytes=600))
     assert result is not None

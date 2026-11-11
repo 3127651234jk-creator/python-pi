@@ -9,12 +9,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from pi.ai.json_io import to_json
 from pi.ai.models import Model
 from pi.ai.providers import faux
-from pi.durable.entries import ASSISTANT_ENTRY, USER_ENTRY
+from pi.ai.types import AssistantMessage, TextContent, Usage, UserMessage
+from pi.agent.types import AgentToolResult
+from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
 from pi.durable.harness import Harness
 from pi.durable.session import create_session
 from pi.durable.storage import JsonlStorage
+from pi.durable.tasks import compact_definition
+from pi.durable.transaction import TransactionScope
+from pi.durable.types import TaskOutcome, TaskState, define_task
 
 
 def make_model() -> Model:
@@ -139,5 +145,163 @@ def test_abort_generation_leaves_unanswered(tmp_path):
         finally:
             os.environ.pop("FAUX_SCRIPT", None)
             faux.reset_script_index()
+
+    asyncio.run(scenario())
+
+
+def test_durable_tool_task_applies_prepare_arguments(tmp_path):
+    """pi.tool normalizes arguments exactly like the interactive tool pipeline."""
+
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, make_model())
+        seen = {}
+
+        class EchoTool:
+            prepare_arguments = staticmethod(lambda args: {"text": args["value"]})
+
+            async def execute(self, call_id, params, signal=None, on_update=None):
+                seen["params"] = params
+                return AgentToolResult(content=[TextContent(text=params["text"])], details={})
+
+        harness.register_tools({"echo": EchoTool()})
+        cid = await harness.create_conversation()
+        await harness.submit_tool_task(cid, "echo", {"value": "hi"})
+        await harness.run_pending_tasks()
+
+        assert seen["params"] == {"text": "hi"}
+        transcript = await harness.transcript(cid)
+        assert [entry.kind for entry in transcript] == [TOOL_RESULT_ENTRY.kind]
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_compact_cut_inside_last_entry_does_not_fault(tmp_path):
+    """A cut inside a multi-message entry snaps to the entry start instead of StopIteration."""
+
+    async def scenario():
+        faux.reset_script_index()
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"text": "summary"}])
+        try:
+            session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+            model = make_model()
+            model.context_window = 100
+            harness = Harness(session, model)
+            harness.register_definition(compact_definition(keep_recent_tokens=1, reserve_tokens=1))
+            cid = await harness.create_conversation()
+
+            def assistant(text):
+                return to_json(AssistantMessage(
+                    content=[TextContent(text=text)], api="faux", provider="faux", model="faux",
+                    usage=Usage(), stop_reason="stop", timestamp=0,
+                ))
+
+            async def change(tx):
+                await tx.append_entry(cid, {
+                    "kind": USER_ENTRY.kind, "model": [to_json(UserMessage(content="hi", timestamp=0))],
+                })
+                await tx.append_entry(cid, {
+                    "kind": ASSISTANT_ENTRY.kind,
+                    "model": [assistant("a" * 400), assistant("b" * 400)],
+                })
+
+            await session.commit(change)
+            task_id = await harness.submit_compact_task(cid)
+            await harness.run_pending_tasks()
+
+            record = await harness._get_task(task_id)
+            assert record.state.status == "terminal"
+            assert record.state.outcome.status == "completed"
+            assert record.state.outcome.result["compacted"] is True
+            transcript = await harness.transcript(cid)
+            assert transcript[-1].kind == COMPACTION_ENTRY.kind
+            await session.close()
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            faux.reset_script_index()
+
+    asyncio.run(scenario())
+
+
+def test_unreservable_task_faults_instead_of_crashing_the_scheduler(tmp_path):
+    """A version migration failure must fault the task, not escape every cycle."""
+
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, make_model())
+        cid = await harness.create_conversation()
+
+        async def finish(task, runtime, harness):
+            await runtime.commit(lambda tx, current: TaskState(status="terminal",
+                outcome=TaskOutcome(status="completed", result={})))
+
+        harness.register_definition(define_task(
+            name="pi.custom", version=1, initial=lambda value: {"phase": "run"},
+            phases={"run": finish}))
+        definition = harness.definitions["pi.custom"]
+
+        async def create(tx):
+            task = await tx.create_task(definition, {"x": 1},
+                {"ownership": {"kind": "conversation"}, "conversation_id": cid})
+            return task.id
+
+        task_id = await session.commit(create, TransactionScope(conversation_id=cid))
+
+        # A newer definition version makes the stored task unreservable.
+        harness.register_definition(define_task(
+            name="pi.custom", version=2, initial=lambda value: {"phase": "run"},
+            phases={"run": finish}))
+        await harness.run_pending_tasks()
+
+        record = await harness._get_task(task_id)
+        assert record.state.status == "terminal"
+        assert record.state.outcome.status == "faulted"
+        assert "migration" in record.state.outcome.error["message"]
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_scheduler_serializes_same_conversation(tmp_path):
+    """concurrency>1 runs different conversations in parallel but one task per conversation."""
+
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, make_model())
+        cid1 = await harness.create_conversation()
+        cid2 = await harness.create_conversation()
+        active = {}
+        peak = {}
+
+        async def run_phase(task, runtime, harness):
+            conversation = task.conversation_id
+            active[conversation] = active.get(conversation, 0) + 1
+            peak[conversation] = max(peak.get(conversation, 0), active[conversation])
+            await asyncio.sleep(0.02)
+            active[conversation] -= 1
+            await runtime.commit(lambda tx, current: TaskState(status="terminal",
+                outcome=TaskOutcome(status="completed", result={})))
+
+        harness.register_definition(define_task(
+            name="pi.custom", version=1, initial=lambda value: {"phase": "run"},
+            phases={"run": run_phase}))
+        definition = harness.definitions["pi.custom"]
+
+        async def create(conversation, value):
+            async def change(tx):
+                task = await tx.create_task(definition, {"x": value},
+                    {"ownership": {"kind": "conversation"}, "conversation_id": conversation})
+                return task.id
+
+            return await session.commit(change, TransactionScope(conversation_id=conversation))
+
+        await create(cid1, 1)
+        await create(cid1, 2)
+        await create(cid2, 3)
+        assert await harness.run_pending_tasks(concurrency=3) == 3
+        assert peak[cid1] == 1
+        assert peak[cid2] == 1
+        await session.close()
 
     asyncio.run(scenario())

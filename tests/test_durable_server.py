@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -89,6 +90,31 @@ def test_session_lifecycle_and_generation(tmp_path):
             await server.close()
             await manager.shutdown()
     asyncio.run(asyncio.wait_for(check(), 120))
+
+
+def test_worker_shutdown_exits_without_waiting_for_timeout(tmp_path):
+    """close_session must not stall for WORKER_STOP_TIMEOUT (5s) on every close."""
+
+    async def check():
+        root = str(tmp_path / "sessions")
+        manager = SessionWorkerManager(root, model_args=["--provider", "faux", "--model", "faux"])
+        server = Server(DurableServerHost(manager))
+        address = await server.start_tcp()
+        client = Client(server.server_id)
+        try:
+            await client.connect_tcp(*address[:2])
+            session_id = await _create_and_attach(server.server_id, client, str(tmp_path))
+            started = time.monotonic()
+            await manager.close_session(session_id)
+            elapsed = time.monotonic() - started
+            assert session_id not in manager.workers
+            assert elapsed < 3
+        finally:
+            await client.close()
+            await server.close()
+            await manager.shutdown()
+
+    asyncio.run(asyncio.wait_for(check(), 60))
 
 
 def test_worker_exit_monitoring_and_recovery(tmp_path):

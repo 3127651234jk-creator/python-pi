@@ -94,7 +94,7 @@ def is_bmp(data: bytes) -> bool:
 def detect_supported_image_mime_type(buffer: bytes) -> Optional[str]:
     """Supported image MIME type of the bytes, or ``None`` (animated PNG counts as unsupported)."""
     if starts_with(buffer, b"\xff\xd8\xff"):
-        return None if buffer[3] == 0xF7 else "image/jpeg"
+        return None if buffer[3:4] == b"\xf7" else "image/jpeg"
     if starts_with(buffer, PNG_SIGNATURE):
         return "image/png" if is_png(buffer) and not is_animated_png(buffer) else None
     if starts_with_ascii(buffer, 0, "GIF87a") or starts_with_ascii(buffer, 0, "GIF89a"):

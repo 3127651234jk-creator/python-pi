@@ -162,6 +162,20 @@ def test_read_reports_undecodable_image(env):
     assert "[Image omitted:" in blocks[0]["text"]
 
 
+def test_read_handles_three_byte_jpeg_signature(env):
+    # FF D8 FF alone used to raise IndexError during MIME detection.
+    read = create_read_tool()
+    api = RecordingApi(env)
+    with open(os.path.join(env.cwd, "truncated.jpg"), "wb") as handle:
+        handle.write(b"\xff\xd8\xff")
+    result = run(read.execute({"path": "truncated.jpg"}, api, Context()))
+    assert result.is_error is False
+    blocks = result.content or []
+    assert blocks and blocks[0]["type"] == "text"
+    assert blocks[0]["text"].startswith("Read image file [image/jpeg]")
+    assert "[Image omitted:" in blocks[0]["text"]
+
+
 def test_edit_unique_and_overlapping(env):
     write, edit = create_write_tool(), create_edit_tool()
     api = RecordingApi(env)

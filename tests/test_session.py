@@ -143,6 +143,18 @@ def test_fork_export_and_session_switch(tmp_path):
     assert len(manager.messages()) == 2
 
 
+def test_list_sessions_skips_non_object_json_lines(tmp_path):
+    sessions = tmp_path / "sessions"
+    manager = SessionManager(session_dir=str(sessions), cwd=str(tmp_path))
+    manager.start_new()
+    manager.append(UserMessage(content="hi", timestamp=0))
+    (sessions / "broken.jsonl").write_text("[]\n", encoding="utf-8")
+
+    listed = manager.list_sessions()
+    assert len(listed) == 1
+    assert listed[0]["id"] == os.path.basename(manager.session_file)[:-6]
+
+
 def test_invalid_load_does_not_change_active_session(tmp_path):
     manager = SessionManager(str(tmp_path))
     manager.append(UserMessage(content="safe", timestamp=0))

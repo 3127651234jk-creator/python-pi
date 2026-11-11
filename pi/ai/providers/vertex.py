@@ -28,8 +28,8 @@ from urllib.parse import quote
 import httpx
 
 from ..models import Model
-from ..types import TranscriptContext
-from .base import SimpleStreamOptions, run_provider_stream
+from ..types import StreamErrorEvent, TranscriptContext
+from .base import SimpleStreamOptions, make_partial, run_provider_stream
 from .google import build_request, make_google_converter
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -193,11 +193,18 @@ async def vertex_access_token(account_path: Optional[str] = None) -> str:
 
 async def stream_vertex(model: Model, context: TranscriptContext, options: Optional[SimpleStreamOptions] = None):
     options = options or SimpleStreamOptions()
-    endpoint = model.base_url or vertex_base_url()
-    streaming_model = replace(model, base_url=endpoint.rstrip("/"))
-    convert = make_google_converter(streaming_model)
-    path = "/models/" + quote(streaming_model.id.removeprefix("models/").removeprefix("publishers/google/models/"), safe="") + ":streamGenerateContent?alt=sse"
-    token = await vertex_access_token()
+    try:
+        endpoint = model.base_url or vertex_base_url()
+        streaming_model = replace(model, base_url=endpoint.rstrip("/"))
+        convert = make_google_converter(streaming_model)
+        path = "/models/" + quote(streaming_model.id.removeprefix("models/").removeprefix("publishers/google/models/"), safe="") + ":streamGenerateContent?alt=sse"
+        token = await vertex_access_token()
+    except Exception as exc:  # noqa: BLE001 - credentials/config errors are stream events
+        error = make_partial(model, int(time.time() * 1000))
+        error.stop_reason = "error"
+        error.error_message = f"Vertex authentication failed: {exc}"
+        yield StreamErrorEvent(reason="error", error=error)
+        return
 
     def headers_factory():
         # run_provider_stream expects a synchronous headers callable.

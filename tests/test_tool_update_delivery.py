@@ -32,6 +32,26 @@ def test_progress_is_delivered_while_tool_is_running():
     asyncio.run(scenario())
 
 
+def test_failing_progress_listener_does_not_fail_the_tool():
+    async def scenario():
+        async def update(result):
+            raise RuntimeError("listener failed")
+
+        async def execute(call_id, args, signal, on_update):
+            await on_update(AgentToolResult(content=[TextContent(text="working")]))
+            return AgentToolResult(content=[TextContent(text="done")])
+
+        result = await execute_prepared_tool_call(
+            {"tool": AgentTool(name="progress", description="progress", execute=execute),
+             "tool_call": ToolCall(id="call", name="progress", arguments={}), "args": {}},
+            None, update,
+        )
+        assert not result["is_error"]
+        assert result["result"].content[0].text == "done"
+
+    asyncio.run(scenario())
+
+
 def test_callback_future_is_awaited():
     async def scenario():
         future = asyncio.get_running_loop().create_future()

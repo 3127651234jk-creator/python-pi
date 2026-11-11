@@ -35,6 +35,26 @@ def test_commit_publishes_changes():
     asyncio.run(scenario())
 
 
+def test_commit_listener_failure_does_not_fail_the_commit():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        reported = []
+        loop.set_exception_handler(lambda loop, context: reported.append(context))
+
+        session = create_session(MemoryStorage())
+
+        def broken(publication):
+            raise RuntimeError("listener failed")
+
+        session.subscribe_commits(broken)
+        cid = (await session.commit(lambda tx: tx.create_conversation({"kind": "ownerless"}))).id
+
+        assert cid
+        assert reported and "listener" in reported[0]["message"]
+
+    asyncio.run(scenario())
+
+
 def test_read_after_write_rejected():
     async def scenario():
         session = create_session(MemoryStorage())

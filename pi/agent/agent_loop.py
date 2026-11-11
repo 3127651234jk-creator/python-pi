@@ -855,25 +855,29 @@ async def execute_prepared_tool_call(
     accepting_updates = True
 
     async def sink(partial_result: AgentToolResult) -> None:
-        if accepting_updates:
+        if not accepting_updates:
+            return
+        try:
             update_tasks.append(asyncio.create_task(_maybe_await(on_update(partial_result))))
+        except Exception:  # noqa: BLE001 - progress listeners never change the outcome
+            return
 
     tool: AgentTool = prepared["tool"]
     try:
         result = await tool.execute(prepared["tool_call"].id, prepared["args"], signal, sink)
         accepting_updates = False
         if update_tasks:
-            await asyncio.gather(*update_tasks)
+            await asyncio.gather(*update_tasks, return_exceptions=True)
         return {"result": result, "is_error": bool(result.is_error)}
     except AbortError:
         accepting_updates = False
         if update_tasks:
-            await asyncio.gather(*update_tasks)
+            await asyncio.gather(*update_tasks, return_exceptions=True)
         return {"result": create_error_tool_result("Operation aborted"), "is_error": True}
     except Exception as exc:  # noqa: BLE001
         accepting_updates = False
         if update_tasks:
-            await asyncio.gather(*update_tasks)
+            await asyncio.gather(*update_tasks, return_exceptions=True)
         return {"result": create_error_tool_result(str(exc)), "is_error": True}
     finally:
         accepting_updates = False

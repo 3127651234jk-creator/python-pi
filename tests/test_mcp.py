@@ -77,6 +77,15 @@ for line in sys.stdin:
     asyncio.run(check())
 
 
+def test_empty_log_notification_still_writes_a_line(tmp_path):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    config.agent_dir.mkdir(parents=True, exist_ok=True)
+    manager = McpManager(config)
+    manager._log_message("srv", {"level": "info", "data": ""})
+    log = (config.agent_dir / "mcp.log").read_text(encoding="utf-8")
+    assert "srv:" in log
+
+
 def test_failed_reconnect_keeps_a_usable_client(tmp_path, monkeypatch):
     """A failed reconnect must not leave a closed client that raises AttributeError."""
 

@@ -479,11 +479,13 @@ class McpManager:
         level = params.get("level", "info") if isinstance(params, dict) else "info"
         data = params.get("data") if isinstance(params, dict) else params
         text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
+        text_lines = text.splitlines()
+        first = text_lines[0] if text_lines else ""
+        lines = "\n".join(("    " + line) for line in text_lines[1:])
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        lines = "\n".join(("    " + line) for line in text.splitlines()[1:]) if isinstance(text, str) else ""
         try:
             with open(self.log_path, "a", encoding="utf-8") as handle:
-                handle.write(f"{timestamp} [{level}] {server}: {text.splitlines()[0] if isinstance(text, str) else text}\n")
+                handle.write(f"{timestamp} [{level}] {server}: {first}\n")
                 if lines:
                     handle.write(lines + "\n")
         except OSError:

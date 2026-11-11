@@ -1,6 +1,11 @@
 """Vertex service-account key parsing: PKCS#1 and PKCS#8 must both work."""
 
+import asyncio
+
+from pi.ai.models import Model
+from pi.ai.providers.base import SimpleStreamOptions
 from pi.ai.providers.vertex import load_private_key, service_account_jwt
+from pi.ai.types import StreamErrorEvent, TranscriptContext, UserMessage
 
 PKCS1_PEM = """-----BEGIN RSA PRIVATE KEY-----
 MIIEpgIBAAKCAQEAwI7m9JBsWWoc5IwOiGGYp6344y9prL4/bxrIRfpVC39EbUvv
@@ -81,3 +86,28 @@ def test_service_account_jwt_signs_with_pkcs8_key():
     assert header and claims
     # A 2048-bit RSA signature is 256 bytes: 342 base64url characters.
     assert len(signature) == 342
+
+
+def test_vertex_credential_errors_become_stream_errors(monkeypatch):
+    """A missing/invalid key must yield StreamErrorEvent, not raise from the generator."""
+
+    async def scenario():
+        from pi.ai.providers import vertex
+
+        async def fail():
+            raise ValueError("missing credentials")
+
+        monkeypatch.setattr(vertex, "vertex_access_token", fail)
+        model = Model("vertex-ai", "t", "google-generative-ai", "vertex-ai", "https://example.test")
+        events = [
+            event
+            async for event in vertex.stream_vertex(
+                model, TranscriptContext(messages=[UserMessage(content="hi", timestamp=0)]),
+                SimpleStreamOptions(),
+            )
+        ]
+        assert len(events) == 1
+        assert isinstance(events[0], StreamErrorEvent)
+        assert "missing credentials" in events[0].error.error_message
+
+    asyncio.run(scenario())

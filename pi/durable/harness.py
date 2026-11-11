@@ -272,9 +272,10 @@ class Harness:
     async def run_pending_tasks(self, concurrency: int = 1) -> int:
         """Run every schedulable task to quiescence; returns tasks executed.
 
-        With ``concurrency > 1`` up to that many pending tasks run at once;
-        reservation makes claiming safe, and tasks owned by the same
-        conversation still serialize through their transaction scopes.
+        With ``concurrency > 1`` up to that many pending tasks run at once.
+        The batch takes at most one task per conversation, so tasks that share
+        a conversation serialize while other conversations still run in
+        parallel.
         """
 
         executed = 0
@@ -302,10 +303,22 @@ class Harness:
 
     async def _pending_batch(self, limit: int) -> List[TaskRecord]:
         async def change(tx):
-            page = await tx.scan_tasks({"status": "pending"}, limit)
+            page = await tx.scan_tasks({"status": "pending"}, max(limit, 1) * 8)
             return page.items
 
-        return await self.session.commit(change)
+        tasks = await self.session.commit(change)
+        batch: List[TaskRecord] = []
+        conversations = set()
+        for task in tasks:
+            conversation = task.conversation_id
+            if conversation is not None:
+                if conversation in conversations:
+                    continue
+                conversations.add(conversation)
+            batch.append(task)
+            if len(batch) >= limit:
+                break
+        return batch
 
     async def _next_pending_task(self) -> Optional[TaskRecord]:
         batch = await self._pending_batch(1)
@@ -343,14 +356,15 @@ class Harness:
             await self._fault_or_orphan(task, "orphaned", f"No definition registered for task kind {task.kind}")
             return
 
-        # Reserve: pending -> running. On reopen, running resets to pending.
-        reserved = await self._reserve(task.id, definition, task)
-        if reserved is None:
-            return
-
         signal = asyncio.Event()
         runtime = TaskRuntime(self, task.id, signal)
         try:
+            # Reserve: pending -> running. On reopen, running resets to pending.
+            # A task that cannot be reserved (for example a version migration)
+            # faults here instead of escaping the scheduler on every cycle.
+            reserved = await self._reserve(task.id, definition, task)
+            if reserved is None:
+                return
             while True:
                 current = await self._get_task(task.id)
                 if current is None or current.state.status in ("completing", "terminal"):

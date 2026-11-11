@@ -39,8 +39,11 @@ def tool_definition() -> TaskDefinition:
         tool = (harness.tools or {}).get(task.input.get("tool"))
         if tool is None:
             raise ValueError(f"tool not available: {task.input.get('tool')!r}")
+        arguments = task.input.get("arguments") or {}
+        if tool.prepare_arguments is not None:
+            arguments = tool.prepare_arguments(arguments)
         result = await tool.execute(str(task.input.get("call_id") or f"durable-{task.id}"),
-                                    task.input.get("arguments") or {}, None, None)
+                                    arguments, None, None)
         blocks = []
         for block in result.content or []:
             if isinstance(block, ImageContent):
@@ -120,11 +123,19 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
             acc += estimate_tokens(messages[cut])
         while cut > 0 and getattr(messages[cut], "role", "") == "toolResult":
             cut -= 1
+        # The head marker can only start at an entry, so a cut inside a
+        # multi-message entry must move back to that entry's start.
+        head_index = next((i for i, (_id, _start, end) in enumerate(spans) if end > cut), None)
+        if head_index is None:
+            await runtime.commit(lambda tx, current: TaskState(status="terminal",
+                outcome=TaskOutcome(status="completed", result={"compacted": False, "tokens": total})))
+            return
+        head_entry = spans[head_index][0]
+        cut = spans[head_index][1]
         if cut <= 0:
             await runtime.commit(lambda tx, current: TaskState(status="terminal",
                 outcome=TaskOutcome(status="completed", result={"compacted": False, "tokens": total})))
             return
-        head_entry = next(entry_id for entry_id, start, _end in spans if start >= cut)
         await runtime.commit(lambda tx, current: TaskState(status="running",
             checkpoint={"phase": "summarize", "cut": cut, "head_entry_id": head_entry, "tokens": total}))
 

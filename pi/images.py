@@ -220,10 +220,10 @@ def resize_image(input_bytes: bytes, mime_type: str, options: Optional[ImageResi
 
         target_width, target_height = original_width, original_height
         if target_width > opts.max_width:
-            target_height = int(target_height * opts.max_width / target_width + 0.5)
+            target_height = max(1, int(target_height * opts.max_width / target_width + 0.5))
             target_width = opts.max_width
         if target_height > opts.max_height:
-            target_width = int(target_width * opts.max_height / target_height + 0.5)
+            target_width = max(1, int(target_width * opts.max_height / target_height + 0.5))
             target_height = opts.max_height
 
         try:

@@ -244,6 +244,15 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 
     stopped.cancel()
     scheduler.cancel()
+    # The client keeps the stream open while it waits for this process to
+    # exit, so serve_task cannot finish on its own. Give a pending shutdown
+    # response a moment to flush, then stop serving; otherwise close_session
+    # waits out WORKER_STOP_TIMEOUT and kills the process before
+    # server.close()/storage.close() run.
+    try:
+        await asyncio.wait_for(asyncio.shield(serve_task), 0.5)
+    except asyncio.TimeoutError:
+        serve_task.cancel()
     await asyncio.gather(scheduler, stopped, serve_task, return_exceptions=True)
     await server.close()
     await storage.close()
