@@ -5,6 +5,7 @@ Python port of ``packages/telemetry/src/noop.ts``.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .types import SpanCallback, SpanOptions, TelemetryContext, TelemetrySpan
@@ -26,7 +27,10 @@ class _NoopSpan(TelemetrySpan):
 
 class _NoopTelemetryContext(TelemetryContext):
     async def start_span(self, options: SpanOptions, callback: SpanCallback) -> Any:
-        return callback(_NoopSpan())
+        result = callback(_NoopSpan())
+        if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+            return await result
+        return result
 
 
 NOOP_TELEMETRY_CONTEXT = _NoopTelemetryContext()

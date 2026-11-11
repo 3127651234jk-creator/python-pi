@@ -293,7 +293,7 @@ def test_worker_crash_is_classified_with_exit_code():
             await never.wait()
             return "unreachable"
 
-        code = "text('before')\ntools.slow.start({})\nimport os\nos._exit(7)\n"
+        code = "text('before')\ntools.slow.start({})\nraise SystemExit(7)\n"
         outcome = await asyncio.wait_for(run_host(code, on_call=on_call), timeout=15)
 
         assert outcome.status == host.STATUS_CRASHED

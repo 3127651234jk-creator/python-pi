@@ -3,6 +3,7 @@ import json
 import sys
 
 import httpx
+import pytest
 
 from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.mcp import McpManager
@@ -70,6 +71,39 @@ for line in sys.stdin:
             assert "PI_M5_MISSING" in manager.errors["bad-env"]
             assert "good" in manager.clients
             assert "good" not in manager.errors
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
+
+
+def test_failed_reconnect_keeps_a_usable_client(tmp_path, monkeypatch):
+    """A failed reconnect must not leave a closed client that raises AttributeError."""
+
+    async def send(self, request, **kwargs):
+        body = json.loads(request.content)
+        if failing["on"]:
+            raise httpx.ConnectError("server down")
+        if "id" not in body:
+            return httpx.Response(202)
+        result = {"protocolVersion": "2025-03-26"} if body["method"] == "initialize" else {"tools": []}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    failing = {"on": False}
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {"remote": {"url": "https://example.test/mcp"}}})
+
+    async def check():
+        manager = McpManager(config)
+        try:
+            await manager.reload()
+            failing["on"] = True
+            with pytest.raises(httpx.ConnectError):
+                await manager.call("remote", "tools/list", {})
+            # Before the fix this raised AttributeError on the closed client.
+            with pytest.raises(httpx.ConnectError):
+                await manager.call("remote", "tools/list", {})
         finally:
             await manager.close()
 

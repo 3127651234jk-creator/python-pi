@@ -22,7 +22,7 @@ from pi.codemode.worker_source import WORKER_SOURCE
 
 # Every module import inside the executed worker program; the set is exact on
 # purpose: new imports must be standard library and stay dependency-free.
-WORKER_IMPORTS = {"concurrent.futures", "json", "math", "os", "re", "sys", "threading", "traceback"}
+WORKER_IMPORTS = {"builtins", "concurrent.futures", "json", "math", "os", "re", "sys", "threading", "traceback"}
 
 PNG_1PX = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
            "AAAABJRU5ErkJggg==")
@@ -143,26 +143,30 @@ def test_worker_source_imports_only_stdlib():
     assert modules == WORKER_IMPORTS
 
 
-def test_worker_runs_without_source_tree_or_pi_import(tmp_path):
+def test_worker_scripts_are_denied_file_import_and_eval_escapes(tmp_path):
     async def scenario():
         code = (
-            "import sys\n"
-            "leaked = [p for p in sys.path if 'pi-python' in p.replace(chr(92), '/')]\n"
-            "try:\n"
-            "    __import__('pi')\n"
-            "    imported = True\n"
-            "except ImportError:\n"
-            "    imported = False\n"
-            "result = {'leaked': leaked, 'imported': imported}\n"
+            "blocked = {}\n"
+            "for name, call in {\n"
+            "    'open': lambda: open('x'),\n"
+            "    'import': lambda: __import__('socket'),\n"
+            "    'eval': lambda: eval('1 + 1'),\n"
+            "    'compile': lambda: compile('1', '<x>', 'eval'),\n"
+            "}.items():\n"
+            "    try:\n"
+            "        call()\n"
+            "        blocked[name] = 'allowed'\n"
+            "    except Exception as exc:\n"
+            "        blocked[name] = type(exc).__name__\n"
+            "result = {'blocked': blocked, 'sum': sum(range(5)), 'label': str({'a': 1})}\n"
         )
         run = await run_script(tmp_path, code)
         assert run.error is None
-        # Isolated mode keeps the scratch dir, the repo and PYTHONPATH off
-        # sys.path; the pi import can only resolve from real site-packages.
-        assert run.value["leaked"] == []
-        import sysconfig
-        installed = os.path.exists(os.path.join(sysconfig.get_paths()["purelib"], "pi"))
-        assert run.value["imported"] == installed
+        assert run.value["blocked"] == {
+            "open": "NameError", "import": "NameError", "eval": "NameError", "compile": "NameError",
+        }
+        assert run.value["sum"] == 10
+        assert run.value["label"] == "{'a': 1}"
 
     asyncio.run(scenario())
 

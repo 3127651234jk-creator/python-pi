@@ -15,6 +15,7 @@ import textwrap
 
 WORKER_SOURCE = textwrap.dedent('''
     """Codemode worker: runs user code with a threaded tool-call bridge."""
+    import builtins
     import concurrent.futures
     import json
     import math
@@ -36,6 +37,17 @@ WORKER_SOURCE = textwrap.dedent('''
         ("image/gif", re.compile(r"^R0lGOD[dl]h")),
         ("image/webp", re.compile(r"^UklG.{8}RUJQ")),
     ]
+
+    # User scripts get the normal builtins minus every file, import and
+    # code-evaluation entry point; the tool bridge is their only I/O.
+    BLOCKED_BUILTINS = {
+        "open", "input", "eval", "exec", "compile", "__import__", "breakpoint",
+        "help", "exit", "quit",
+    }
+
+    def restricted_builtins():
+        return {name: value for name, value in vars(builtins).items()
+                if name not in BLOCKED_BUILTINS}
 
     class ScriptExit(Exception):
         def __init__(self, value):
@@ -422,7 +434,7 @@ WORKER_SOURCE = textwrap.dedent('''
                        "exit": exit, "store": store, "load": load, "wait": wait, "wait_all": wait_all,
                        "wait_any": wait_any, "search_tools": search_tools, "describe_tool": describe_tool,
                        "describe_namespace": describe_namespace, "console": console, "print": Console._log,
-                       "__name__": "__codemode__"}
+                       "__name__": "__codemode__", "__builtins__": restricted_builtins()}
         value = None
         try:
             with open(sys.argv[1], "r", encoding="utf-8") as handle:
@@ -432,6 +444,8 @@ WORKER_SOURCE = textwrap.dedent('''
                 value = environment["result"]
         except ScriptExit as stop:
             value = stop.value
+        except SystemExit:
+            raise
         except BaseException:
             stack = traceback.format_exc(limit=12)
             head = stack.splitlines()[-1] if stack else "script failed"

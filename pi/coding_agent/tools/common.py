@@ -49,7 +49,10 @@ def _locks_guard() -> asyncio.Lock:
 async def with_file_mutation_queue(absolute_path: str, fn: Callable[[], Awaitable[Any]]) -> Any:
     """Run ``fn`` while holding the mutation lock for ``absolute_path``."""
 
+    # Windows paths are case-insensitive and accept both separators; key the
+    # lock by the canonical spelling so case variants serialize together.
+    key = os.path.normcase(absolute_path)
     async with _locks_guard():
-        lock = _MUTATION_LOCKS.setdefault(absolute_path, asyncio.Lock())
+        lock = _MUTATION_LOCKS.setdefault(key, asyncio.Lock())
     async with lock:
         return await fn()

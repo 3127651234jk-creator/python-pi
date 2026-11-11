@@ -172,7 +172,8 @@ def _tool_namespace(name: str) -> Optional[str]:
 
 DESCRIPTION_INTRO = (
     "Run Python that calls other tools. The input is raw Python (not JSON, no code fence), "
-    "executed in an isolated subprocess: no network, file system, or timers beyond its tool calls.\n"
+    "executed in an isolated subprocess with file, import, and code-evaluation builtins "
+    "disabled; tool calls are its only I/O.\n"
     "- tools.<name>(args) calls one tool and blocks until it finishes; tools.<name>.start(args) "
     "starts a call and returns a handle, composed with wait_all(...) / wait_any(...). "
     "Set the module variable `result` to return a value. Calls still running when the script ends are cancelled.\n"

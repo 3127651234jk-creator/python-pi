@@ -805,10 +805,20 @@ class McpManager:
         if client is None:
             raise ValueError(f"MCP server not connected: {server}")
         namespace = re.sub(r"[^A-Za-z0-9_]", "_", server)
+        replacement = McpClient(server, client.config, client.cwd)
+        try:
+            await self._connect_client(replacement, namespace)
+        except BaseException:
+            try:
+                await replacement.close()
+            except BaseException:
+                pass
+            raise
+        # Retire the old client only after the replacement connected: a failed
+        # reconnect must not leave a closed client registered, where every
+        # later call would raise AttributeError and never retry.
         await client.close()
-        client = McpClient(server, client.config, client.cwd)
-        await self._connect_client(client, namespace)
-        self.clients[server] = client
+        self.clients[server] = replacement
         await self.ensure_tools(server)
 
     async def ensure_tools(self, server: str) -> None:

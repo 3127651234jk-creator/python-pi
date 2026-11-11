@@ -111,3 +111,21 @@ def test_noop_backend_passes_values_through():
         assert result == 42
 
     asyncio.run(scenario())
+
+
+def test_noop_backend_awaits_async_callbacks():
+    """The noop backend must run async span bodies, not return their coroutines."""
+
+    async def scenario():
+        ran = []
+
+        async def body(span):
+            ran.append(True)
+            span.add_event("step")
+            return "done"
+
+        result = await NOOP_TELEMETRY_CONTEXT.start_span(SpanOptions(name="x"), body)
+        assert result == "done"
+        assert ran == [True]
+
+    asyncio.run(scenario())

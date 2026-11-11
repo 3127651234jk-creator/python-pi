@@ -1,6 +1,7 @@
 """Runtime regressions found by the second Python audit."""
 
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -38,6 +39,31 @@ def test_mutation_queue_releases_unused_locks(tmp_path, durable):
                 await common.with_file_mutation_queue(path, lambda: asyncio.sleep(0))
         locks = mutation_queue._QUEUES if durable else common._MUTATION_LOCKS
         assert not locks
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows paths are case-insensitive")
+def test_mutation_queue_treats_case_variant_paths_as_one_file(tmp_path):
+    """Two spellings of the same Windows path must not mutate concurrently."""
+
+    async def scenario():
+        active = 0
+        peak = 0
+
+        async def mutate():
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+
+        upper = str(tmp_path / "Shared.txt")
+        await asyncio.gather(
+            common.with_file_mutation_queue(upper, mutate),
+            common.with_file_mutation_queue(upper.lower(), mutate),
+        )
+        assert peak == 1
+
     asyncio.run(scenario())
 
 

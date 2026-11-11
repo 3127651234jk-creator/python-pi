@@ -392,8 +392,13 @@ async def stream_assistant_response(
         partial = event.partial
         if event.type == "start":
             partial_message = partial
-            context.messages.append(partial_message)
-            added_partial = True
+            if added_partial:
+                # A wrapper (context-overflow recovery) restarted the stream;
+                # replace the abandoned partial instead of stacking a second.
+                context.messages[-1] = partial
+            else:
+                context.messages.append(partial)
+                added_partial = True
             await emit(MessageStartEvent(message=partial))
         elif partial_message is not None:
             partial_message = partial

@@ -71,6 +71,55 @@ def test_overflow_retries_once():
     asyncio.run(check())
 
 
+def test_overflow_retry_does_not_leave_the_abandoned_partial():
+    """A mid-stream overflow retry must replace, not stack, the partial message."""
+
+    async def check():
+        from pi.agent.agent_loop import default_convert_to_llm, stream_assistant_response
+        from pi.agent.types import AgentContext, AgentLoopConfig
+        from pi.ai.providers.base import make_partial
+        from pi.ai.types import StreamStartEvent
+
+        model = resolve_model("faux")
+        model.context_window = 3000
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=1))
+        messages = [UserMessage(content="old" * 100, timestamp=0), UserMessage(content="latest", timestamp=1)]
+        attempts = {"main": 0}
+
+        async def provider(model, context, options):
+            if context.messages[0].role == "system":
+                yield DoneEvent(reason="stop", message=response("summary"))
+                return
+            attempts["main"] += 1
+            if attempts["main"] == 1:
+                partial = make_partial(model, 0)
+                partial.content = [TextContent(text="half")]
+                yield StreamStartEvent(partial=partial)
+                error = response(reason="error")
+                error.error_message = "context_length_exceeded"
+                yield StreamErrorEvent(reason="error", error=error)
+                return
+            yield StreamStartEvent(partial=make_partial(model, 0))
+            yield DoneEvent(reason="stop", message=response("full"))
+
+        async def stream_fn(model, context, options=None):
+            async for event in compactor.stream(model, context, options or SimpleStreamOptions(), provider):
+                yield event
+
+        context = AgentContext(messages=list(messages), tools=[])
+        final = await stream_assistant_response(
+            context,
+            AgentLoopConfig(model=model, convert_to_llm=default_convert_to_llm),
+            None,
+            lambda event: asyncio.sleep(0),
+            stream_fn,
+        )
+        assert final.content[0].text == "full"
+        assert [m.content[0].text for m in context.messages if m.role == "assistant"] == ["full"]
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("reason,text,match", [("length", "partial", "token cap"), ("stop", "", "empty summary")])
 def test_failed_summary_keeps_previous_state(reason, text, match):
     async def check():
