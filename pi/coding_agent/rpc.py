@@ -37,7 +37,7 @@ from typing import Optional
 
 from ..ai.json_io import to_json
 from ..ai.models import ModelError
-from ..ai.types import AssistantMessage, ImageContent, TextContent, get_message_text
+from ..ai.types import AssistantMessage, ImageContent, SystemMessage, TextContent, get_message_text
 from ..agent.agent import Agent
 from ..agent.compaction import compact_agent, restore_compaction
 from .catalog_sync import fetch_catalog, save_cache

@@ -12,7 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from pi.agent.agent import Agent
-from pi.agent.agent_loop import default_convert_to_llm, run_agent_loop
+from pi.agent.agent_loop import (
+    default_convert_to_llm,
+    execute_tool_calls_parallel,
+    execute_tool_calls_sequential,
+    run_agent_loop,
+)
 from pi.agent.types import (
     AgentContext,
     AgentLoopConfig,
@@ -20,10 +25,13 @@ from pi.agent.types import (
     AgentToolResult,
     BeforeToolCallResult,
     ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
 )
 from pi.ai.models import Model
 from pi.ai.providers import faux
+from pi.ai.providers.base import make_partial
 from pi.ai.types import SystemMessage, TextContent, ToolCall, ToolResultMessage, UserMessage
+from pi.util import AbortSignal
 
 
 @pytest.fixture(autouse=True)
@@ -355,5 +363,127 @@ def test_hosted_tool_declaration_preserved_in_changes():
         declared = [t for m in captured["context"].messages if getattr(m, "role", None) == "system"
                     for t in (m.tools_added or [])]
         assert [t.hosted for t in declared] == [{"type": "web_search", "search_context_size": "medium"}]
+
+    asyncio.run(scenario())
+
+
+def _abort_batch_fixture():
+    """Three calls on one assistant message; the first one aborts the signal."""
+    tool_calls = [ToolCall(id=f"t{i}", name="echo", arguments={"text": "x"}) for i in (1, 2, 3)]
+    assistant = make_partial(make_model(), 0)
+    assistant.content = tool_calls
+    assistant.stop_reason = "toolUse"
+    return tool_calls, assistant
+
+
+def _assert_batch_answers_every_call(batch, events):
+    results = {message.tool_call_id: message for message in batch["messages"]}
+    assert set(results) == {"t1", "t2", "t3"}
+    assert results["t1"].content[0].text == "ran"
+    for call_id in ("t2", "t3"):
+        assert results[call_id].is_error
+        assert results[call_id].content[0].text == "Operation aborted"
+    starts = [e.tool_call_id for e in events if isinstance(e, ToolExecutionStartEvent)]
+    ends = [e.tool_call_id for e in events if isinstance(e, ToolExecutionEndEvent)]
+    assert starts == ["t1", "t2", "t3"]
+    assert ends == ["t1", "t2", "t3"]
+
+
+def test_abort_answers_remaining_tool_calls_sequential():
+    """An aborted serial batch still emits a toolResult for every toolUse block."""
+
+    async def scenario():
+        signal = AbortSignal()
+        tool_calls, assistant = _abort_batch_fixture()
+
+        async def execute(tool_call_id, params, sig=None, on_update=None):
+            if tool_call_id == "t1":
+                sig.abort()
+            return AgentToolResult(content=[TextContent(text="ran")], details={})
+
+        tool = make_tool()
+        tool.execute = execute
+        events = []
+        batch = await execute_tool_calls_sequential(
+            AgentContext(messages=[], tools=[tool]),
+            assistant,
+            tool_calls,
+            AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal,
+            lambda e: events.append(e) or asyncio.sleep(0),
+        )
+        _assert_batch_answers_every_call(batch, events)
+
+    asyncio.run(scenario())
+
+
+def test_abort_answers_remaining_tool_calls_parallel():
+    """An abort during preparation still answers the calls that never started."""
+
+    async def scenario():
+        signal = AbortSignal()
+        tool_calls, assistant = _abort_batch_fixture()
+
+        async def before(ctx, sig):
+            if ctx.tool_call_id == "t1":
+                sig.abort()
+            return None
+
+        events = []
+        batch = await execute_tool_calls_parallel(
+            AgentContext(messages=[], tools=[make_tool()]),
+            assistant,
+            tool_calls,
+            AgentLoopConfig(
+                model=make_model(),
+                convert_to_llm=default_convert_to_llm,
+                before_tool_call=before,
+            ),
+            signal,
+            lambda e: events.append(e) or asyncio.sleep(0),
+        )
+        results = {message.tool_call_id: message for message in batch["messages"]}
+        assert set(results) == {"t1", "t2", "t3"}
+        for call_id in ("t1", "t2", "t3"):
+            assert results[call_id].is_error
+            assert results[call_id].content[0].text == "Operation aborted"
+        starts = [e.tool_call_id for e in events if isinstance(e, ToolExecutionStartEvent)]
+        ends = [e.tool_call_id for e in events if isinstance(e, ToolExecutionEndEvent)]
+        assert starts == ["t1", "t2", "t3"]
+        assert ends == ["t1", "t2", "t3"]
+
+    asyncio.run(scenario())
+
+
+def test_aborted_stream_answers_streamed_tool_calls():
+    """A request aborted after a tool_use block was streamed still gets a result."""
+
+    async def scenario():
+        from pi.ai.types import StreamErrorEvent, StreamStartEvent
+
+        def aborted_message(model):
+            partial = make_partial(model, 0)
+            partial.content = [ToolCall(id="t1", name="echo", arguments={})]
+            partial.stop_reason = "aborted"
+            return partial
+
+        async def stream_fn(model, context, options=None):
+            yield StreamStartEvent(partial=aborted_message(model))
+            yield StreamErrorEvent(reason="aborted", error=aborted_message(model))
+
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[make_tool()]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=AbortSignal(),
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+        roles = [getattr(m, "role", None) for m in messages]
+        assert roles == ["system", "user", "assistant", "toolResult"]
+        result = messages[-1]
+        assert result.tool_call_id == "t1"
+        assert result.is_error
+        assert "aborted" in result.content[0].text.lower()
 
     asyncio.run(scenario())

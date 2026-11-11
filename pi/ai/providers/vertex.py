@@ -56,19 +56,43 @@ def _der_read(data: bytes, offset: int):
     return tag, data[offset:offset + length], offset + length
 
 
-def _der_sequence_integers(content: bytes):
-    """Yield INTEGER values at the top level of a DER sequence."""
-    values = []
+def _der_items(content: bytes):
+    """Return the top-level ``(tag, body)`` TLVs of a DER sequence."""
+    items = []
     offset = 0
     while offset < len(content):
         tag, body, offset = _der_read(content, offset)
+        items.append((tag, body))
+    return items
+
+
+def _pkcs1_integers(content: bytes):
+    """Yield INTEGER values at the top level of a PKCS#1 DER sequence."""
+    values = []
+    for tag, body in _der_items(content):
         if tag == 0x02:
             values.append(int.from_bytes(body, "big"))
         elif tag in (0x30, 0xA0):  # nested sequence / context tag: descend
-            values.extend(_der_sequence_integers(body))
-        elif tag == 0x04 and not values:  # PKCS#8 octet string wrapping PKCS#1
-            values.extend(_der_sequence_integers(body))
+            values.extend(_pkcs1_integers(body))
     return values
+
+
+def _der_sequence_integers(content: bytes):
+    """Yield INTEGER values at the top level of a DER sequence."""
+    items = _der_items(content)
+    if len(items) == 1 and items[0][0] in (0x30, 0xA0):  # unwrap the outer sequence
+        items = _der_items(items[0][1])
+    # PKCS#8 PrivateKeyInfo wraps the PKCS#1 key in an OCTET STRING after the
+    # version and algorithm fields; parse that inner key when present.
+    for tag, body in items:
+        if tag != 0x04:
+            continue
+        try:
+            if _der_items(body):
+                return _pkcs1_integers(body)
+        except (IndexError, ValueError):
+            continue
+    return _pkcs1_integers(content)
 
 
 def load_private_key(pem: str):

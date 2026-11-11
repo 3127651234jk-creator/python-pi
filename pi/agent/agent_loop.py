@@ -209,10 +209,24 @@ async def run_loop(
             new_messages.append(message)
 
             if message.stop_reason in ("error", "aborted"):
-                last_completed_turn = _turn_context(message, [], current_context, new_messages)
+                # The provider may have streamed tool_use blocks before the
+                # request failed; answer them so the persisted transcript
+                # stays valid for the next request.
+                streamed_calls = [
+                    c for c in message.content if isinstance(c, ToolCall) and c.raw_item is None
+                ]
+                aborted_results: List[ToolResultMessage] = []
+                for finalized in await _finalize_aborted_tool_calls(streamed_calls, emit):
+                    result_message = create_tool_result_message(finalized)
+                    await emit(MessageStart(result_message))
+                    await emit(MessageEnd(result_message))
+                    current_context.messages.append(result_message)
+                    new_messages.append(result_message)
+                    aborted_results.append(result_message)
+                last_completed_turn = _turn_context(message, aborted_results, current_context, new_messages)
                 if config.finish_turn is not None:
                     await config.finish_turn(last_completed_turn, signal)
-                await emit(TurnEndEvent(message=message, tool_results=[]))
+                await emit(TurnEndEvent(message=message, tool_results=aborted_results))
                 await emit(AgentEndEvent(messages=new_messages))
                 return
 
@@ -449,6 +463,40 @@ async def fail_tool_calls_from_truncated_message(
     return {"messages": messages, "terminate": False}
 
 
+async def _finalize_aborted_tool_calls(
+    tool_calls: List[ToolCall], emit: EmitFn
+) -> List[Dict[str, Any]]:
+    """Answer calls an abort left unstarted so every tool_use has a result.
+
+    Providers reject a transcript whose assistant ``toolUse`` blocks lack a
+    matching ``toolResult``, so an aborted batch must still answer every call.
+    """
+    from .types import ToolExecutionStartEvent, ToolExecutionEndEvent
+
+    finalized_calls: List[Dict[str, Any]] = []
+    for tool_call in tool_calls:
+        await emit(
+            ToolExecutionStartEvent(
+                tool_call_id=tool_call.id, tool_name=tool_call.name, args=tool_call.arguments
+            )
+        )
+        finalized = {
+            "tool_call": tool_call,
+            "result": create_error_tool_result("Operation aborted"),
+            "is_error": True,
+        }
+        await emit(
+            ToolExecutionEndEvent(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                result=finalized["result"],
+                is_error=True,
+            )
+        )
+        finalized_calls.append(finalized)
+    return finalized_calls
+
+
 def _enter_call_context(config: AgentLoopConfig, context: AgentContext,
                         assistant_message: AssistantMessage, signal: Optional[AbortSignal],
                         tool_call: ToolCall, holds_queue: bool):
@@ -555,7 +603,7 @@ async def execute_tool_calls_sequential(
     finalized_calls: List[Dict[str, Any]] = []
     messages: List[ToolResultMessage] = []
 
-    for tool_call in tool_calls:
+    for index, tool_call in enumerate(tool_calls):
         await emit(
             ToolExecutionStartEvent(
                 tool_call_id=tool_call.id, tool_name=tool_call.name, args=tool_call.arguments
@@ -595,6 +643,15 @@ async def execute_tool_calls_sequential(
         messages.append(tool_result_message)
 
         if signal is not None and signal.aborted:
+            # Every tool_use block in the assistant message needs a matching
+            # tool_result, otherwise the next request is rejected by the
+            # provider. Answer the calls the abort prevented from running.
+            for finalized in await _finalize_aborted_tool_calls(tool_calls[index + 1:], emit):
+                tool_result_message = create_tool_result_message(finalized)
+                await emit(MessageStart(tool_result_message))
+                await emit(MessageEnd(tool_result_message))
+                finalized_calls.append(finalized)
+                messages.append(tool_result_message)
             break
 
     return {"messages": messages, "terminate": _should_terminate_batch(finalized_calls)}
@@ -611,21 +668,30 @@ async def execute_tool_calls_parallel(
     from .types import ToolExecutionEndEvent, ToolExecutionStartEvent
 
     entries: List[Any] = []
+    accounted = 0
 
-    for tool_call in tool_calls:
+    for index, tool_call in enumerate(tool_calls):
         await emit(
             ToolExecutionStartEvent(
                 tool_call_id=tool_call.id, tool_name=tool_call.name, args=tool_call.arguments
             )
         )
         preparation = await prepare_tool_call(current_context, assistant_message, tool_call, config, signal)
+        accounted = index + 1
         if preparation["kind"] == "immediate":
-            entries.append(
-                {
-                    "tool_call": tool_call,
-                    "result": preparation["result"],
-                    "is_error": preparation["is_error"],
-                }
+            finalized = {
+                "tool_call": tool_call,
+                "result": preparation["result"],
+                "is_error": preparation["is_error"],
+            }
+            entries.append(finalized)
+            await emit(
+                ToolExecutionEndEvent(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    result=finalized["result"],
+                    is_error=finalized["is_error"],
+                )
             )
             if signal is not None and signal.aborted:
                 break
@@ -669,6 +735,7 @@ async def execute_tool_calls_parallel(
             break
 
     ordered = await asyncio.gather(*[_maybe_call(entry) for entry in entries])
+    ordered.extend(await _finalize_aborted_tool_calls(tool_calls[accounted:], emit))
     messages: List[ToolResultMessage] = []
     for finalized in ordered:
         tool_result_message = create_tool_result_message(finalized)

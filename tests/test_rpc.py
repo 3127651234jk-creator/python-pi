@@ -4,7 +4,7 @@ import json
 import os
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers.base import make_partial
-from pi.ai.types import StreamErrorEvent, UserMessage
+from pi.ai.types import StreamErrorEvent, SystemMessage, UserMessage
 
 from pi.agent.agent import Agent
 from pi.ai.models import resolve_model
@@ -34,6 +34,26 @@ def test_rpc_validation_state_and_events():
         assert records[2]["data"]["disposition"] == "started"
         assert records[-1]["type"] == "agent_settled"
         assert any(record["type"] == "message_update" for record in records)
+    asyncio.run(check())
+
+
+def test_new_session_keeps_system_messages_and_stays_in_dispatch():
+    """new_session must not raise NameError out of dispatch (killing the server)."""
+
+    async def check():
+        output = io.StringIO()
+        agent = Agent(resolve_model("faux"))
+        agent.messages = [
+            SystemMessage(content="sys", timestamp=0),
+            UserMessage(content="hi", timestamp=0),
+        ]
+        server = RpcServer(agent, JsonWriter(output))
+        await server.dispatch({"id": "n", "type": "new_session"})
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        assert records[-1]["id"] == "n"
+        assert records[-1]["success"]
+        assert [message.role for message in agent.messages] == ["system"]
+
     asyncio.run(check())
 
 
