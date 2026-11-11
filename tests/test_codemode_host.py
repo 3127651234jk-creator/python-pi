@@ -232,8 +232,10 @@ def test_timeout_cancels_pending_and_reports():
             return "unreachable"
 
         code = "result = wait(tools.slow.start({}))\n"
+        # Include worker startup time under load before testing cancellation
+        # of an active tool call; 300ms can expire before the first call.
         outcome = await asyncio.wait_for(
-            run_host(code, on_call=on_call, timeout_ms=300), timeout=15)
+            run_host(code, on_call=on_call, timeout_ms=3000), timeout=15)
 
         assert outcome.status == host.STATUS_TIMEOUT
         assert outcome.value is None

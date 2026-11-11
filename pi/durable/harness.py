@@ -110,6 +110,17 @@ class TaskRuntime:
         await self._harness.session.commit(tx_change, scope)
 
 
+async def _scan_all(scan, query):
+    items = []
+    cursor = None
+    while True:
+        page = await scan(query, 1000, cursor)
+        items.extend(page.items)
+        if page.next is None:
+            return items
+        cursor = page.next
+
+
 def _scope_for(harness: "Harness", task_id: int):
     from .transaction import TransactionScope
 
@@ -194,8 +205,7 @@ class Harness:
         """Visible entries, oldest first (fork-aware, active context only)."""
 
         async def change(tx):
-            page = await tx.scan_entries({"conversation_id": conversation_id}, 1000)
-            items = list(reversed(page.items))
+            items = list(reversed(await _scan_all(tx.scan_entries, {"conversation_id": conversation_id})))
             for entry in reversed(items):
                 if entry.head is not None:
                     start = entry.head
@@ -236,8 +246,7 @@ class Harness:
     async def list_tasks(self, conversation_id: Optional[int] = None) -> List[TaskRecord]:
         async def change(tx):
             query = {"conversation_id": conversation_id} if conversation_id is not None else {}
-            page = await tx.scan_tasks(query, 1000)
-            return page.items
+            return await _scan_all(tx.scan_tasks, query)
 
         return await self.session.commit(change)
 
@@ -330,8 +339,8 @@ class Harness:
         async def change(tx):
             from .types import write_task
 
-            page = await tx.scan_tasks({"status": "running"}, 100)
-            for record in page.items:
+            records = await _scan_all(tx.scan_tasks, {"status": "running"})
+            for record in records:
                 replaced = TaskRecord(
                     id=record.id,
                     conversation_id=record.conversation_id,
@@ -346,7 +355,7 @@ class Harness:
                 )
                 tx._writes.append(write_task(replaced))
                 tx._mark_table_write()
-            return len(page.items)
+            return len(records)
 
         await self.session.commit(change)
 
@@ -488,19 +497,17 @@ class Harness:
         async def change(tx):
             from .types import write_task
 
-            page = await tx.scan_tasks({"status": "waiting"}, 10)
+            records = await _scan_all(tx.scan_tasks, {"status": "waiting"})
+            replacements = []
             resumed = 0
-            for record in page.items:
+            for record in records:
                 ids = record.state.on or []
                 terminal_tasks = []
                 for tid in ids:
                     other = await tx.task(tid)
                     if other is None or other.state.status != "terminal":
-                        terminal_tasks = None
-                        break
+                        continue
                     terminal_tasks.append(other)
-                if terminal_tasks is None:
-                    continue
                 if record.state.policy == "failFast":
                     failed = [t for t in terminal_tasks if t.state.outcome.status != "completed"]
                     if not failed and len(terminal_tasks) != len(ids):
@@ -518,10 +525,11 @@ class Harness:
                             abort_requested=record.abort_requested,
                             state=TaskState(status="terminal", outcome=outcome),
                         )
-                        tx._writes.append(write_task(replaced))
-                        tx._mark_table_write()
+                        replacements.append(replaced)
                         resumed += 1
                         continue
+                if len(terminal_tasks) != len(ids):
+                    continue
                 # allSettled: resume at the stored checkpoint.
                 replaced = TaskRecord(
                     id=record.id,
@@ -535,9 +543,11 @@ class Harness:
                     state=TaskState(status="pending", checkpoint=record.state.checkpoint),
                     memos=record.memos,
                 )
+                replacements.append(replaced)
+                resumed += 1
+            for replaced in replacements:
                 tx._writes.append(write_task(replaced))
                 tx._mark_table_write()
-                resumed += 1
             return resumed
 
         resumed = await self.session.commit(change)
