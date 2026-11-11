@@ -377,6 +377,9 @@ class ProviderState:
     def __init__(self, model: Model, timestamp: int) -> None:
         self.model = model
         self._partial = make_partial(model, int(time.time() * 1000))
+        # Provider block index -> position in ``content``. Provider indices may
+        # skip blocks the port does not materialize (e.g. redacted thinking).
+        self._block_positions: Dict[int, int] = {}
 
     @property
     def partial(self) -> AssistantMessage:
@@ -385,18 +388,33 @@ class ProviderState:
     def snapshot(self) -> AssistantMessage:
         return copy.deepcopy(self._partial)
 
+    def _append_block(self, index: int, block: Any) -> int:
+        position = len(self._partial.content)
+        self._partial.content.append(block)
+        self._block_positions[index] = position
+        return position
+
+    def block_at(self, index: int) -> Any:
+        position = self._block_positions.get(index)
+        if position is None or position >= len(self._partial.content):
+            return None
+        return self._partial.content[position]
+
+    def position_of(self, index: int) -> int:
+        return self._block_positions.get(index, index)
+
     def add_text(self, index: int) -> None:
         from ..types import TextContent
 
-        self._partial.content.insert(index, TextContent(text=""))
+        self._append_block(index, TextContent(text=""))
 
     def add_thinking(self, index: int) -> None:
         from ..types import ThinkingContent
 
-        self._partial.content.insert(index, ThinkingContent(thinking=""))
+        self._append_block(index, ThinkingContent(thinking=""))
 
     def add_tool_call(self, index: int, tool_call: Any) -> None:
-        self._partial.content.insert(index, tool_call)
+        self._append_block(index, tool_call)
 
     def set_usage(self, usage: Usage) -> None:
         self._partial.usage = usage

@@ -143,6 +143,99 @@ def test_anthropic_stream_mapping(monkeypatch):
     assert body["messages"] == [{"role": "user", "content": "hi"}]
 
 
+ANTHROPIC_REDACTED_SSE = """event: message_start
+data: {"type":"message_start","message":{"id":"msg_2","model":"claude-test","usage":{"input_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"after redacted"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tu_1","name":"read"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\": \\"a.txt\\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"""
+
+
+def test_anthropic_redacted_thinking_keeps_following_blocks(monkeypatch):
+    """A redacted_thinking block must not shift the indices of later blocks."""
+
+    from pi.ai.providers import anthropic
+    from pi.ai.types import (
+        AssistantMessage,
+        TextDeltaEvent,
+        ThinkingStartEvent,
+        Usage,
+    )
+
+    collect = stream_with(monkeypatch, anthropic, ANTHROPIC_REDACTED_SSE)
+    events, _ = asyncio.run(collect())
+
+    message = [event for event in events if isinstance(event, DoneEvent)][0].message
+    kinds = [type(block).__name__ for block in message.content]
+    assert kinds == ["ThinkingContent", "TextContent", "ToolCall"]
+    redacted = message.content[0]
+    assert redacted.redacted is True
+    assert redacted.thinking == "[Reasoning redacted]"
+    assert redacted.thinking_signature == "opaque"
+    assert message.content[1].text == "after redacted"
+    assert message.content[2].arguments == {"path": "a.txt"}
+
+    assert [event.delta for event in events if isinstance(event, TextDeltaEvent)] == ["after redacted"]
+    assert [event.content_index for event in events if isinstance(event, ThinkingStartEvent)] == [0]
+
+    replayed = anthropic.convert_messages([
+        AssistantMessage(
+            content=message.content, api="anthropic-messages", provider="anthropic",
+            model="claude-test", usage=Usage(), stop_reason="toolUse", timestamp=0,
+        )
+    ])
+    assert replayed[0]["content"][0] == {"type": "redacted_thinking", "data": "opaque"}
+
+
+def test_anthropic_unknown_block_does_not_shift_indices():
+    """Blocks the port does not materialize still leave later deltas addressable."""
+
+    from pi.ai.providers import anthropic
+    from pi.ai.providers.base import ProviderState
+
+    state = ProviderState(make_model("anthropic"), 0)
+
+    async def run():
+        for data in (
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "future_block"}},
+            {"type": "content_block_start", "index": 1, "content_block": {"type": "text"}},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "kept"}},
+        ):
+            async for _ in anthropic._convert_events(None, data, state):
+                pass
+
+    asyncio.run(run())
+    assert [type(block).__name__ for block in state.partial.content] == ["TextContent"]
+    assert state.partial.content[0].text == "kept"
+
+
 def test_anthropic_request_includes_tools(monkeypatch):
     from pi.ai.providers import anthropic
     from pi.ai.types import SystemMessage, Tool

@@ -200,8 +200,11 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
         if isinstance(block, TextContent):
             blocks.append({"type": "text", "text": block.text})
         elif isinstance(block, ThinkingContent):
-            # Replay requires the provider signature; drop unsigned thinking.
-            if block.thinking_signature:
+            if block.redacted:
+                # Redacted thinking travels back as the opaque payload.
+                blocks.append({"type": "redacted_thinking", "data": block.thinking_signature or ""})
+            elif block.thinking_signature:
+                # Replay requires the provider signature; drop unsigned thinking.
                 blocks.append(
                     {
                         "type": "thinking",
@@ -252,30 +255,38 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         block_type = block.get("type")
         if block_type == "text":
             state.add_text(index)
-            yield TextStartEvent(content_index=index, partial=state.snapshot())
+            yield TextStartEvent(content_index=state.position_of(index), partial=state.snapshot())
         elif block_type == "thinking":
             state.add_thinking(index)
             if block.get("redacted"):
-                partial.content[index].redacted = True  # type: ignore[union-attr]
-            yield ThinkingStartEvent(content_index=index, partial=state.snapshot())
+                state.block_at(index).redacted = True  # type: ignore[union-attr]
+            yield ThinkingStartEvent(content_index=state.position_of(index), partial=state.snapshot())
+        elif block_type == "redacted_thinking":
+            state.add_thinking(index)
+            redacted = state.block_at(index)
+            redacted.thinking = "[Reasoning redacted]"
+            redacted.thinking_signature = block.get("data", "")
+            redacted.redacted = True
+            yield ThinkingStartEvent(content_index=state.position_of(index), partial=state.snapshot())
         elif block_type == "tool_use":
             tool_call = ToolCall(id=block.get("id", ""), name=block.get("name", ""), arguments={})
             state.add_tool_call(index, tool_call)
-            yield ToolCallStartEvent(content_index=index, partial=state.snapshot())
+            yield ToolCallStartEvent(content_index=state.position_of(index), partial=state.snapshot())
         return
 
     if etype == "content_block_delta":
         index = data["index"]
         delta = data.get("delta", {})
         delta_type = delta.get("type")
-        block = partial.content[index] if index < len(partial.content) else None
+        block = state.block_at(index)
+        content_index = state.position_of(index)
         if delta_type == "text_delta" and isinstance(block, TextContent):
             block.text += delta.get("text", "")
-            yield TextDeltaEvent(content_index=index, delta=delta.get("text", ""), partial=state.snapshot())
+            yield TextDeltaEvent(content_index=content_index, delta=delta.get("text", ""), partial=state.snapshot())
         elif delta_type == "thinking_delta" and isinstance(block, ThinkingContent):
             block.thinking += delta.get("thinking", "")
             yield ThinkingDeltaEvent(
-                content_index=index, delta=delta.get("thinking", ""), partial=state.snapshot()
+                content_index=content_index, delta=delta.get("thinking", ""), partial=state.snapshot()
             )
         elif delta_type == "signature_delta" and isinstance(block, ThinkingContent):
             block.thinking_signature = (block.thinking_signature or "") + delta.get("signature", "")
@@ -284,18 +295,19 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
                 "__raw__": (block.arguments.get("__raw__", "") or "") + delta.get("partial_json", "")
             }
             yield ToolCallDeltaEvent(
-                content_index=index, delta=delta.get("partial_json", ""), partial=state.snapshot()
+                content_index=content_index, delta=delta.get("partial_json", ""), partial=state.snapshot()
             )
         return
 
     if etype == "content_block_stop":
         index = data["index"]
-        block = partial.content[index] if index < len(partial.content) else None
+        block = state.block_at(index)
+        content_index = state.position_of(index)
         if isinstance(block, TextContent):
-            yield TextEndEvent(content_index=index, content=block.text, partial=state.snapshot())
+            yield TextEndEvent(content_index=content_index, content=block.text, partial=state.snapshot())
         elif isinstance(block, ThinkingContent):
             yield ThinkingEndEvent(
-                content_index=index, content=block.thinking, partial=state.snapshot()
+                content_index=content_index, content=block.thinking, partial=state.snapshot()
             )
         elif isinstance(block, ToolCall):
             raw = block.arguments.pop("__raw__", "") if "__raw__" in block.arguments else None
@@ -307,7 +319,7 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
                     block.arguments = {"__invalid__": raw}
             else:
                 block.arguments = {}
-            yield ToolCallEndEvent(content_index=index, tool_call=block, partial=state.snapshot())
+            yield ToolCallEndEvent(content_index=content_index, tool_call=block, partial=state.snapshot())
         return
 
     if etype == "message_delta":
