@@ -60,7 +60,7 @@ class OAuthCallbackServer:
         self.settled = False
 
     async def wait(self):
-        return await self._future
+        return await asyncio.shield(self._future)
 
     def cancel(self):
         """Stop waiting for the browser unless a callback is already being completed."""

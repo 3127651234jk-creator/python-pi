@@ -64,7 +64,8 @@ class EventStream(Generic[T, U]):
     """
 
     def __init__(self, is_done: Callable[[T], bool], get_result: Callable[[T], U]) -> None:
-        self._queue: "asyncio.Queue[Optional[T]]" = asyncio.Queue()
+        self._queue: "asyncio.Queue[object]" = asyncio.Queue()
+        self._sentinel = object()
         self._is_done = is_done
         self._get_result = get_result
         self._result: Optional[U] = None
@@ -84,7 +85,7 @@ class EventStream(Generic[T, U]):
         self._result = result
         self._ended = True
         self._completion.set()
-        self._queue.put_nowait(None)
+        self._queue.put_nowait(self._sentinel)
 
     async def result(self) -> U:
         await self._completion.wait()
@@ -95,11 +96,11 @@ class EventStream(Generic[T, U]):
 
     async def __anext__(self) -> T:
         event = await self._queue.get()
-        if event is None:
+        if event is self._sentinel:
             # Keep completion visible to later and concurrent consumers.
-            self._queue.put_nowait(None)
+            self._queue.put_nowait(self._sentinel)
             raise StopAsyncIteration
-        return event
+        return cast(T, event)
 
 
 class AsyncEventStream(Generic[T]):
