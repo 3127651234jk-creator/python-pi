@@ -236,7 +236,17 @@ async def _git_files(root: str) -> Optional[List[str]]:
             git, "-C", root, "ls-files", "-z", "-c", "-o", "--exclude-standard",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        data, _ = await process.communicate()
+        try:
+            data, _ = await process.communicate()
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                # Drain stdout so a full pipe cannot block process.wait().
+                await process.communicate()
+            await process.wait()
     except OSError:
         return None
     if process.returncode != 0:
@@ -332,6 +342,8 @@ async def grep_python(root: str, pattern: str, *, glob: Optional[str] = None, ig
                 lines.append(rendered)
                 size += len(rendered.encode("utf-8")) + 1
                 byte_limited = size > DEFAULT_MAX_BYTES
+                if byte_limited:
+                    break
             if byte_limited:
                 break
         if limited or byte_limited:

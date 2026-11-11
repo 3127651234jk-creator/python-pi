@@ -42,7 +42,7 @@ class AbortSignal:
 
         if self.aborted:
             listener()
-            return listener
+            return lambda: None
 
         async def waiter() -> None:
             await self._event.wait()
