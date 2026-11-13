@@ -41,17 +41,15 @@ JSON_RPC_METHOD_NOT_FOUND = -32601
 
 
 def _windows_batch_command(command: str, args: List[str]) -> str:
-    """Escape cmd.exe syntax, including the second parse of npm .bin shims."""
+    """Escape both cmd.exe parses when a batch shim forwards arguments with %*."""
     meta = re.compile(r'([()\[\]%!^"`<>&|;, *?])')
     escaped = [meta.sub(r"^\1", command)]
-    double_escape = re.search(r"node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$", command, re.I) is not None
     for arg in args:
         arg = re.sub(r'(\\*)"', lambda match: match[1] * 2 + '\\"', arg)
         trailing = len(arg) - len(arg.rstrip("\\"))
         arg += "\\" * trailing
         arg = meta.sub(r"^\1", '"' + arg + '"')
-        if double_escape:
-            arg = meta.sub(r"^\1", arg)
+        arg = meta.sub(r"^\1", arg)
         escaped.append(arg)
     return " ".join(escaped)
 
