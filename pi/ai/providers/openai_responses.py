@@ -98,7 +98,14 @@ async def stream_openai_responses(model, context, options=None):
         kind = data.get("type", event_name) if isinstance(data, dict) else ""
         key = data.get("output_index", 0) if isinstance(data, dict) else 0
         events = []
-        if kind in ("response.output_text.delta", "response.refusal.delta"):
+        if kind in ("response.refusal.delta", "response.refusal.done"):
+            raise RuntimeError(f"Provider refusal: {data.get('delta') or data.get('refusal') or 'request refused'}")
+        if kind == "response.output_item.done" and data["item"].get("type") == "message":
+            refusals = [part.get("refusal", "request refused") for part in data["item"].get("content", [])
+                        if part.get("type") == "refusal"]
+            if refusals:
+                raise RuntimeError("Provider refusal: " + "\n".join(refusals))
+        if kind == "response.output_text.delta":
             events = blocks.text((key, data.get("content_index", 0)), data["delta"])
         elif kind == "response.reasoning_summary_text.delta":
             events = blocks.text(("thinking", key), data["delta"], thinking=True)
@@ -122,6 +129,11 @@ async def stream_openai_responses(model, context, options=None):
             events = blocks.hosted_call(("hosted", key), data["item"])
         elif kind in ("response.completed", "response.incomplete"):
             response = data["response"]
+            refusals = [part.get("refusal", "request refused") for item in response.get("output", [])
+                        if item.get("type") == "message" for part in item.get("content", [])
+                        if part.get("type") == "refusal"]
+            if refusals:
+                raise RuntimeError("Provider refusal: " + "\n".join(refusals))
             usage = response.get("usage") or {}
             cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
             state.set_usage(usage_from_counts(max(0, usage.get("input_tokens", 0) - cached), usage.get("output_tokens", 0), cached,
@@ -129,6 +141,14 @@ async def stream_openai_responses(model, context, options=None):
             state.partial.usage.cost = model.calculate_cost(state.partial.usage)
             state.set_response(response.get("id"), response.get("model"))
             executed = any(isinstance(b, ToolCall) and b.raw_item is None for b in state.partial.content)
+            status = response.get("status")
+            state.set_raw_stop_reason(status or kind)
+            if status not in (None, "completed", "incomplete"):
+                raise RuntimeError(f"Provider response status: {status}")
+            if kind == "response.incomplete":
+                incomplete = (response.get("incomplete_details") or {}).get("reason")
+                if incomplete != "max_output_tokens":
+                    raise RuntimeError(f"Response incomplete: {incomplete or 'without a provider reason'}")
             reason = "length" if kind == "response.incomplete" else "toolUse" if executed else "stop"
             events = blocks.finish(reason)
         elif kind in ("error", "response.failed"):

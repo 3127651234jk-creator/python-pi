@@ -15,6 +15,7 @@ import base64
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import secrets
@@ -278,34 +279,43 @@ class McpClient:
             self._fail_pending("MCP server disconnected")
 
     async def _http_listener(self) -> None:
-        """Best-effort SSE listen stream for server push on Streamable HTTP."""
-
-        try:
-            headers = {"Accept": "text/event-stream", "MCP-Protocol-Version": getattr(self, "version", "2025-03-26")}
-            if self.session_id:
-                headers["Mcp-Session-Id"] = self.session_id
-            if self.bearer():
-                headers["Authorization"] = "Bearer " + self.bearer()
-            async with self.http.stream("GET", self.config["url"], headers=headers) as response:
-                if response.status_code >= 400:
+        """Listen without an idle read deadline; retry interrupted push streams."""
+        delay = 1.0
+        timeout = httpx.Timeout(self.config.get("timeout", 60), read=None)
+        while True:
+            try:
+                headers = {"Accept": "text/event-stream", "MCP-Protocol-Version": getattr(self, "version", "2025-03-26")}
+                if self.session_id:
+                    headers["Mcp-Session-Id"] = self.session_id
+                if self.bearer():
+                    headers["Authorization"] = "Bearer " + self.bearer()
+                async with self.http.stream("GET", self.config["url"], headers=headers, timeout=timeout) as response:
+                    if response.status_code == 405:
+                        return  # Servers may explicitly decline the optional GET stream.
+                    response.raise_for_status()
+                    data = []
+                    async for line in response.aiter_lines():
+                        if line.startswith("data:"):
+                            data.append(line[5:].lstrip())
+                        elif not line and data:
+                            payload = "\n".join(data)
+                            data = []
+                            try:
+                                event = json.loads(payload)
+                            except ValueError:
+                                continue
+                            if isinstance(event, dict):
+                                await self._dispatch(event)
+                                delay = 1.0
+                logging.getLogger(__name__).warning("MCP %s push stream ended; reconnecting", self.name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep optional push failures isolated
+                logging.getLogger(__name__).warning("MCP %s push stream failed: %s", self.name, exc)
+                if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500:
                     return
-                data = []
-                async for line in response.aiter_lines():
-                    if line.startswith("data:"):
-                        data.append(line[5:].lstrip())
-                    elif not line and data:
-                        payload = "\n".join(data)
-                        data = []
-                        try:
-                            event = json.loads(payload)
-                        except ValueError:
-                            continue
-                        if isinstance(event, dict):
-                            await self._dispatch(event)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001  # the listen stream is optional per spec
-            return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
 
     async def _dispatch(self, message: dict) -> None:
         method = message.get("method")
@@ -496,6 +506,7 @@ class McpManager:
         self.lazy_servers = set()
         self.log_path = config.agent_dir / "mcp.log"
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
+        self._reconnect_locks: Dict[str, asyncio.Lock] = {}
         self.extension_servers: Dict[str, dict] = {}
         self.extension_server_owners: Dict[str, str] = {}
 
@@ -823,31 +834,38 @@ class McpManager:
                 or isinstance(exc, (asyncio.TimeoutError, OSError))
             if not transient:
                 raise
-            await self.reconnect(server)
+            await self.reconnect(server, client)
             if signal:
                 signal.throw_if_aborted()
             return await self.clients[server].request(method, params)
 
-    async def reconnect(self, server: str) -> None:
-        client = self.clients.get(server)
+    async def reconnect(self, server: str, client: Optional[McpClient] = None) -> None:
+        if client is None:
+            client = self.clients.get(server)
         if client is None:
             raise ValueError(f"MCP server not connected: {server}")
-        namespace = re.sub(r"[^A-Za-z0-9_]", "_", server)
-        replacement = McpClient(server, client.config, client.cwd)
-        try:
-            await self._connect_client(replacement, namespace)
-        except BaseException:
+        lock = self._reconnect_locks.setdefault(server, asyncio.Lock())
+        async with lock:
+            # A concurrent caller may already have replaced the failed connection.
+            if self.clients.get(server) is not client:
+                return
+            namespace = re.sub(r"[^A-Za-z0-9_]", "_", server)
+            replacement = McpClient(server, client.config, client.cwd)
             try:
-                await replacement.close()
+                await self._connect_client(replacement, namespace)
             except BaseException:
-                pass
-            raise
-        # Retire the old client only after the replacement connected: a failed
-        # reconnect must not leave a closed client registered, where every
-        # later call would raise AttributeError and never retry.
-        await client.close()
-        self.clients[server] = replacement
-        await self.ensure_tools(server)
+                try:
+                    await replacement.close()
+                except BaseException:
+                    pass
+                raise
+            # Retire the old client only after the replacement connected: a failed
+            # reconnect must not leave a closed client registered, where every
+            # later call would raise AttributeError and never retry.
+            await client.close()
+            self.clients[server] = replacement
+            await self.ensure_tools(server)
+    
 
     async def ensure_tools(self, server: str) -> None:
         """Discover tools for a lazily-connected server and refresh changed tool sets."""

@@ -146,6 +146,7 @@ class Harness:
 
         self.register_definition(compact_definition())
         self._stop = asyncio.Event()
+        self._signals: Dict[int, asyncio.Event] = {}
 
     # -- registration ---------------------------------------------------------
 
@@ -275,6 +276,9 @@ class Harness:
             tx._mark_table_write()
 
         await self.session.commit(change, _scope_for(self, task_id))
+        signal = self._signals.get(task_id)
+        if signal is not None:
+            signal.set()
 
     # -- scheduler ---------------------------------------------------------------
 
@@ -367,6 +371,7 @@ class Harness:
 
         signal = asyncio.Event()
         runtime = TaskRuntime(self, task.id, signal)
+        self._signals[task.id] = signal
         try:
             # Reserve: pending -> running. On reopen, running resets to pending.
             # A task that cannot be reserved (for example a version migration)
@@ -387,7 +392,23 @@ class Harness:
                 if handler is None:
                     await self._fault_or_orphan(current, "faulted", f"Task {current.kind} has no phase {phase!r}")
                     return
-                await handler(current, runtime, self)
+                phase_task = asyncio.create_task(handler(current, runtime, self))
+                abort_wait = asyncio.create_task(signal.wait())
+                try:
+                    done, _ = await asyncio.wait((phase_task, abort_wait), return_when=asyncio.FIRST_COMPLETED)
+                    if phase_task not in done:
+                        phase_task.cancel()
+                        await asyncio.gather(phase_task, return_exceptions=True)
+                        latest = await self._get_task(task.id)
+                        if latest is not None:
+                            await self._abort_now(latest, definition)
+                        return
+                    await phase_task
+                finally:
+                    abort_wait.cancel()
+                    if not phase_task.done():
+                        phase_task.cancel()
+                    await asyncio.gather(phase_task, abort_wait, return_exceptions=True)
                 after = await self._get_task(task.id)
                 if after is None or after.state.status in ("completing", "terminal", "waiting"):
                     return
@@ -401,6 +422,9 @@ class Harness:
                 await self._fault_or_orphan(
                     current, "faulted", f"{type(exc).__name__}: {error_message(exc)}"
                 )
+
+        finally:
+            self._signals.pop(task.id, None)
 
     async def _reserve(self, task_id: int, definition: TaskDefinition, record: TaskRecord) -> Optional[TaskRecord]:
         """Claim a pending task (or recover a stale running one), migrating input."""
@@ -449,11 +473,16 @@ class Harness:
         on the non-reentrant line lock."""
 
         signal = asyncio.Event()
+        signal.set()
         runtime = TaskRuntime(self, task.id, signal)
+        runtime._in_abort = True
         try:
             current = await self._get_task(task.id)
             if current is not None and current.state.status not in ("completing", "terminal"):
-                await definition.abort(current, runtime, self)
+                if (current.state.checkpoint or {}).get("phase") == "settle":
+                    await definition.phases["settle"](current, runtime, self)
+                else:
+                    await definition.abort(current, runtime, self)
         except Exception as exc:  # noqa: BLE001
             current = await self._get_task(task.id)
             if current is not None and current.state.status not in ("completing", "terminal"):

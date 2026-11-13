@@ -55,7 +55,7 @@ _STOP_REASON_MAP = {
     "stop_sequence": "stop",
     "tool_use": "toolUse",
     "max_tokens": "length",
-    "refusal": "stop",
+    "pause_turn": "stop",
 }
 
 
@@ -206,8 +206,8 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
             if block.redacted:
                 # Redacted thinking travels back as the opaque payload.
                 blocks.append({"type": "redacted_thinking", "data": block.thinking_signature or ""})
-            elif block.thinking_signature:
-                # Replay requires the provider signature; drop unsigned thinking.
+            elif block.thinking_signature and block.thinking_signature.strip():
+                # Signed thinking must replay with its original signature.
                 blocks.append(
                     {
                         "type": "thinking",
@@ -215,6 +215,8 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
                         "signature": block.thinking_signature,
                     }
                 )
+            elif block.thinking.strip():
+                blocks.append({"type": "text", "text": block.thinking})
         elif isinstance(block, ToolCall) and block.raw_item is None:
             blocks.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.arguments})
         # Hosted tool calls have no Anthropic replay shape and are dropped.
@@ -272,7 +274,7 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
             redacted.redacted = True
             yield ThinkingStartEvent(content_index=state.position_of(index), partial=state.snapshot())
         elif block_type == "tool_use":
-            tool_call = ToolCall(id=block.get("id", ""), name=block.get("name", ""), arguments={})
+            tool_call = ToolCall(id=block.get("id", ""), name=block.get("name", ""), arguments=dict(block.get("input") or {}))
             state.add_tool_call(index, tool_call)
             yield ToolCallStartEvent(content_index=state.position_of(index), partial=state.snapshot())
         return
@@ -320,7 +322,7 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
                     block.arguments = parsed if isinstance(parsed, dict) else {"value": parsed}
                 except (json.JSONDecodeError, ValueError):
                     block.arguments = {"__invalid__": raw}
-            else:
+            elif raw is not None:
                 block.arguments = {}
             yield ToolCallEndEvent(content_index=content_index, tool_call=block, partial=state.snapshot())
         return
@@ -339,7 +341,10 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
 
     if etype == "message_stop":
         raw = partial.raw_stop_reason or "end_turn"
-        yield DoneEvent(reason=_STOP_REASON_MAP.get(raw, "stop"), message=state.snapshot())
+        partial.stop_reason = _STOP_REASON_MAP.get(raw, "error")
+        if partial.stop_reason == "error":
+            raise RuntimeError(f"Provider stop_reason: {raw}")
+        yield DoneEvent(reason=partial.stop_reason, message=state.snapshot())
         return
 
     if etype == "error":

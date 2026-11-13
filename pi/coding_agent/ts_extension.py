@@ -479,7 +479,9 @@ class TsExtensionBridge:
             elif method == "setModel":
                 if api.context.agent.is_streaming:
                     raise RuntimeError("Changing models requires an idle agent")
-                registry = ModelRegistry(api.context.config or Configuration(str(api.context.cwd)))
+                registry = api.context.registry
+                if registry is None:
+                    registry = ModelRegistry(api.context.config or Configuration(str(api.context.cwd)))
                 selected = params["model"]
                 model = registry.resolve(selected["provider"], selected["id"])
                 try:

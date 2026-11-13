@@ -160,6 +160,10 @@ class RemoteServiceProvider:
             if closed or registration["instances"].get(key) is not instance:
                 return
             closed = True
+            instance["active"] = False
+            for unsubscribe in instance["unsubscribe"]:
+                unsubscribe()
+            instance["unsubscribe"].clear()
             del registration["instances"][key]
             self._emit(registration, {"type": "closed", "instance": address})
 
@@ -214,6 +218,14 @@ class RemoteServiceProvider:
             return
         self._disposed = True
         for registration in self._registrations.values():
+            instances = list(registration["instances"].values())
+            if registration["singleton"] is not None:
+                instances.append(registration["singleton"])
+            for instance in instances:
+                instance["active"] = False
+                for unsubscribe in instance["unsubscribe"]:
+                    unsubscribe()
+                instance["unsubscribe"].clear()
             if registration["singleton"] is not None:
                 registration["singleton"] = None
                 self._emit(registration, {"type": "unavailable"})
@@ -239,7 +251,7 @@ class RemoteServiceProvider:
 
     def _create_instance(self, registration: Dict[str, Any], members: Dict[str, Dict[str, Any]],
                          address: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        instance: Dict[str, Any] = {"address": address, "members": members, "active": True}
+        instance: Dict[str, Any] = {"address": address, "members": members, "active": True, "unsubscribe": []}
         for name, member in members.items():
             if member["kind"] != "state":
                 continue
@@ -253,7 +265,7 @@ class RemoteServiceProvider:
                     update["instance"] = dict(address)
                 self._emit(registration, update)
 
-            member["state"].subscribe_source(listener)
+            instance["unsubscribe"].append(member["state"].subscribe_source(listener))
         return instance
 
     def _resolve_instance(self, registration: Dict[str, Any],

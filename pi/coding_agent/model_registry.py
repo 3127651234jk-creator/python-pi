@@ -142,8 +142,14 @@ class ModelRegistry:
             for entry in entries:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
                     raise ModelError("Model requires a nonempty id")
-                if set(entry) - {"id", "name", "reasoning", "context_window", "max_tokens", "input", "costs", "params", "base_url", "thinking_level_map"}:
+                if set(entry) - {"id", "name", "reasoning", "context_window", "max_tokens", "input", "costs", "params", "base_url", "thinking_level_map", "compat"}:
                     raise ModelError("Unknown model capability field")
+                compat = entry.get("compat", {})
+                if (not isinstance(compat, dict)
+                        or set(compat) - {"maxTokensField", "supportsUsageInStreaming"}
+                        or ("maxTokensField" in compat and compat["maxTokensField"] not in ("max_tokens", "max_completion_tokens"))
+                        or ("supportsUsageInStreaming" in compat and not isinstance(compat["supportsUsageInStreaming"], bool))):
+                    raise ModelError("Invalid model compat settings")
                 if "params" in entry and (not isinstance(entry["params"], dict) or not all(isinstance(k, str) for k in entry["params"])):
                     raise ModelError("Model params must be an object with string keys")
                 if "base_url" in entry and (not isinstance(entry["base_url"], str) or not entry["base_url"]):

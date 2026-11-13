@@ -98,6 +98,8 @@ class Model:
     # Provider-specific thinking-level mapping (pi level -> provider level or None),
     # carried verbatim from catalogs such as the Radius gateway /v1/config response.
     thinking_level_map: Optional[Dict[str, Optional[str]]] = None
+    # Chat Completions compatibility overrides, using the TS catalog keys.
+    compat: Dict[str, object] = field(default_factory=dict)
 
     def calculate_cost(self, usage) -> Dict[str, float]:
         m = 1_000_000.0

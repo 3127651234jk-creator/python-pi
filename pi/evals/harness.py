@@ -386,7 +386,7 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
             workspace, agent_dir, host_agent_dir, selection)
         if sandbox_identity:
             try:
-                os.remove(host_auth)
+                os.remove(os.path.join(agent_dir, "auth.json"))
             except FileNotFoundError:
                 pass
             if api_key and not stored_credential:

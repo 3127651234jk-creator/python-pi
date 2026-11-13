@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from pi.coding_agent.config import Configuration, write_json
-from pi.coding_agent.mcp import McpManager
+from pi.coding_agent.mcp import McpClient, McpManager
 
 
 def test_stdio_discovery_call_and_close(tmp_path):
@@ -150,3 +150,31 @@ def test_http_session_and_error_mapping(tmp_path, monkeypatch):
         finally:
             await manager.close()
     asyncio.run(check())
+
+def test_concurrent_reconnects_share_replacement(tmp_path, monkeypatch):
+    async def check():
+        manager = McpManager(Configuration(str(tmp_path), str(tmp_path / "user")))
+        old = McpClient("test", {"command": sys.executable}, tmp_path)
+        manager.clients["test"] = old
+        replacements = []
+
+        async def connect(client, namespace):
+            replacements.append(client)
+            await asyncio.sleep(0)
+
+        async def refresh(server):
+            pass
+
+        monkeypatch.setattr(manager, "_connect_client", connect)
+        monkeypatch.setattr(manager, "ensure_tools", refresh)
+        try:
+            await asyncio.gather(manager.reconnect("test", old), manager.reconnect("test", old))
+            assert len(replacements) == 1
+            assert manager.clients["test"] is replacements[0]
+            await manager.reconnect("test", old)
+            assert len(replacements) == 1
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
+

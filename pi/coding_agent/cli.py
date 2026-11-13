@@ -14,6 +14,7 @@ import shutil
 import sys
 import json
 import getpass
+import threading
 from contextlib import nullcontext, redirect_stdout
 from typing import Any, Callable, List, Optional, Tuple
 import httpx
@@ -380,6 +381,33 @@ SLASH_HELP = """Commands:
 Anything else is sent as a prompt. Ctrl+C aborts the current run."""
 
 
+async def read_console_input() -> str:
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+
+    def deliver(value, error):
+        if result.done():
+            return
+        if error is not None:
+            result.set_exception(error)
+        else:
+            result.set_result(value)
+
+    def read():
+        value, error = None, None
+        try:
+            value = input("\n> ").strip()
+        except BaseException as exc:
+            error = exc
+        try:
+            loop.call_soon_threadsafe(deliver, value, error)
+        except RuntimeError:
+            pass  # The loop has already closed after cancellation.
+
+    threading.Thread(target=read, daemon=True).start()
+    return await result
+
+
 async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optional[SessionManager], registry: Optional[ModelRegistry] = None,
                            resources: Optional[ResourceCatalog] = None, mcp: Optional[McpManager] = None,
                            extensions: Optional[ExtensionManager] = None, ui: Optional[TerminalUI] = None,
@@ -394,7 +422,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
             print(f"error: {exc}")
     while True:
         try:
-            value = await ui.read() if ui else await loop.run_in_executor(None, lambda: input("\n> ").strip())
+            value = await ui.read() if ui else await read_console_input()
         except (EOFError, KeyboardInterrupt):
             print()
             break

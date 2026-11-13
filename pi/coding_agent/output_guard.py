@@ -36,6 +36,8 @@ def take_over_stdout() -> None:
     global _state
     if _state is not None:
         return
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     _state = sys.stdout
     sys.stdout = _Forwarder(_state)
 

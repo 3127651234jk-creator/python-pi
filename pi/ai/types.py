@@ -475,15 +475,9 @@ def get_system_message_text(message: SystemMessage) -> str:
         text = message.content
     else:
         text = "\n".join(block.text for block in message.content)
-    if message.sections:
-        rendered = []
-        for name, section in message.sections.items():
-            if section is None:
-                continue
-            rendered.append(section if name == "preamble" else f"<{name}>\n{section}\n</{name}>")
-        if rendered:
-            text = (text + "\n\n" if text else "") + "\n\n".join(rendered)
-    return text
+    parts = [text]
+    parts.extend(section for section in (message.sections or {}).values() if section is not None)
+    return "\n\n".join(part for part in parts if part)
 
 
 def get_message_text(content: Union[str, List[Any]]) -> str:

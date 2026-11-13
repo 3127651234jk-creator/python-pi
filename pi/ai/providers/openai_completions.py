@@ -8,7 +8,7 @@ OpenRouter, vLLM, llama.cpp, ...).
 from __future__ import annotations
 
 import json
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from ..models import Model
@@ -54,7 +54,6 @@ _FINISH_REASON_MAP = {
     "function_call": "toolUse",
     "length": "length",
     "max_tokens": "length",
-    "content_filter": "stop",
 }
 
 
@@ -64,9 +63,17 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
     body: Dict[str, Any] = {
         "model": model.id,
         "stream": True,
-        "stream_options": {"include_usage": True},
         "messages": convert_messages(system, messages),
     }
+    if model.compat.get("supportsUsageInStreaming", True):
+        body["stream_options"] = {"include_usage": True}
+    default_token_field = (
+        "max_completion_tokens" if model.provider == "openai" or model.api == "azure-openai"
+        or urlsplit(model.base_url).hostname == "api.openai.com" else "max_tokens"
+    )
+    token_field = model.compat.get("maxTokensField", default_token_field)
+    if token_field not in ("max_tokens", "max_completion_tokens"):
+        raise ValueError("compat.maxTokensField must be max_tokens or max_completion_tokens")
     tools = _declared_tools(system)
     if tools:
         body["tools"] = [
@@ -79,9 +86,9 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
             del body["tools"]
             del body["tool_choice"]
     if options and options.max_tokens:
-        body["max_tokens"] = options.max_tokens
+        body[token_field] = options.max_tokens
     else:
-        body["max_tokens"] = model.max_tokens
+        body[token_field] = model.max_tokens
     if options and options.temperature is not None:
         body["temperature"] = options.temperature
     reasoning = options.reasoning if options else None
@@ -238,6 +245,8 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
     state.set_response(data.get("id"), data.get("model"))
 
     delta = choice.get("delta") or {}
+    if delta.get("refusal"):
+        raise RuntimeError(f"Provider refusal: {delta['refusal']}")
 
     # Reasoning content (DeepSeek-style) maps to thinking blocks.
     reasoning_text = delta.get("reasoning_content") or delta.get("reasoning")
@@ -288,8 +297,12 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
 
     finish_reason = choice.get("finish_reason")
     if finish_reason:
+        if partial.raw_stop_reason is not None:
+            return
         state.set_raw_stop_reason(finish_reason)
-        partial.stop_reason = _FINISH_REASON_MAP.get(finish_reason, "stop")
+        partial.stop_reason = _FINISH_REASON_MAP.get(finish_reason, "error")
+        if partial.stop_reason == "error":
+            raise RuntimeError(f"Provider finish_reason: {finish_reason}")
         for event in _close_blocks(state):
             yield event
         return
@@ -305,7 +318,9 @@ def _close_blocks(state: ProviderState) -> List[Any]:
         elif isinstance(block, ThinkingContent):
             events.append(ThinkingEndEvent(content_index=index, content=block.thinking, partial=state.snapshot()))
         elif isinstance(block, ToolCall):
-            raw = block.arguments.pop("__raw__", "")
+            if "__raw__" not in block.arguments:
+                continue  # Already finalized: retain parsed arguments.
+            raw = block.arguments.pop("__raw__")
             if raw:
                 try:
                     parsed = json.loads(raw)
