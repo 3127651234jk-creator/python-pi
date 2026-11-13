@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import signal as process_signal
 import tempfile
@@ -37,6 +38,22 @@ from .model_registry import expand, validate_url
 RESOURCE_TOOLS = ("list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource")
 
 JSON_RPC_METHOD_NOT_FOUND = -32601
+
+
+def _windows_batch_command(command: str, args: List[str]) -> str:
+    """Escape cmd.exe syntax, including the second parse of npm .bin shims."""
+    meta = re.compile(r'([()\[\]%!^"`<>&|;, *?])')
+    escaped = [meta.sub(r"^\1", command)]
+    double_escape = re.search(r"node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$", command, re.I) is not None
+    for arg in args:
+        arg = re.sub(r'(\\*)"', lambda match: match[1] * 2 + '\\"', arg)
+        trailing = len(arg) - len(arg.rstrip("\\"))
+        arg += "\\" * trailing
+        arg = meta.sub(r"^\1", '"' + arg + '"')
+        if double_escape:
+            arg = meta.sub(r"^\1", arg)
+        escaped.append(arg)
+    return " ".join(escaped)
 
 
 class McpMethodNotFound(RuntimeError):
@@ -183,13 +200,23 @@ class McpClient:
     async def connect(self, auth_header: str = ""):
         if "command" in self.config:
             env = {**os.environ, **{k: expand(v) for k, v in self.config.get("env", {}).items()}}
-            self.process = await asyncio.create_subprocess_exec(
-                os.path.expanduser(self.config["command"]), *self.config.get("args", []),
-                cwd=str(self.cwd / self.config.get("cwd", ".")), env=env,
+            command = os.path.expanduser(self.config["command"])
+            args = self.config.get("args", [])
+            cwd = str(self.cwd / self.config.get("cwd", "."))
+            if sys.platform == "win32":
+                candidate = os.path.join(cwd, command) if os.path.dirname(command) else command
+                command = shutil.which(candidate, path=env.get("PATH")) or command
+            options = dict(
+                cwd=cwd, env=env,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 limit=16 * 1024 * 1024,
                 start_new_session=sys.platform != "win32",
             )
+            if sys.platform == "win32" and os.path.splitext(command)[1].lower() in (".cmd", ".bat"):
+                self.process = await asyncio.create_subprocess_shell(
+                    _windows_batch_command(command, args), executable=env.get("COMSPEC", "cmd.exe"), **options)
+            else:
+                self.process = await asyncio.create_subprocess_exec(command, *args, **options)
             self.pump_task = asyncio.create_task(self._stdio_pump())
             async def drain():
                 while await self.process.stderr.read(4096):
