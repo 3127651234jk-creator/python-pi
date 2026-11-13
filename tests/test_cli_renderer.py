@@ -2,10 +2,34 @@
 returning to the prompt with no output."""
 
 import asyncio
+import pytest
 
-from pi.agent.types import MessageEndEvent, ToolExecutionStartEvent
-from pi.ai.types import AssistantMessage, Usage
+from pi.agent.types import AgentToolResult, MessageEndEvent, ToolExecutionStartEvent, ToolExecutionEndEvent
+from pi.ai.types import AssistantMessage, ImageContent, TextContent, Usage
 from pi.coding_agent.cli import CliRenderer
+
+
+@pytest.mark.parametrize("with_text", [False, True])
+@pytest.mark.parametrize("is_error", [False, True])
+def test_renderer_handles_image_first_tool_result(monkeypatch, capsys, with_text, is_error):
+    renderer = CliRenderer()
+    image = ImageContent(data="image-data", mime_type="image/png")
+    content = [image]
+    if with_text:
+        content.extend([TextContent(text="first text"), TextContent(text="second text")])
+    rendered = []
+    monkeypatch.setattr(renderer, "print_image_block", rendered.append)
+    asyncio.run(renderer(ToolExecutionEndEvent(
+        tool_call_id="screenshot", tool_name="screenshot",
+        result=AgentToolResult(content=content), is_error=is_error,
+    )))
+    assert rendered == [image]
+    output = capsys.readouterr().out
+    if with_text:
+        assert "first text" in output
+        assert "second text" in output
+    if is_error:
+        assert "error:" in output
 
 
 def assistant(**overrides) -> AssistantMessage:

@@ -94,7 +94,7 @@ def test_parent_exit_does_not_disable_interrupts(tmp_path, abort):
     script = tmp_path / "parent.py"
     script.write_text(
         "import subprocess, sys\n"
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'])\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; [(print(1, flush=True), time.sleep(0.02)) for _ in range(100)]'])\n"
     )
     tool = create_bash_tool(str(tmp_path), shell_command=lambda command: ([sys.executable, str(script)], False))
     signal = SimpleNamespace(aborted=False)
@@ -149,10 +149,14 @@ def test_windows_interrupt_kills_orphan_descendants(tmp_path, abort):
         "from pathlib import Path\n"
         "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
         "Path('pids').write_text(str(os.getpid()) + ' ' + str(grandchild.pid))\n"
-        "time.sleep(30)\n"
+        "while True: print(1, flush=True); time.sleep(0.02)\n"
     )
     parent = tmp_path / "parent.py"
-    parent.write_text("import subprocess, sys\nsubprocess.Popen([sys.executable, 'child.py'])\n")
+    parent.write_text(
+        "import subprocess, sys, time\nfrom pathlib import Path\n"
+        "subprocess.Popen([sys.executable, 'child.py'])\n"
+        "while not Path('pids').exists(): time.sleep(0.01)\n"
+    )
     signal = SimpleNamespace(aborted=False)
     tool = create_bash_tool(str(tmp_path), shell_command=lambda command: ([sys.executable, str(parent)], False))
 
@@ -217,5 +221,24 @@ def test_output_failure_terminates_command_immediately(tmp_path, monkeypatch):
         assert processes and all(process.returncode is not None for process in processes)
         assert not list(tmp_path.glob("pi-py-bash-*.log"))
         assert not any(task.get_coro().__qualname__ == "Process.wait" for task in asyncio.all_tasks())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("timeout", [None, 5])
+def test_parent_exit_with_idle_inherited_stdout(tmp_path, timeout):
+    script = tmp_path / "idle_parent.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "print('started', flush=True)\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'])\n"
+        "print('done', flush=True)\n"
+    )
+    tool = create_bash_tool(str(tmp_path), shell_command=lambda command: ([sys.executable, str(script)], False))
+
+    async def scenario():
+        result = await asyncio.wait_for(tool.execute("test", {"command": "unused", "timeout": timeout}), 1.5)
+        assert result.structured_content["exit_code"] == 0
+        assert result.structured_content["output"].splitlines() == ["started", "done"]
 
     asyncio.run(scenario())

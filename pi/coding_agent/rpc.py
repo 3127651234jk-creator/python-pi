@@ -35,6 +35,8 @@ import sys
 import uuid
 from typing import Optional
 
+import httpx
+
 from ..ai.json_io import to_json
 from ..ai.models import ModelError
 from ..ai.types import AssistantMessage, ImageContent, SystemMessage, TextContent, get_message_text
@@ -205,7 +207,8 @@ class RpcServer:
                 raise ValueError("type must be a string")
             if await self._handle(kind, command, response):
                 return
-        except (KeyError, ValueError, TypeError, OSError, RuntimeError, ModelError) as exc:
+        except (KeyError, ValueError, TypeError, OSError, RuntimeError, ModelError,
+                httpx.HTTPError, asyncio.TimeoutError) as exc:
             response.pop("data", None)
             response.update(success=False, error=str(exc))
         await self.writer.write(response)

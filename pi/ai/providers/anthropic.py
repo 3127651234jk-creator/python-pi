@@ -147,7 +147,9 @@ def convert_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     for message in messages:
         if isinstance(message, UserMessage):
             flush_results()
-            api_messages.append({"role": "user", "content": _user_content(message)})
+            content = _user_content(message)
+            if content and (not isinstance(content, str) or content.strip()):
+                api_messages.append({"role": "user", "content": content})
         elif isinstance(message, AssistantMessage):
             flush_results()
             api_messages.append({"role": "assistant", "content": _assistant_content(message)})
@@ -156,7 +158,7 @@ def convert_messages(messages: List[Any]) -> List[Dict[str, Any]]:
             for block in message.content:
                 if isinstance(block, ImageContent):
                     content.append(_image_block(block))
-                else:
+                elif isinstance(block, TextContent) and block.text.strip():
                     content.append({"type": "text", "text": block.text})
             if not content:
                 content = [{"type": "text", "text": "(empty result)"}]
@@ -182,7 +184,7 @@ def _user_content(message: UserMessage) -> Any:
             blocks.append(_image_block(block))
         elif isinstance(block, (AudioContent, VideoContent)):
             raise ValueError("Anthropic Messages does not support audio or video input")
-        else:
+        elif isinstance(block, TextContent) and block.text.strip():
             blocks.append({"type": "text", "text": block.text})
     return blocks
 
@@ -198,7 +200,8 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     for block in message.content:
         if isinstance(block, TextContent):
-            blocks.append({"type": "text", "text": block.text})
+            if block.text.strip():
+                blocks.append({"type": "text", "text": block.text})
         elif isinstance(block, ThinkingContent):
             if block.redacted:
                 # Redacted thinking travels back as the opaque payload.

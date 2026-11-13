@@ -16,12 +16,11 @@ def normalize_to_lf(content: str) -> str:
 
 
 def detect_line_ending(content: str) -> str:
-    index = content.find("\r")
-    if index == -1:
+    crlf_index = content.find("\r\n")
+    lf_index = content.find("\n")
+    if lf_index == -1 or crlf_index == -1:
         return "\n"
-    if index + 1 < len(content) and content[index + 1] == "\n":
-        return "\r\n"
-    return "\n"
+    return "\r\n" if crlf_index < lf_index else "\n"
 
 
 def restore_line_endings(content: str, ending: str) -> str:

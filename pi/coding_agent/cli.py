@@ -255,7 +255,7 @@ class CliRenderer:
                     return
             text = ""
             if result is not None and getattr(result, "content", None):
-                text = result.content[0].text
+                text = "\n".join(block.text for block in result.content if isinstance(block, TextContent))
             if event.is_error:
                 print(f"{indent}  error: {text}", flush=True)
             elif self.fold and result is not None and text:

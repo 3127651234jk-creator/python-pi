@@ -22,6 +22,7 @@ from .types import (
     AgentEvent,
     AgentLoopConfig,
     AgentTool,
+    MessageEndEvent,
 )
 
 
@@ -137,6 +138,14 @@ class Agent:
         self.error_message = None
         self._abort = AbortSignal()
         new_messages: List[Any] = []
+        completed_messages: List[Any] = []
+
+        async def emit(event: AgentEvent) -> None:
+            # Record completion before subscribers run: a subscriber may persist
+            # the message and then another subscriber may raise.
+            if isinstance(event, MessageEndEvent):
+                completed_messages.append(event.message)
+            await self._emit(event)
 
         try:
             config = self._build_config()
@@ -150,14 +159,14 @@ class Agent:
                 prompts=prompts,
                 context=AgentContext(messages=list(self.messages), tools=list(self.tools)),
                 config=config,
-                emit=self._emit,
+                emit=emit,
                 signal=self._abort,
                 stream_fn=compacted_stream,
             )
         finally:
             self.is_streaming = False
             self._abort = None
-            self.messages = _sync_messages(self, new_messages)
+            self.messages = _sync_messages(self, completed_messages)
         return new_messages
 
     def _build_config(self) -> AgentLoopConfig:
@@ -240,9 +249,8 @@ def _user_input(text: str, images: Optional[List[Any]]) -> UserMessage:
 def _sync_messages(agent: "Agent", new_messages: List[Any]) -> List[Any]:
     """Rebuild the transcript from agent state plus the new messages.
 
-    The loop mutates its own context copy; the Agent keeps one authoritative
-    list: everything that was in ``self.messages`` before the run, plus the
-    messages appended by the run.
+    Keep completed messages even when the loop raises before returning its
+    result. Completion is recorded before notifying external subscribers.
     """
     return list(agent.messages) + list(new_messages)
 

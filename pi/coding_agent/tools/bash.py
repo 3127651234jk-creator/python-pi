@@ -35,6 +35,7 @@ from .truncate import (
 MAX_TIMEOUT_SECONDS = 2147483
 STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024
 UPDATE_THROTTLE_MS = 300
+EXIT_STDIO_GRACE_MS = 100
 
 BASH_SCHEMA = {
     "type": "object",
@@ -213,9 +214,11 @@ def create_bash_tool(
         output = OutputAccumulator()
         last_update_at = 0.0
         update_dirty = False
+        last_data_at = time.monotonic()
 
         def handle_data(data: bytes) -> None:
-            nonlocal update_dirty
+            nonlocal update_dirty, last_data_at
+            last_data_at = time.monotonic()
             output.append(data)
             update_dirty = True
 
@@ -267,6 +270,7 @@ def create_bash_tool(
             read_task = asyncio.ensure_future(read_stream())
             wait_task = asyncio.ensure_future(proc.wait())
             failed = False
+            exited_at = None
             try:
                 await asyncio.sleep(0)
                 while True:
@@ -277,7 +281,16 @@ def create_bash_tool(
                         read_task.result()
                         if proc.returncode is not None:
                             break
-                    if timeout is not None and (time.monotonic() - started_at) > timeout:
+                    now = time.monotonic()
+                    if proc.returncode is not None:
+                        if exited_at is None:
+                            exited_at = now
+                        if now - max(exited_at, last_data_at) >= EXIT_STDIO_GRACE_MS / 1000:
+                            read_task.cancel()
+                            proc.stdout._transport.close()
+                            await asyncio.gather(read_task, return_exceptions=True)
+                            break
+                    if timeout is not None and (now - started_at) > timeout:
                         timed_out = True
                         break
                     pending = {task for task in (read_task, wait_task) if not task.done()}
@@ -308,7 +321,8 @@ def create_bash_tool(
                             proc.stdout._transport.close()
                             await asyncio.gather(read_task, return_exceptions=True)
                     else:
-                        await read_task
+                        if not read_task.cancelled():
+                            await read_task
                 finally:
                     if not wait_task.done():
                         wait_task.cancel()

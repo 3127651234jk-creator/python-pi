@@ -1,12 +1,16 @@
 """Regression tests for event-stream task ownership and failure cleanup."""
 
 import asyncio
+import json
 
 import pytest
 
 from pi.agent.agent import Agent
-from pi.agent.types import AgentStartEvent
+from pi.agent.types import AgentStartEvent, AgentTool, AgentToolResult
 from pi.ai.models import Model
+from pi.ai.providers import faux
+from pi.ai.types import TextContent
+from pi.util import AbortError
 
 
 def make_agent():
@@ -64,5 +68,75 @@ def test_configuration_failure_clears_streaming_state(monkeypatch):
             await agent.prompt("hello")
         assert not agent.is_streaming
         assert agent._abort is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_task", [False, True])
+def test_interrupted_compaction_keeps_prompt(monkeypatch, cancel_task):
+    async def scenario():
+        agent = make_agent()
+        entered = asyncio.Event()
+
+        async def interrupted_stream(model, context, options, stream):
+            entered.set()
+            await options.signal.wait()
+            options.signal.throw_if_aborted()
+            yield
+
+        monkeypatch.setattr(agent.compactor, "stream", interrupted_stream)
+        task = asyncio.create_task(agent.prompt("keep this prompt"))
+        await entered.wait()
+        if cancel_task:
+            task.cancel()
+        else:
+            agent.abort()
+        with pytest.raises(asyncio.CancelledError if cancel_task else AbortError):
+            await task
+        assert [m.content for m in agent.messages] == ["keep this prompt"]
+        assert not agent.is_streaming
+        assert agent._abort is None
+
+    asyncio.run(scenario())
+
+
+def test_subscriber_failure_keeps_persisted_tool_result(monkeypatch):
+    async def scenario():
+        faux.reset_script_index()
+        monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+            {"toolCalls": [{"id": "call", "name": "echo", "arguments": {}}]},
+            {"text": "recovered"},
+        ]))
+        agent = make_agent()
+
+        async def execute(*args):
+            return AgentToolResult(content=[TextContent(text="saved result")])
+
+        agent.tools = [AgentTool(name="echo", description="echo", execute=execute)]
+        persisted = []
+
+        def persist(event):
+            if event.type == "message_end":
+                persisted.append(event.message)
+
+        def fail(event):
+            if event.type == "message_end" and event.message.role == "toolResult":
+                raise RuntimeError("subscriber failed")
+
+        agent.subscribe(persist)
+        unsubscribe = agent.subscribe(fail)
+        try:
+            with pytest.raises(RuntimeError, match="subscriber failed"):
+                await agent.prompt("run tool")
+            assert agent.messages == persisted
+            assert [m.role for m in agent.messages] == ["system", "user", "assistant", "toolResult"]
+            assert agent.messages[-1].content[0].text == "saved result"
+            assert not agent.is_streaming
+            unsubscribe()
+            new_messages = await agent.prompt("continue")
+            assert agent.messages == persisted
+            assert len(new_messages) == 2
+        finally:
+            faux.reset_script_index()
 
     asyncio.run(scenario())
