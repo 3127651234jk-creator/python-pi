@@ -847,7 +847,7 @@ class McpManager:
             return await client.request(method, params)
         except (RuntimeError, httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
             message = str(exc)
-            transient = "disconnected" in message or "MCP HTTP" in message or isinstance(exc, httpx.HTTPError) \
+            transient = message == "MCP server disconnected" or re.fullmatch(r"MCP HTTP [0-9]{3}", message) is not None or isinstance(exc, httpx.HTTPError) \
                 or isinstance(exc, (asyncio.TimeoutError, OSError))
             if not transient:
                 raise
