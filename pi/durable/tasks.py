@@ -115,7 +115,7 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
             await runtime.commit(lambda tx, current: TaskState(status="terminal",
                 outcome=TaskOutcome(status="completed", result={"compacted": False, "tokens": total})))
             return
-        keep = min(keep_recent_tokens, max(1, budget // 2))
+        keep = max(1, min(keep_recent_tokens, max(1, budget // 2)))
         cut = len(messages)
         acc = 0
         while cut > 0 and acc < keep:

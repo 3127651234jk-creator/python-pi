@@ -131,7 +131,7 @@ class ContextCompactor:
         if not force and sum(estimate_tokens(m) for m in projected) <= budget:
             return projected
         # Cut before a user or assistant, never between a tool call and its results.
-        keep = min(self.settings.keep_recent_tokens, max(1, budget // 2))
+        keep = max(1, min(self.settings.keep_recent_tokens, max(1, budget // 2)))
         cut = len(tail)
         tokens = 0
         while cut > 0 and tokens < keep:

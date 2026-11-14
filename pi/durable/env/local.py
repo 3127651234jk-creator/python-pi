@@ -800,6 +800,8 @@ class LocalExecutionEnv:
         force = bool(options.get("force", False)) if options else False
         try:
             if os.path.isdir(resolved) and not os.path.islink(resolved):
+                if not recursive:
+                    return err(FileError("is_directory", "Is a directory", resolved))
                 import shutil as _shutil
 
                 _shutil.rmtree(resolved, ignore_errors=force)

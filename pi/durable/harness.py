@@ -23,7 +23,7 @@ from ..ai.types import AssistantMessage, ToolCall, TranscriptContext, UserMessag
 from ..ai.providers import get_default_stream_fn
 from ..ai.utils import normalize_context
 from .entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, USER_ENTRY
-from .errors import error_message
+from .errors import StorageRejected, error_message
 from .session import Session
 from .types import (
     TaskDefinition,
@@ -178,6 +178,8 @@ class Harness:
         commit together before anything becomes visible."""
 
         async def change(tx):
+            if await tx.conversation(conversation_id) is None:
+                raise StorageRejected(f"Unknown conversation: {conversation_id}")
             submission = await tx.create_submission(
                 {
                     "conversation_id": conversation_id,
@@ -225,6 +227,8 @@ class Harness:
         if "pi.tool" not in self.definitions:
             raise RuntimeError("Register tools first: harness.register_tools(...)")
         async def change(tx):
+            if await tx.conversation(conversation_id) is None:
+                raise StorageRejected(f"Unknown conversation: {conversation_id}")
             task = await tx.create_task(
                 self.definitions["pi.tool"],
                 {"tool": tool, "arguments": arguments, "call_id": call_id},
@@ -238,6 +242,8 @@ class Harness:
         """Submit a pi.compact task that summarizes and shrinks the context."""
 
         async def change(tx):
+            if await tx.conversation(conversation_id) is None:
+                raise StorageRejected(f"Unknown conversation: {conversation_id}")
             task = await tx.create_task(
                 self.definitions["pi.compact"],
                 {"conversation_id": conversation_id},

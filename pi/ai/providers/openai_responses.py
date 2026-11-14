@@ -121,8 +121,15 @@ async def stream_openai_responses(model, context, options=None):
             events = blocks.tool(("tool", key), "", "", data["delta"])
         elif kind == "response.function_call_arguments.done":
             tool_key = ("tool", key)
-            blocks.arguments[tool_key] = data["arguments"]
-            state.partial.content[blocks.indices[tool_key]].arguments = json.loads(data["arguments"])
+            # Providers may report an empty string here even though the deltas
+            # carried the arguments (or for a no-argument call). Keep whatever
+            # was accumulated instead of replacing it with "".
+            arguments = data.get("arguments")
+            if not isinstance(arguments, str) or not arguments:
+                arguments = blocks.arguments.get(tool_key, "")
+            blocks.arguments[tool_key] = arguments
+            state.partial.content[blocks.indices[tool_key]].arguments = (
+                json.loads(arguments) if arguments.strip() else {})
         elif kind == "response.output_item.done" and data["item"]["type"] == "reasoning":
             item = data["item"]
             index = blocks.indices.get(("thinking", key))

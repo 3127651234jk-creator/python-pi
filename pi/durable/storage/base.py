@@ -136,6 +136,8 @@ class BaseStorage:
 
     @classmethod
     def _page(cls, values: List[Any], limit: int) -> Page:
+        if limit <= 0:
+            raise StorageRejected("Invalid storage page limit")
         items = values[:limit]
         if len(values) <= limit:
             return Page(items=list(items))

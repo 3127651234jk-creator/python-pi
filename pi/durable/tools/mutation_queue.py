@@ -9,6 +9,7 @@ got. Other files, and other file systems, never wait. Not a lock against
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Awaitable, Callable, Optional
 from weakref import WeakValueDictionary
 
@@ -44,7 +45,10 @@ async def _canonical(env: ExecutionEnv, absolute_path: str, context: Context) ->
     if code != "not_found":
         raise result.error
     # The file system splits the path, so a name may contain characters that are separators elsewhere.
-    parent = get_or_throw(await env.join_path([absolute_path, ".."], context))
+    # ``join_path`` appends ``..`` without collapsing it, so normalize before
+    # comparing: otherwise the parent branch can never match and aliases of a
+    # missing file would get distinct queue keys.
+    parent = os.path.normpath(get_or_throw(await env.join_path([absolute_path, ".."], context)))
     if parent == absolute_path or not absolute_path.startswith(parent):
         return absolute_path
     name = absolute_path[len(parent) + (0 if parent.endswith(("/", "\\")) else 1):]

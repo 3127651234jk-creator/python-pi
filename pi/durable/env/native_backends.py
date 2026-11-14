@@ -63,6 +63,8 @@ class WindowsWatchBackend:  # pragma: no cover - exercised on Windows only
         if self._closed:
             return
         handle = _open_directory_handle(directory)
+        overlapped = None
+        stop = threading.Event()
         try:
             buffer = ctypes.create_string_buffer(_BUFFER_SIZE)
             overlapped = _Overlapped()
@@ -72,14 +74,17 @@ class WindowsWatchBackend:  # pragma: no cover - exercised on Windows only
             self._issue(handle, buffer, overlapped)
         except BaseException:
             _kernel32.CloseHandle(handle)
+            if overlapped is not None and overlapped.hEvent:
+                _kernel32.CloseHandle(overlapped.hEvent)
             raise
         watch = _WindowsWatch(
             thread=threading.Thread(
-                target=self._run, args=(directory, handle, buffer, overlapped), daemon=True
+                target=self._run, args=(directory, handle, buffer, overlapped, stop), daemon=True
             ),
             handle=handle,
             buffer=buffer,
             overlapped=overlapped,
+            stop=stop,
         )
         self._watches[directory] = watch
         watch.thread.start()
@@ -88,8 +93,7 @@ class WindowsWatchBackend:  # pragma: no cover - exercised on Windows only
         watch = self._watches.pop(directory, None)
         if watch is None:
             return
-        _kernel32.CancelIoEx(watch.handle, None)
-        _kernel32.CloseHandle(watch.handle)
+        self._stop(watch)
 
     def commit(self) -> None:
         pass
@@ -97,9 +101,27 @@ class WindowsWatchBackend:  # pragma: no cover - exercised on Windows only
     def close(self) -> None:
         self._closed = True
         for watch in list(self._watches.values()):
-            _kernel32.CancelIoEx(watch.handle, None)
-            _kernel32.CloseHandle(watch.handle)
+            self._stop(watch)
         self._watches.clear()
+
+    def _stop(self, watch: "_WindowsWatch") -> None:
+        """Cancel the pending read and release both handles.
+
+        ``CancelIoEx``/``CloseHandle`` on the directory alone leaves the
+        overlapped event handle allocated, which accumulates for the lifetime
+        of a long-running worker. Wake the waiting thread first so it can
+        observe the cancellation, then close the event it was waiting on.
+        """
+        watch.stop.set()
+        _kernel32.CancelIoEx(watch.handle, None)
+        event = watch.overlapped.hEvent if watch.overlapped is not None else None
+        if event:
+            _kernel32.SetEvent(event)
+        watch.thread.join(timeout=1.0)
+        _kernel32.CloseHandle(watch.handle)
+        if event:
+            _kernel32.CloseHandle(event)
+            watch.overlapped.hEvent = None
 
     def _issue(self, handle: int, buffer, overlapped: "_Overlapped") -> None:
         _kernel32.ResetEvent(overlapped.hEvent)
@@ -109,10 +131,11 @@ class WindowsWatchBackend:  # pragma: no cover - exercised on Windows only
             winerror = ctypes.GetLastError()
             raise OSError(_WIN32_ERRNOS.get(winerror, errno.EIO), f"ReadDirectoryChangesW failed ({winerror})")
 
-    def _run(self, directory: str, handle: int, buffer, overlapped: "_Overlapped") -> None:
-        while not self._closed:
+    def _run(self, directory: str, handle: int, buffer, overlapped: "_Overlapped",
+             stop: threading.Event) -> None:
+        while not self._closed and not stop.is_set():
             _kernel32.WaitForSingleObject(overlapped.hEvent, _INFINITE)
-            if self._closed:
+            if self._closed or stop.is_set():
                 break
             nbytes = wintypes.DWORD()
             if not _kernel32.GetOverlappedResult(
@@ -122,29 +145,31 @@ class WindowsWatchBackend:  # pragma: no cover - exercised on Windows only
                 if error != _ERROR_MORE_DATA:
                     # Aborted by close, or the directory is gone: one wake-up so the
                     # watcher's rescan reconciles coverage.
-                    if not self._closed:
+                    if not self._closed and not stop.is_set():
                         self._on_event(directory, None)
                     break
-            if self._closed:
+            if self._closed or stop.is_set():
                 break
             for name in _parse_change_names(buffer, nbytes.value):
                 self._on_event(directory, name)
-            if self._closed:
+            if self._closed or stop.is_set():
                 break
             try:
                 self._issue(handle, buffer, overlapped)
             except OSError:
-                if not self._closed:
+                if not self._closed and not stop.is_set():
                     self._on_event(directory, None)
                 break
 
 
 class _WindowsWatch:
-    def __init__(self, thread: threading.Thread, handle: int, buffer, overlapped) -> None:
+    def __init__(self, thread: threading.Thread, handle: int, buffer, overlapped,
+                 stop: threading.Event) -> None:
         self.thread = thread
         self.handle = handle
         self.buffer = buffer
         self.overlapped = overlapped
+        self.stop = stop
 
 
 if WINDOWS:

@@ -340,6 +340,7 @@ class ExtensionManager:
         self.old_before, self.old_after = agent.before_tool_call, agent.after_tool_call
         self.old_prepare_request = agent.prepare_request
         self.output = None
+        self.ui_sink = None
         self.custom_host = None
         self.size_provider = None
         self.editor_host = None
@@ -591,6 +592,7 @@ class ExtensionManager:
         if set(api.commands) & set(self.commands):
             raise ValueError("Extension command name collision")
         api.sealed = True
+        api.ui.sink = self.ui_sink
         api.ui.custom_host = self.custom_host
         api.ui.size_provider = self.size_provider
         api.ui.editor_host = self.editor_host
@@ -695,7 +697,12 @@ class ExtensionManager:
         return [(action, keys, handler) for api in self.extensions for action, keys, handler in api.keybindings]
 
     def set_ui_sink(self, sink) -> None:
-        """Route extension UI requests through a client (RPC mode)."""
+        """Route extension UI requests through a client (RPC mode).
+
+        The sink is kept so extensions loaded by a later ``reload()`` bind to
+        the same client instead of silently falling back to the console.
+        """
+        self.ui_sink = sink
         for api in self.extensions:
             api.ui.sink = sink
 

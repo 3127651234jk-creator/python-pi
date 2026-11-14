@@ -12,14 +12,16 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import re
 import shutil
 import tarfile
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -157,12 +159,18 @@ class PackageManager:
         else:
             name, version, root = await self._install_git(parsed, notify)
         existing = self._read().get(name)
-        if existing:
-            self._remove_files(InstalledPackage.from_json(existing))
-        package = InstalledPackage(name=name, source=source, version=version, installed_at=time.time())
-        package.files = self._place_files(name, root, notify)
-        if not any(package.files.values()):
-            raise ValueError(f"Package has no pi extensions/skills/prompts/themes: {source}")
+        old = InstalledPackage.from_json(existing) if existing else None
+        # Copy into staging first: a missing/empty/corrupt package must not
+        # uninstall the version that is already on disk.
+        staging_root, placed = self._stage_files(name, root, notify)
+        try:
+            if not any(placed.values()):
+                raise ValueError(f"Package has no pi extensions/skills/prompts/themes: {source}")
+            package = InstalledPackage(name=name, source=source, version=version, installed_at=time.time())
+            package.files = placed
+            self._commit_staged(name, staging_root, placed, old)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
         store = self._read()
         store[name] = package.to_json()
         self._write(store)
@@ -251,41 +259,138 @@ class PackageManager:
 
     # -- placement -------------------------------------------------------------
 
-    def _place_files(self, name: str, root: Path, notify) -> Dict[str, List[str]]:
+    def _stage_files(self, name: str, root: Path, notify) -> Tuple[Path, Dict[str, List[str]]]:
+        """Copy a package into a private staging tree.
+
+        Returns the staging root and the final ``kind -> paths`` map. Nothing
+        outside the staging directory changes, so a failed copy leaves the
+        installed package untouched.
+        """
+        self.config.agent_dir.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(tempfile.mkdtemp(prefix=".pi-install-", dir=self.config.agent_dir))
         manifest = read_manifest(root)
         placed: Dict[str, List[str]] = {}
-        for kind in KINDS:
-            for relative in manifest.get(kind, []):
-                origin = (root / relative).resolve()
-                if not origin.exists() or not origin.is_relative_to(root.resolve()):
-                    notify(f"skipping missing manifest path: {relative}")
-                    continue
-                if kind == "prompts":
-                    # Prompt discovery scans only flat template files; packages
-                    # install theirs flattened under "<package>--" prefixed names.
-                    files = ([origin] if origin.is_file()
-                             else sorted(origin.glob("*.md")))
-                    if not files:
+        try:
+            for kind in KINDS:
+                for relative in manifest.get(kind, []):
+                    origin = (root / relative).resolve()
+                    if not origin.exists() or not origin.is_relative_to(root.resolve()):
+                        notify(f"skipping missing manifest path: {relative}")
                         continue
-                    destination = self.config.agent_dir / "prompts"
-                    destination.mkdir(parents=True, exist_ok=True)
-                    for source_file in files:
-                        target_file = destination / f"{_safe_name(name)}--{source_file.name}"
-                        shutil.copy2(source_file, target_file)
-                        placed.setdefault("prompts", []).append(str(target_file))
+                    if kind == "prompts":
+                        # Prompt discovery scans only flat template files;
+                        # packages install theirs flattened under
+                        # "<package>--" prefixed names.
+                        files = ([origin] if origin.is_file()
+                                 else sorted(origin.glob("*.md")))
+                        if not files:
+                            continue
+                        destination = staging_root / "prompts"
+                        destination.mkdir(parents=True, exist_ok=True)
+                        for source_file in files:
+                            target_name = f"{_safe_name(name)}--{source_file.name}"
+                            shutil.copy2(source_file, destination / target_name)
+                            placed.setdefault("prompts", []).append(
+                                str(self.config.agent_dir / "prompts" / target_name))
+                        continue
+                    destination = staging_root / kind / name
+                    if kind not in placed:
+                        destination.mkdir(parents=True)
+                    target = destination / origin.name
+                    if origin.is_dir():
+                        shutil.copytree(origin, target)
+                    else:
+                        shutil.copy2(origin, target)
+                    placed.setdefault(kind, []).append(
+                        str(self.config.agent_dir / kind / name / origin.name))
+        except BaseException:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
+        return staging_root, placed
+
+    def _commit_staged(self, name: str, staging_root: Path, files: Dict[str, List[str]],
+                       old: Optional[InstalledPackage]) -> None:
+        """Swap staged resources into place, restoring the old version on failure."""
+        backup_root = Path(tempfile.mkdtemp(prefix=".pi-backup-", dir=self.config.agent_dir))
+        moved: List[Tuple[Path, Path]] = []  # (backup, original)
+        installed: List[Path] = []
+        try:
+            prompts_dir = self.config.agent_dir / "prompts"
+            prompts_dir.mkdir(parents=True, exist_ok=True)
+            old_prompts = set(old.files.get("prompts", [])) if old else set()
+            new_prompts = set(files.get("prompts", []))
+            for path in old_prompts - new_prompts:
+                target = Path(path)
+                if target.parent == prompts_dir and target.exists():
+                    backup = backup_root / "prompts" / target.name
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(target, backup)
+                    moved.append((backup, target))
+            staged_prompts = staging_root / "prompts"
+            if staged_prompts.exists():
+                for staged in sorted(staged_prompts.iterdir()):
+                    target = prompts_dir / staged.name
+                    if target.exists():
+                        backup = backup_root / "prompts-replaced" / target.name
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(target, backup)
+                        moved.append((backup, target))
+                    os.replace(staged, target)
+                    installed.append(target)
+            staged_kinds = {kind for kind in KINDS
+                            if kind != "prompts" and (staging_root / kind / name).exists()}
+            old_kinds = {kind for kind in (old.files if old else {}) if kind in KINDS and kind != "prompts"}
+            for kind in staged_kinds | old_kinds:
+                final = self.config.agent_dir / kind / name
+                staged = staging_root / kind / name
+                if kind not in staged_kinds:
+                    # The new version no longer ships this kind: retire the old one.
+                    if final.exists():
+                        backup = backup_root / kind / name
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(final, backup)
+                        moved.append((backup, final))
                     continue
-                destination = self.config.agent_dir / kind / name
-                if kind not in placed:
-                    if destination.exists():
-                        shutil.rmtree(destination)
-                    destination.mkdir(parents=True)
-                if origin.is_dir():
-                    shutil.copytree(origin, destination / origin.name)
-                    placed.setdefault(kind, []).append(str(destination / origin.name))
-                else:
-                    destination.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(origin, destination / origin.name)
-                    placed.setdefault(kind, []).append(str(destination / origin.name))
+                final.parent.mkdir(parents=True, exist_ok=True)
+                if final.exists():
+                    backup = backup_root / kind / name
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(final, backup)
+                    moved.append((backup, final))
+                os.replace(staged, final)
+                installed.append(final)
+        except BaseException:
+            for path in reversed(installed):
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+                    elif path.exists():
+                        path.unlink()
+                except OSError:
+                    pass
+            for backup, target in reversed(moved):
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            target.unlink()
+                    os.replace(backup, target)
+                except OSError:
+                    pass
+            shutil.rmtree(backup_root, ignore_errors=True)
+            raise
+        shutil.rmtree(backup_root, ignore_errors=True)
+
+    def _place_files(self, name: str, root: Path, notify) -> Dict[str, List[str]]:
+        """Place a package's resources directly, replacing any previous copy."""
+        staging_root, placed = self._stage_files(name, root, notify)
+        try:
+            if placed:
+                self._commit_staged(name, staging_root, placed, None)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
         return placed
 
     def _remove_files(self, package: InstalledPackage) -> None:
