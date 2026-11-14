@@ -59,6 +59,7 @@ from .ts_interop import our_message_to_ts
 from .usage import session_stats, summary_usage_extra, usage_cost_breakdown
 
 _THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+_UI_RESPONSE_TIMEOUT_SECONDS = 60
 
 
 class JsonWriter:
@@ -144,7 +145,10 @@ class RpcServer:
             payload = {"type": "extension_ui_request", "id": request_id}
             payload.update(_ui_request_to_ts(request))
             await self.writer.write(payload)
-            reply = await future
+            try:
+                reply = await asyncio.wait_for(future, _UI_RESPONSE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise asyncio.TimeoutError("Extension UI request timed out") from exc
             return reply.get("value") if isinstance(reply, dict) else None
         finally:
             self.ui_futures.pop(request_id, None)
@@ -490,6 +494,18 @@ class RpcServer:
 
     async def serve(self, source=None):
         source = source or sys.stdin.buffer
+        commands = asyncio.Queue()
+
+        async def run_commands() -> None:
+            while True:
+                command = await commands.get()
+                try:
+                    await self.dispatch(command)
+                finally:
+                    commands.task_done()
+
+        dispatcher = asyncio.create_task(run_commands())
+        drain = None
         try:
             while True:
                 line = await asyncio.to_thread(source.readline)
@@ -506,8 +522,20 @@ class RpcServer:
                 if command.get("type") == "extension_ui_response":
                     self.resolve_ui(command)
                     continue
-                await self.dispatch(command)
+                commands.put_nowait(command)
+
+            drain = asyncio.create_task(commands.join())
+            done, _ = await asyncio.wait((drain, dispatcher), return_when=asyncio.FIRST_COMPLETED)
+            if dispatcher in done:
+                await dispatcher
+            await drain
         finally:
+            if drain is not None and not drain.done():
+                drain.cancel()
+            if not dispatcher.done():
+                dispatcher.cancel()
+            await asyncio.gather(*(task for task in (drain, dispatcher) if task is not None),
+                                 return_exceptions=True)
             if self.busy():
                 self.agent.abort()
                 try:

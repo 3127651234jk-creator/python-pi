@@ -2,6 +2,9 @@ import asyncio
 import io
 import json
 import os
+import queue
+
+import pytest
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers.base import make_partial
 from pi.ai.types import StreamErrorEvent, SystemMessage, UserMessage
@@ -66,6 +69,67 @@ def test_parse_error_does_not_stop_server():
         assert len(records) == 3
         assert not records[0]["success"] and not records[1]["success"]
         assert records[2]["id"] == "ok" and records[2]["success"]
+    asyncio.run(check())
+
+
+def test_extension_ui_response_is_read_while_command_is_running():
+    class Source:
+        def __init__(self):
+            self.lines = queue.Queue()
+
+        def readline(self):
+            return self.lines.get()
+
+    class Extensions:
+        server = None
+
+        async def process_input(self, text):
+            confirmed = await self.server.ui_sink({"method": "confirm", "title": "Continue?"})
+            assert confirmed is True
+            return None
+
+    async def check():
+        output = io.StringIO()
+        source = Source()
+        extensions = Extensions()
+        server = RpcServer(Agent(resolve_model("faux")), JsonWriter(output), extensions=extensions)
+        extensions.server = server
+        serving = asyncio.create_task(server.serve(source))
+        source.lines.put(b'{"id":"prompt","type":"prompt","message":"hello"}\n')
+
+        request = None
+        for _ in range(100):
+            records = [json.loads(line) for line in output.getvalue().splitlines()]
+            request = next((record for record in records
+                            if record.get("type") == "extension_ui_request"), None)
+            if request is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert request is not None
+
+        reply = {"type": "extension_ui_response", "id": request["id"], "value": True}
+        source.lines.put((json.dumps(reply) + "\n").encode())
+        source.lines.put(b'{"id":"state","type":"get_state"}\n')
+        source.lines.put(b"")
+        await asyncio.wait_for(serving, 2)
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        responses = {record.get("id"): record for record in records if record.get("type") == "response"}
+        assert responses["prompt"]["data"] == {"disposition": "handled"}
+        assert responses["state"]["success"]
+
+    asyncio.run(check())
+
+
+def test_extension_ui_request_times_out(monkeypatch):
+    async def check():
+        output = io.StringIO()
+        server = RpcServer(Agent(resolve_model("faux")), JsonWriter(output))
+        monkeypatch.setattr("pi.coding_agent.rpc._UI_RESPONSE_TIMEOUT_SECONDS", 0.01)
+        with pytest.raises(asyncio.TimeoutError, match="Extension UI request timed out"):
+            await server.ui_sink({"method": "input", "message": "Value"})
+        assert not server.ui_futures
+
     asyncio.run(check())
 
 
