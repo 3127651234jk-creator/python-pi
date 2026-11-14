@@ -134,3 +134,36 @@ def test_fail_fast_does_not_wait_for_other_running_dependencies():
         assert (await storage.task(4)).state.outcome.status == "aborted"
 
     asyncio.run(scenario())
+
+
+def test_completing_parent_waits_for_owned_tasks_and_terminal_states_keep_memos():
+    async def scenario():
+        storage = MemoryStorage()
+        harness = Harness(create_session(storage), resolve_model("faux"))
+        outcome = TaskOutcome(status="completed")
+        await storage.commit([
+            write_task(TaskRecord(id=2, conversation_id=1, kind="parent", version=1, input={},
+                                  state=TaskState(status="completing", outcome=outcome),
+                                  memos={"parent": True})),
+            write_task(TaskRecord(id=3, conversation_id=1, kind="child", version=1, input={}, owner=2,
+                                  state=TaskState(status="pending"), memos={"child": True})),
+        ])
+
+        assert not await harness._finalize_completing()
+        assert (await storage.task(2)).state.status == "completing"
+
+        child = await storage.task(3)
+        child.state = TaskState(status="completing", outcome=outcome)
+        await storage.commit([write_task(child)])
+        assert await harness._finalize_completing()
+        assert (await storage.task(2)).state.status == "completing"
+        terminal_child = await storage.task(3)
+        assert terminal_child.state.status == "terminal"
+        assert terminal_child.memos == {"child": True}
+
+        assert await harness._finalize_completing()
+        terminal_parent = await storage.task(2)
+        assert terminal_parent.state.status == "terminal"
+        assert terminal_parent.memos == {"parent": True}
+
+    asyncio.run(scenario())

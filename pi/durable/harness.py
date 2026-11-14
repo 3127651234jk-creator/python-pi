@@ -85,6 +85,7 @@ class TaskRuntime:
                     background=current.background,
                     abort_requested=current.abort_requested,
                     state=TaskState(status="completing", outcome=next_state.outcome),
+                    memos=current.memos,
                 )
                 from .types import write_task
 
@@ -516,8 +517,14 @@ class Harness:
         async def change(tx):
             from .types import write_task
 
-            page = await tx.scan_tasks({"status": "completing"}, 10)
-            for record in page.items:
+            completing = await _scan_all(tx.scan_tasks, {"status": "completing"})
+            all_tasks = await _scan_all(tx.scan_tasks, {})
+            live_owner_ids = {task.owner for task in all_tasks
+                              if task.owner is not None and task.state.status != "terminal"}
+            finalized = 0
+            for record in completing:
+                if record.id in live_owner_ids:
+                    continue
                 terminal = TaskRecord(
                     id=record.id,
                     conversation_id=record.conversation_id,
@@ -528,10 +535,12 @@ class Harness:
                     background=record.background,
                     abort_requested=record.abort_requested,
                     state=TaskState(status="terminal", outcome=record.state.outcome),
+                    memos=record.memos,
                 )
                 tx._writes.append(write_task(terminal))
                 tx._mark_table_write()
-            return len(page.items)
+                finalized += 1
+            return finalized
 
         count = await self.session.commit(change)
         return count > 0
@@ -573,6 +582,7 @@ class Harness:
                             background=record.background,
                             abort_requested=record.abort_requested,
                             state=TaskState(status="terminal", outcome=outcome),
+                            memos=record.memos,
                         )
                         replacements.append(replaced)
                         resumed += 1
@@ -629,6 +639,7 @@ async def _stage_terminal(tx, current: TaskRecord, outcome: TaskOutcome) -> None
         background=current.background,
         abort_requested=current.abort_requested,
         state=TaskState(status="completing", outcome=outcome),
+        memos=current.memos,
     )
     tx._writes.append(write_task(replaced))
     tx._mark_table_write()
