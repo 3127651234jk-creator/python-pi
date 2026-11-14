@@ -364,6 +364,11 @@ async def run_pi_coding_agent(args: HarnessRunArgs,
     selection = resolve_model_selection(options.model)
     host_agent_dir = get_agent_dir()
     sandbox_identity = resolve_sandbox_identity()
+    if sandbox_identity:
+        if not all(hasattr(os, name) for name in ("getuid", "geteuid", "setuid", "setgid", "setgroups")):
+            raise OSError("The eval filesystem sandbox requires POSIX user APIs.")
+        if os.getuid() != 0 or os.geteuid() != 0:
+            raise PermissionError("The eval runner must start as root before entering the unprivileged tool sandbox.")
     root = tempfile.mkdtemp(prefix="pi-eval-")
     workspace = os.path.join(root, "workspace")
     isolated_home = os.path.join(root, "home")
