@@ -220,9 +220,9 @@ class RpcServer:
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("message must be a nonempty string")
             images = _images_from_command(command.get("images"))
-            if self.extensions and kind == "prompt":
-                if self.busy():
-                    raise ValueError("Agent is busy")
+            # Streaming input must reach the queue path below. Extension input
+            # handlers can execute commands and are only run for idle prompts.
+            if self.extensions and kind == "prompt" and not self.busy():
                 text = await self.extensions.process_input(text)
                 if text is None:
                     response["data"] = {"disposition": "handled"}
