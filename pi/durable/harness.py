@@ -544,7 +544,10 @@ class Harness:
             replacements = []
             resumed = 0
             for record in records:
-                ids = record.state.on or []
+                # Abort must reach the scheduler's normal abort handler even
+                # when the joined tasks never finish. Keep the checkpoint so
+                # an already committed settle phase still takes precedence.
+                ids = [] if record.abort_requested else (record.state.on or [])
                 terminal_tasks = []
                 for tid in ids:
                     other = await tx.task(tid)
