@@ -70,6 +70,8 @@ class TaskRuntime:
                 next_state = await next_state
             if next_state is None:
                 return None
+            if next_state.status in ("terminal", "completing") and next_state.outcome is None:
+                raise ValueError(f"Task state {next_state.status!r} requires an outcome")
             if next_state.status == "terminal":
                 # Terminal outcomes stage as completing; the scheduler finalizes
                 # them once no ordinary owned work below is live (spec 5.5).

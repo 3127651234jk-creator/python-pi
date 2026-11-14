@@ -2,8 +2,10 @@
 
 import asyncio
 
+import pytest
+
 from pi.ai.models import resolve_model
-from pi.durable.harness import Harness
+from pi.durable.harness import Harness, TaskRuntime
 from pi.durable.session import create_session
 from pi.durable.storage import MemoryStorage
 from pi.durable.types import ConversationRecord, EntryRecord, TaskOutcome, TaskRecord, TaskState, write_conversation, write_entry, write_task
@@ -11,6 +13,27 @@ from pi.durable.types import ConversationRecord, EntryRecord, TaskOutcome, TaskR
 
 def task(tid, state):
     return TaskRecord(id=tid, conversation_id=1, kind="custom", version=1, input={}, state=state)
+
+
+@pytest.mark.parametrize("status", ["terminal", "completing"])
+def test_runtime_rejects_missing_outcome_atomically(status):
+    async def scenario():
+        storage = MemoryStorage()
+        harness = Harness(create_session(storage), resolve_model("faux"))
+        await storage.commit([write_task(task(2, TaskState(status="running", checkpoint={"phase": "run"})))])
+        runtime = TaskRuntime(harness, 2, asyncio.Event())
+
+        async def change(tx, current):
+            tx._writes.append(write_task(task(3, TaskState(status="pending"))))
+            tx._mark_table_write()
+            return TaskState(status=status)
+
+        with pytest.raises(ValueError, match="requires an outcome"):
+            await runtime.commit(change)
+        assert (await storage.task(2)).state.status == "running"
+        assert await storage.task(3) is None
+
+    asyncio.run(scenario())
 
 
 def test_transcript_and_task_listing_read_all_pages():
