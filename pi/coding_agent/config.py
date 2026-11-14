@@ -99,8 +99,10 @@ def validate_settings(settings: dict) -> None:
     allowed.update({"default_project_trust", "enable_install_telemetry", "cache_retention"})
     if set(settings) - allowed:
         raise ValueError("Unknown settings key; supported: " + ", ".join(sorted(allowed)))
-    if settings.get("theme", "dark") not in ("dark", "light", "mono"):
-        raise ValueError("theme must be dark, light or mono")
+    # Theme discovery belongs to the UI; user themes are named by their files.
+    # Keep configuration loadable even when a theme is temporarily unavailable.
+    if not isinstance(settings.get("theme", "dark"), str) or not settings.get("theme", "dark").strip():
+        raise ValueError("theme must be a nonempty string")
     bindings = settings.get("keybindings", {})
     if not isinstance(bindings, dict) or set(bindings) - {"submit", "newline", "abort", "models", "sessions", "exit", "complete", "save"}:
         raise ValueError("Invalid keybindings actions")

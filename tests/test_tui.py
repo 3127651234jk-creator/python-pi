@@ -167,7 +167,7 @@ def test_abort_during_run():
 
 def test_invalid_theme_and_bindings():
     with pytest.raises(ValueError):
-        validate_settings({"theme": "invalid"})
+        validate_settings({"theme": ""})
     with pytest.raises(ValueError):
         validate_settings({"keybindings": {"unknown": ["c-x"]}})
 

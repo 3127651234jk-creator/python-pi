@@ -35,7 +35,7 @@ def test_invalid_project_file_keeps_user_settings(tmp_path, monkeypatch):
     (tmp_path / "user").mkdir()
     write_json(tmp_path / "user" / "settings.json", {"provider": "anthropic"})
     (tmp_path / ".pi").mkdir()
-    (tmp_path / ".pi" / "settings.json").write_text(json.dumps({"theme": "nope"}), encoding="utf-8")
+    (tmp_path / ".pi" / "settings.json").write_text(json.dumps({"theme": ""}), encoding="utf-8")
     config = Configuration(str(tmp_path))
     assert config.errors, "project validation failure must be collected"
     assert config.settings.get("provider") == "anthropic"
