@@ -82,7 +82,8 @@ def create_read_tool() -> ToolRegistration:
                 before: FileInfo = get_or_throw(await reader.info(context))
                 result = await _read_text(reader, before, path, offset, limit, context)
                 after: FileInfo = get_or_throw(await reader.info(context))
-                if after.size == before.size and after.mtime_ms == before.mtime_ms:
+                if (after.size > before.size
+                        or (after.size == before.size and after.mtime_ms == before.mtime_ms)):
                     return result
                 if attempt == 1:
                     raise RuntimeError(f"{path} changed while it was read")

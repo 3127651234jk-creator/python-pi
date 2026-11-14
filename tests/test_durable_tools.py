@@ -72,6 +72,29 @@ def test_read_write_roundtrip(env):
     assert result.diagnostics in (None, [])
 
 
+def test_read_accepts_a_file_that_grows_during_the_read(env, monkeypatch):
+    from pi.durable.env.local import LocalBinaryReader
+
+    path = os.path.join(env.cwd, "active.log")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("first\n")
+    original_info = LocalBinaryReader.info
+    calls = 0
+
+    async def growing_info(self, context):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("second\n")
+        return await original_info(self, context)
+
+    monkeypatch.setattr(LocalBinaryReader, "info", growing_info)
+    result = run(create_read_tool().execute({"path": "active.log"}, RecordingApi(env), Context()))
+    assert _text(result).splitlines() == ["first"]
+    assert calls == 2
+
+
 def test_write_creates_parent_directories(env):
     write = create_write_tool()
     api = RecordingApi(env)
