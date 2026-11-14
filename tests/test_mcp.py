@@ -109,6 +109,35 @@ for line in sys.stdin:
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("field,value", [
+    ("env", None), ("env", []), ("env", {"TOKEN": 1}),
+    ("headers", None), ("headers", []), ("headers", {"X-Test": 1}),
+])
+def test_reload_rejects_non_string_env_and_headers_without_aborting(tmp_path, monkeypatch, field, value):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "bad": {"command": "bad", field: value},
+        "good": {"command": "good"},
+    }})
+
+    async def scenario():
+        manager = McpManager(config)
+        connected = []
+
+        async def connect(client, namespace):
+            connected.append(client.name)
+
+        monkeypatch.setattr(manager, "_connect_client", connect)
+        try:
+            await manager.reload()
+            assert manager.errors["bad"] == f"{field} must map strings to strings"
+            assert connected == ["good"]
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_empty_log_notification_still_writes_a_line(tmp_path):
     config = Configuration(str(tmp_path), str(tmp_path / "user"))
     config.agent_dir.mkdir(parents=True, exist_ok=True)

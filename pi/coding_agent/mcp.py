@@ -579,6 +579,12 @@ class McpManager:
                     raise ValueError("timeout must be between 0 and 86400 seconds")
                 if "command" in settings and (not isinstance(settings["command"], str) or not isinstance(settings.get("args", []), list) or not all(isinstance(arg, str) for arg in settings.get("args", []))):
                     raise ValueError("command must be an executable and args a string list")
+                for field in ("env", "headers"):
+                    values = settings.get(field, {})
+                    if (not isinstance(values, dict)
+                            or not all(isinstance(key, str) and isinstance(value, str)
+                                       for key, value in values.items())):
+                        raise ValueError(f"{field} must map strings to strings")
                 if "command" in settings:
                     # cmd.exe treats newlines as command boundaries even inside
                     # the escaping used for Windows batch shims.
@@ -607,8 +613,7 @@ class McpManager:
                     # A list_changed notification raced the connect; list again now that
                     # the client is registered.
                     await self.ensure_tools(name)
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError, ModelError,
-                    asyncio.TimeoutError, httpx.HTTPError) as exc:
+            except Exception as exc:  # noqa: BLE001 - one invalid server must not abort reload
                 self.errors[name] = str(exc) or type(exc).__name__
                 if client:
                     await client.close()
