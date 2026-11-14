@@ -311,6 +311,10 @@ class TsExtensionBridge:
                     message = json.loads(line)
                 except ValueError:
                     continue
+                # Extensions may print JSON scalars or arrays as ordinary logs.
+                # Only objects can be bridge protocol messages.
+                if not isinstance(message, dict):
+                    continue
                 if message.get("method") is None and message.get("id") in self.pending:
                     future = self.pending.pop(message["id"])
                     if future.done():
