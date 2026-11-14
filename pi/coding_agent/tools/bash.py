@@ -10,7 +10,6 @@ full output is saved to a temp file when truncation occurs.
 from __future__ import annotations
 
 import asyncio
-import base64
 import codecs
 import math
 import os
@@ -99,9 +98,11 @@ def powershell_command(command: str) -> Tuple[list, bool]:
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         "$OutputEncoding = [Console]::OutputEncoding\n"
     )
-    encoded = base64.b64encode((prefix + command).encode("utf-16-le")).decode("ascii")
+    # Windows PowerShell serializes redirected errors as CLIXML when invoked
+    # with -EncodedCommand, even with -OutputFormat Text. A literal -Command
+    # argument keeps stderr readable; subprocess handles Windows argv quoting.
     return [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text",
-            "-EncodedCommand", encoded], False
+            "-Command", prefix + command], False
 
 
 class OutputAccumulator:
