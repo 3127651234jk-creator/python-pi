@@ -389,8 +389,9 @@ async def stream_assistant_response(
             await emit(MessageEndEvent(message=final))
             return final
 
-        partial = event.partial
-        if event.type == "start":
+        partial = event["partial"] if isinstance(event, dict) else event.partial
+        event_type = event.get("type") if isinstance(event, dict) else event.type
+        if event_type == "start":
             partial_message = partial
             if added_partial:
                 # A wrapper (context-overflow recovery) restarted the stream;

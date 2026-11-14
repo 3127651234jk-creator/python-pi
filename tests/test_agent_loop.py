@@ -30,7 +30,7 @@ from pi.agent.types import (
 from pi.ai.models import Model
 from pi.ai.providers import faux
 from pi.ai.providers.base import make_partial
-from pi.ai.types import SystemMessage, TextContent, ToolCall, ToolResultMessage, UserMessage
+from pi.ai.types import DoneEvent, StreamStartEvent, SystemMessage, TextContent, ToolCall, ToolResultMessage, UserMessage
 from pi.util import AbortSignal
 
 
@@ -99,6 +99,39 @@ def test_tool_call_roundtrip():
         assert "ToolExecutionStartEvent" in event_types
         assert "ToolExecutionEndEvent" in event_types
         assert event_types[-1] == "AgentEndEvent"
+
+    asyncio.run(scenario())
+
+
+def test_unknown_wire_event_preserves_partial_and_completes():
+    async def scenario():
+        partial = make_partial(make_model(), 0)
+        partial.content = [TextContent(text="in progress")]
+        unknown = {"type": "future_event", "partial": partial, "extra": "payload"}
+
+        async def stream_fn(model, context, options=None):
+            yield StreamStartEvent(partial=partial)
+            yield unknown
+            final = make_partial(model, 0)
+            final.content = [TextContent(text="complete")]
+            final.stop_reason = "stop"
+            yield DoneEvent(reason="stop", message=final)
+
+        events = []
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: events.append(e) or asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+        updates = [e for e in events if getattr(e, "type", None) == "message_update"]
+        assert len(updates) == 1
+        assert updates[0].assistant_message_event is unknown
+        assert updates[0].message.content[0].text == "in progress"
+        assert messages[-1].content[0].text == "complete"
+        assert events[-1].type == "agent_end"
 
     asyncio.run(scenario())
 
