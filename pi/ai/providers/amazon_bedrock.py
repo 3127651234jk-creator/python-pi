@@ -68,6 +68,8 @@ def build_request(model, context, options):
         cache_point = {"cachePoint": {"type": "default", **({"ttl": "1h"} if options.cache_retention == "1h" else {})}}
     output = []
     for message in messages:
+        same_model = (message.role == "assistant" and message.provider == model.provider
+                      and message.api == model.api and message.model == model.id)
         content = []
         if isinstance(message, ToolResultMessage):
             content = [{"toolResult": {"toolUseId": normalize_tool_call_id(message.tool_call_id), "status": "error" if message.is_error else "success",
@@ -84,8 +86,11 @@ def build_request(model, context, options):
                     if block.raw_item is not None:
                         continue  # Hosted calls are provider-executed; not replayable on Bedrock.
                     content.append({"toolUse": {"toolUseId": normalize_tool_call_id(block.id), "name": block.name, "input": block.arguments}})
-                elif isinstance(block, ThinkingContent) and block.thinking_signature:
-                    content.append({"reasoningContent": {"reasoningText": {"text": block.thinking, "signature": block.thinking_signature}}})
+                elif isinstance(block, ThinkingContent):
+                    if same_model and block.thinking_signature:
+                        content.append({"reasoningContent": {"reasoningText": {"text": block.thinking, "signature": block.thinking_signature}}})
+                    elif not block.redacted and block.thinking.strip():
+                        content.append({"text": block.thinking})
         role = "assistant" if message.role == "assistant" else "user"
         if content:
             if output and output[-1]["role"] == role:

@@ -44,6 +44,8 @@ def build_request(model, context, options):
                     content.append({"type": "input_text", "text": b.text})
             items.append({"role": "user", "content": content})
         elif isinstance(message, AssistantMessage):
+            same_model = (message.provider == model.provider and message.api == model.api
+                          and message.model == model.id)
             for block in message.content:
                 if isinstance(block, TextContent):
                     items.append({"role": "assistant", "content": [{"type": "output_text", "text": block.text}]})
@@ -54,8 +56,11 @@ def build_request(model, context, options):
                         items.append(block.raw_item)
                     else:
                         items.append({"type": "function_call", "call_id": block.id, "name": block.name, "arguments": json.dumps(block.arguments)})
-                elif isinstance(block, ThinkingContent) and block.thinking_signature and message.api in ("openai-responses", "openai-codex-responses", "azure-openai-responses"):
-                    items.append(json.loads(block.thinking_signature))
+                elif isinstance(block, ThinkingContent):
+                    if same_model and block.thinking_signature:
+                        items.append(json.loads(block.thinking_signature))
+                    elif not block.redacted and block.thinking.strip():
+                        items.append({"role": "assistant", "content": [{"type": "output_text", "text": block.thinking}]})
         elif isinstance(message, ToolResultMessage):
             output = [{"type": "input_image", "image_url": f"data:{b.mime_type};base64,{b.data}"} if isinstance(b, ImageContent)
                       else {"type": "input_text", "text": b.text} for b in message.content]

@@ -15,6 +15,8 @@ def build_request(model, context, options):
     system, messages = normalize_context(context)
     contents = []
     for message in messages:
+        same_model = (message.role == "assistant" and message.provider == model.provider
+                      and message.api == model.api and message.model == model.id)
         parts = []
         if isinstance(message, ToolResultMessage):
             parts = [{"functionResponse": {"name": message.tool_name, "id": message.tool_call_id,
@@ -29,11 +31,14 @@ def build_request(model, context, options):
                     if block.raw_item is not None:
                         continue  # Hosted calls are provider-executed; not replayable on Gemini.
                     part = {"functionCall": {"id": block.id, "name": block.name, "args": block.arguments}}
-                    if block.thought_signature:
+                    if same_model and block.thought_signature:
                         part["thoughtSignature"] = block.thought_signature
                     parts.append(part)
-                elif isinstance(block, ThinkingContent) and block.thinking_signature:
-                    parts.append({"text": block.thinking, "thought": True, "thoughtSignature": block.thinking_signature})
+                elif isinstance(block, ThinkingContent):
+                    if same_model and block.thinking_signature:
+                        parts.append({"text": block.thinking, "thought": True, "thoughtSignature": block.thinking_signature})
+                    elif not block.redacted and block.thinking.strip():
+                        parts.append({"text": block.thinking})
         role = "model" if message.role == "assistant" else "user"
         if parts:
             if contents and contents[-1]["role"] == role:
