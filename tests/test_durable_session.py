@@ -10,12 +10,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
+from pi.ai.types import UserMessage
 from pi.durable.documents import define_doc
 from pi.durable.errors import ReadAfterWrite
 from pi.durable.entries import USER_ENTRY
 from pi.durable.session import create_session
 from pi.durable.types import define_task
-from pi.durable.storage import JsonlStorage, MemoryStorage
+from pi.durable.storage import JsonlStorage, MemoryStorage, SqliteStorage
 
 
 def test_commit_publishes_changes():
@@ -213,5 +214,25 @@ def test_reopen_continues_sequence():
         finally:
             if os.path.exists(path):
                 os.remove(path)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("storage_type,suffix", [(JsonlStorage, ".jsonl"), (SqliteStorage, ".sqlite")])
+def test_lone_surrogate_commit_round_trips_without_poisoning_session(tmp_path, storage_type, suffix):
+    async def scenario():
+        path = str(tmp_path / f"session{suffix}")
+        session = create_session(storage_type(path))
+        conversation = await session.commit(lambda tx: tx.create_conversation({"kind": "ownerless"}))
+        await session.commit(lambda tx: tx.append_entry(
+            conversation.id, {"kind": "pi.user", "model": [UserMessage(content="\ud800", timestamp=0)]}))
+        await session.commit(lambda tx: tx.append_entry(
+            conversation.id, {"kind": "pi.user", "model": [UserMessage(content="still usable", timestamp=1)]}))
+        await session.close()
+
+        reopened = storage_type(path)
+        page = await reopened.scan_entries({"conversation_id": conversation.id}, 10)
+        assert [entry.model[0].content for entry in page.items] == ["still usable", "\ud800"]
+        await reopened.close()
 
     asyncio.run(scenario())

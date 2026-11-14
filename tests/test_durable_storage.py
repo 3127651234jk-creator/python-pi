@@ -369,12 +369,25 @@ def test_sqlite_document_record_survives_reopen(tmp_path):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("invalid", [object(), "\ud800"])
-def test_sqlite_encoding_failure_leaves_connection_usable(tmp_path, invalid):
+def test_jsonl_serialization_failure_writes_no_log_and_stays_usable(tmp_path):
+    async def scenario():
+        storage = JsonlStorage(str(tmp_path / "failure.jsonl"))
+        with pytest.raises(StorageRejected):
+            await storage.commit([write_entry(entry(2, 3, data=object()))])
+        assert storage.next_seq == 1
+        assert await storage.entry_global(2) is None
+        assert os.path.getsize(storage.path) == 0
+        assert await storage.commit([write_conversation(conversation(3))]) == 1
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_serialization_failure_leaves_connection_usable(tmp_path):
     async def scenario():
         storage = SqliteStorage(str(tmp_path / "failure.db"))
-        with pytest.raises((TypeError, UnicodeEncodeError)):
-            await storage.commit([write_entry(entry(2, 3, data=invalid))])
+        with pytest.raises(StorageRejected):
+            await storage.commit([write_entry(entry(2, 3, data=object()))])
         assert not storage.conn.in_transaction
         assert storage.next_seq == 1
         assert await storage.entry_global(2) is None

@@ -11,6 +11,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from ..errors import StorageRejected
 from ..types import Page, record_from_dict, record_to_dict
 from .base import BaseStorage
 from .memory import MemoryStorage
@@ -87,8 +88,12 @@ class JsonlStorage(MemoryStorage):
         self.check_global_ids(resolved)
         actions = self.prepare_document_actions(resolved)
         self.check_document_actions(actions)
+        try:
+            payload = json.dumps({"seq": seq, "writes": self._encode_writes(resolved)}, ensure_ascii=True) + "\n"
+        except (TypeError, UnicodeEncodeError, ValueError) as exc:
+            raise StorageRejected(f"Commit is not JSON-serializable: {exc}") from exc
         with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"seq": seq, "writes": self._encode_writes(resolved)}, ensure_ascii=False) + "\n")
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         self.apply_writes(resolved, actions, seq)

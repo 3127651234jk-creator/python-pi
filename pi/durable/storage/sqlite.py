@@ -12,6 +12,7 @@ import os
 import sqlite3
 from typing import Any, Dict, List, Optional
 
+from ..errors import StorageRejected
 from ..types import Page, record_from_dict, record_to_dict
 from .base import BaseStorage
 from .memory import MemoryStorage
@@ -70,9 +71,10 @@ class SqliteStorage(MemoryStorage):
         self.check_global_ids(resolved)
         actions = self.prepare_document_actions(resolved)
         self.check_document_actions(actions)
-        payload = json.dumps(self._encode_writes(resolved), ensure_ascii=False)
-        # sqlite3 encodes text parameters as UTF-8 when binding them.
-        payload.encode("utf-8")
+        try:
+            payload = json.dumps(self._encode_writes(resolved), ensure_ascii=True)
+        except (TypeError, UnicodeEncodeError, ValueError) as exc:
+            raise StorageRejected(f"Commit is not JSON-serializable: {exc}") from exc
         try:
             self.conn.execute("BEGIN")
             self.conn.execute(
