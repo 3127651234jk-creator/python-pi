@@ -249,6 +249,11 @@ async def run_loop(
                     new_messages.append(result)
 
             last_completed_turn = _turn_context(message, tool_results, current_context, new_messages)
+            if signal is not None and signal.aborted:
+                await emit(TurnEndEvent(message=message, tool_results=tool_results))
+                await emit(AgentEndEvent(messages=new_messages))
+                return
+
             decision = None
             if config.finish_turn is not None:
                 decision = await config.finish_turn(last_completed_turn, signal)

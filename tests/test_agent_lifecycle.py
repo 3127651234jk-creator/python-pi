@@ -140,3 +140,37 @@ def test_subscriber_failure_keeps_persisted_tool_result(monkeypatch):
             faux.reset_script_index()
 
     asyncio.run(scenario())
+
+
+def test_subscriber_failure_keeps_every_completed_parallel_tool_result(monkeypatch):
+    async def scenario():
+        faux.reset_script_index()
+        monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+            {"toolCalls": [
+                {"id": "first", "name": "echo", "arguments": {"text": "one"}},
+                {"id": "second", "name": "echo", "arguments": {"text": "two"}},
+            ]},
+        ]))
+        agent = make_agent()
+
+        async def execute(tool_call_id, params, signal=None, on_update=None):
+            return AgentToolResult(content=[TextContent(text=params["text"])])
+
+        agent.tools = [AgentTool(name="echo", description="echo", execute=execute)]
+
+        def fail_first_result(event):
+            if (event.type == "message_end" and event.message.role == "toolResult"
+                    and event.message.tool_call_id == "first"):
+                raise RuntimeError("subscriber failed")
+
+        agent.subscribe(fail_first_result)
+        try:
+            with pytest.raises(RuntimeError, match="subscriber failed"):
+                await agent.prompt("run tools")
+            results = [message for message in agent.messages if message.role == "toolResult"]
+            assert [message.tool_call_id for message in results] == ["first", "second"]
+            assert [message.content[0].text for message in results] == ["one", "two"]
+        finally:
+            faux.reset_script_index()
+
+    asyncio.run(scenario())

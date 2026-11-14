@@ -488,6 +488,45 @@ def test_abort_answers_remaining_tool_calls_parallel():
     asyncio.run(scenario())
 
 
+def test_abort_during_tool_batch_does_not_request_another_model_turn():
+    async def scenario():
+        signal = AbortSignal()
+        provider_calls = 0
+
+        async def stream_fn(model, context, options=None):
+            nonlocal provider_calls
+            provider_calls += 1
+            partial = make_partial(model, 0)
+            yield StreamStartEvent(partial=partial)
+            message = make_partial(model, 0)
+            message.content = [ToolCall(id="t1", name="echo", arguments={"text": "x"})]
+            message.stop_reason = "toolUse"
+            yield DoneEvent(reason="toolUse", message=message)
+
+        async def execute(tool_call_id, params, sig=None, on_update=None):
+            sig.abort()
+            return AgentToolResult(content=[TextContent(text="ran")], details={})
+
+        tool = make_tool()
+        tool.execute = execute
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[tool]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=signal,
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+
+        assert provider_calls == 1
+        assert signal.aborted
+        assert [getattr(message, "role", None) for message in messages] == [
+            "system", "user", "assistant", "toolResult",
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_aborted_stream_answers_streamed_tool_calls():
     """A request aborted after a tool_use block was streamed still gets a result."""
 

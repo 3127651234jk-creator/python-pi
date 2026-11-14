@@ -77,10 +77,17 @@ class Agent:
         return unsubscribe
 
     async def _emit(self, event: AgentEvent) -> None:
+        first_error: Optional[Exception] = None
         for listener in list(self._listeners):
-            result = listener(event)
-            if hasattr(result, "__await__"):
-                await result
+            try:
+                result = listener(event)
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     # -- queues ------------------------------------------------------------
 
@@ -139,13 +146,25 @@ class Agent:
         self._abort = AbortSignal()
         new_messages: List[Any] = []
         completed_messages: List[Any] = []
+        deferred_listener_error: Optional[Exception] = None
 
         async def emit(event: AgentEvent) -> None:
+            nonlocal deferred_listener_error
             # Record completion before subscribers run: a subscriber may persist
             # the message and then another subscriber may raise.
             if isinstance(event, MessageEndEvent):
                 completed_messages.append(event.message)
-            await self._emit(event)
+            is_tool_result_event = (getattr(getattr(event, "message", None), "role", None)
+                                    == "toolResult")
+            if deferred_listener_error is not None and not is_tool_result_event:
+                raise deferred_listener_error
+            try:
+                await self._emit(event)
+            except Exception as exc:
+                if not is_tool_result_event:
+                    raise
+                if deferred_listener_error is None:
+                    deferred_listener_error = exc
 
         try:
             config = self._build_config()
