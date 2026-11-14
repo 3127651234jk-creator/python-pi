@@ -90,6 +90,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             provider_thinking_level=data.get("provider_thinking_level"),
             diagnostics=[_diagnostic_from_json(item) for item in (data.get("diagnostics") or [])
                          if isinstance(item, dict)] or None,
+            retried=bool(data.get("retried", False)),
         )
     if role == "toolResult":
         blocks = [_block_from_json(block) for block in data.get("content", [])]

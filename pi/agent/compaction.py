@@ -7,8 +7,9 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from ..ai.models import Model
 from ..ai.providers import SimpleStreamOptions
+from ..ai.retry import RetryPolicy, retry_assistant_call
 from ..ai.types import (
-    AudioContent, DoneEvent, ImageContent, Message, StreamErrorEvent, SystemMessage,
+    AssistantMessage, AudioContent, DoneEvent, ImageContent, Message, StreamErrorEvent, SystemMessage,
     TextContent, ToolCall, TranscriptContext, Usage, UserMessage, VideoContent, combine_usage,
 )
 from ..ai.utils import normalize_context
@@ -107,6 +108,9 @@ class ContextCompactor:
         # across chunk and split-turn requests like the TypeScript CompactionResult.
         self.last_usage: Optional[Usage] = None
         self.on_summary: Optional[Callable[[str, Optional[Usage]], None]] = None
+        # Shared with the agent's auto-retry policy: transient stream drops in
+        # the summarization call retry instead of failing the compaction.
+        self.retry: Optional[RetryPolicy] = None
 
     async def project(self, messages, model: Model, options, stream, force=False):
         system, rest = normalize_context(TranscriptContext(messages=messages))
@@ -233,15 +237,25 @@ class ContextCompactor:
                 SystemMessage(content=system_prompt, timestamp=0),
                 UserMessage(content=user_text, timestamp=0),
             ])
-            final = None
-            async for event in stream(model, request, SimpleStreamOptions(
-                signal=options.signal, api_key=options.api_key,
-                max_tokens=min(max_tokens, model.max_tokens),
-            )):
-                if isinstance(event, DoneEvent):
-                    final = event.message
-                elif isinstance(event, StreamErrorEvent):
-                    raise RuntimeError("Context summarization failed: " + (event.error.error_message or event.reason))
+            async def produce() -> AssistantMessage:
+                # A stream failure becomes an error message so the retry policy
+                # can classify it; deterministic failures still return as errors.
+                final: Optional[AssistantMessage] = None
+                async for event in stream(model, request, SimpleStreamOptions(
+                    signal=options.signal, api_key=options.api_key,
+                    max_tokens=min(max_tokens, model.max_tokens),
+                )):
+                    if isinstance(event, DoneEvent):
+                        final = event.message
+                    elif isinstance(event, StreamErrorEvent):
+                        final = event.error
+                if options.signal:
+                    options.signal.throw_if_aborted()
+                if final is None:
+                    raise RuntimeError("Context summarization stream ended without a done/error event")
+                return final
+
+            final = await retry_assistant_call(produce, self.retry, options.signal)
             if options.signal:
                 options.signal.throw_if_aborted()
             if final is None:

@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pi.ai.json_io import to_json
 from pi.ai.models import Model
 from pi.ai.providers import faux
+from pi.ai.retry import RetryPolicy
 from pi.ai.types import AssistantMessage, TextContent, Usage, UserMessage
 from pi.agent.types import AgentToolResult
 from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
@@ -271,6 +272,33 @@ def test_compact_cut_inside_last_entry_does_not_fault(tmp_path):
                            message["content"] == "Conversation summary:\nsummary"
                            for message in messages)
                 await harness.run_pending_tasks()
+
+            await session.close()
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            faux.reset_script_index()
+
+    asyncio.run(scenario())
+
+
+def test_durable_generation_retries_transient_stream_error(tmp_path):
+    """A transient stream drop retries with backoff before the turn commits."""
+
+    async def scenario():
+        faux.reset_script_index()
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"error": "terminated"}, {"text": "recovered answer"}])
+        try:
+            session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
+            harness = Harness(session, make_model(), retry=RetryPolicy(base_delay_ms=0))
+            cid = await harness.create_conversation()
+            await harness.submit_input(cid, "hello")
+            await harness.run_pending_tasks()
+
+            transcript = await harness.transcript(cid)
+            # The failed attempt never becomes a visible entry.
+            assert [e.kind for e in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
+            answer = transcript[1].model[0]
+            assert answer.content[0].text == "recovered answer"
             await session.close()
         finally:
             os.environ.pop("FAUX_SCRIPT", None)
@@ -358,5 +386,30 @@ def test_concurrent_scheduler_serializes_same_conversation(tmp_path):
         assert peak[cid1] == 1
         assert peak[cid2] == 1
         await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_durable_generation_does_not_retry_quota_error(tmp_path):
+    """Quota/billing errors are deterministic: the error response settles as-is."""
+
+    async def scenario():
+        faux.reset_script_index()
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"error": "insufficient_quota"}, {"text": "never"}])
+        try:
+            session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
+            harness = Harness(session, make_model(), retry=RetryPolicy(base_delay_ms=0))
+            cid = await harness.create_conversation()
+            await harness.submit_input(cid, "hello")
+            await harness.run_pending_tasks()
+
+            transcript = await harness.transcript(cid)
+            answer = transcript[1].model[0]
+            assert answer.stop_reason == "error"
+            assert answer.error_message == "insufficient_quota"
+            await session.close()
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            faux.reset_script_index()
 
     asyncio.run(scenario())

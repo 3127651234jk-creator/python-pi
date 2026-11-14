@@ -22,11 +22,14 @@ from prompt_toolkit import PromptSession
 
 from ..ai.models import ModelError, resolve_image_model, resolve_model
 from ..ai.providers import generate_images
+from ..ai.retry import RetryPolicy
 from ..ai.types import AssistantMessage, ImageContent, ImagesContext, SystemMessage, TextContent, TextDeltaEvent, get_message_text
 from ..agent.agent import Agent
 from ..agent.compaction import compact_agent, prefix_checkpoint, restore_compaction
 from ..agent.types import (
     AgentEndEvent,
+    AutoRetryEndEvent,
+    AutoRetryStartEvent,
     MessageEndEvent,
     MessageUpdateEvent,
     ToolExecutionEndEvent,
@@ -161,7 +164,8 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
                  thinking_level=args.thinking or os.environ.get("PI_PY_THINKING") or settings.get("thinking", "off"),
                  compaction=CompactionSettings(**settings.get("compaction", {})),
                  cache_retention=settings.get("cache_retention", "5m") or None,
-                 block_images=bool(image_settings.get("block_images", False)))
+                 block_images=bool(image_settings.get("block_images", False)),
+                 retry=RetryPolicy(**settings.get("retry", {})))
     apply_attribution(model, settings)
     current_agent["agent"] = agent
     resources = resources or ResourceCatalog(registry.config)
@@ -279,6 +283,15 @@ class CliRenderer:
             if lines:
                 indent = "  " if event.parent_tool_call_id else ""
                 print("\n".join(indent + line for line in lines), flush=True)
+        elif isinstance(event, AutoRetryStartEvent):
+            print(
+                f"\n[retrying attempt {event.attempt}/{event.max_attempts} in "
+                f"{event.delay_ms / 1000:.1f}s: {event.error_message}]",
+                flush=True,
+            )
+        elif isinstance(event, AutoRetryEndEvent) and not event.success:
+            reason = "retry cancelled" if event.final_error == "Retry cancelled" else f"retry failed: {event.final_error}"
+            print(f"\n[{reason}]", flush=True)
         elif isinstance(event, TurnEndEvent):
             message = event.message
             usage = getattr(message, "usage", None)
@@ -671,6 +684,9 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         agent.thinking_level = registry.config.settings.get("thinking", agent.thinking_level)
                         agent.compactor.settings = CompactionSettings(**registry.config.settings.get("compaction", {}))
                         sync_block_images(agent, registry)
+                        retry = RetryPolicy(**registry.config.settings.get("retry", {}))
+                        agent.retry = retry
+                        agent.compactor.retry = retry
                         if resources:
                             resources.reload()
                             for diagnostic in resources.diagnostics:

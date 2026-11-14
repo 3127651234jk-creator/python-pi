@@ -15,6 +15,7 @@ from pi.agent.compaction import (
 from pi.ai.models import resolve_model
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers import SimpleStreamOptions
+from pi.ai.retry import RetryPolicy
 from pi.ai.types import (
     AssistantMessage, DoneEvent, StreamErrorEvent, TextContent, TranscriptContext, Usage, UserMessage,
 )
@@ -213,6 +214,58 @@ def test_split_turn_without_history_region_merges_prior_summary():
         # prefix is summarized.
         assert calls and all(c.messages[0].content == TURN_PREFIX_SUMMARIZATION_PROMPT for c in calls)
         assert compactor.summary == "prior\n\n---\n\n**Turn Context (split turn):**\n\nTURN_CONTEXT"
+
+    asyncio.run(check())
+
+
+def test_summarization_retries_transient_stream_error():
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=50))
+        compactor.retry = RetryPolicy(base_delay_ms=0)
+        model = resolve_model("faux")
+        model.context_window = 3000
+        messages = [UserMessage(content="old" * 4000, timestamp=0), UserMessage(content="latest", timestamp=1)]
+        attempts = []
+
+        async def stream(model, context, options):
+            attempts.append(1)
+            if len(attempts) == 1:
+                error = response(reason="error")
+                error.error_message = "terminated"
+                yield StreamErrorEvent(reason="error", error=error)
+            else:
+                yield DoneEvent(reason="stop", message=response())
+
+        projected = await compactor.project(messages, model, SimpleStreamOptions(), stream)
+        # The first chunk errored once, the retry succeeded, and the compaction
+        # still completed with the summary cached.
+        assert len(attempts) >= 2
+        assert "summary" in projected[0].content
+        assert compactor.summary == "summary"
+    asyncio.run(check())
+
+
+def test_summarization_stream_error_fails_without_retry_policy():
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=1))
+        model = resolve_model("faux")
+        model.context_window = 3000
+        attempts = []
+
+        async def stream(model, context, options):
+            attempts.append(1)
+            error = response(reason="error")
+            error.error_message = "terminated"
+            yield StreamErrorEvent(reason="error", error=error)
+
+        with pytest.raises(RuntimeError):
+            await compactor.project(
+                [UserMessage(content="x" * 1000, timestamp=0), UserMessage(content="latest", timestamp=1)],
+                model, SimpleStreamOptions(), stream, force=True,
+            )
+        assert len(attempts) == 1
+        assert compactor.prefix == []
+        assert compactor.summary == ""
     asyncio.run(check())
 
 

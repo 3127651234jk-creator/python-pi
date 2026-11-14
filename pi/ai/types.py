@@ -202,6 +202,9 @@ class AssistantMessage:
     end_turn: Optional[bool] = None
     provider_thinking_level: Optional[str] = None
     diagnostics: Optional[List[AssistantMessageDiagnostic]] = None
+    # A failed attempt superseded by an auto-retry: kept in raw history and
+    # session logs, omitted from model projections.
+    retried: bool = False
 
 
 def format_thrown_value(value: Any) -> str:

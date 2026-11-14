@@ -19,9 +19,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..ai.json_io import message_from_json, to_json as ai_to_json
 from ..ai.models import Model
+from ..ai.retry import RetryPolicy, is_retryable_assistant_error, retry_delay_ms
 from ..ai.types import AssistantMessage, ToolCall, TranscriptContext, UserMessage
 from ..ai.providers import get_default_stream_fn
 from ..ai.utils import normalize_context
+from ..agent.compaction import is_context_overflow
 from .entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, USER_ENTRY
 from .errors import StorageRejected, error_message
 from .session import Session
@@ -47,6 +49,24 @@ class TaskRuntime:
     @property
     def aborted(self) -> bool:
         return self.signal.is_set()
+
+    async def sleep(self, until_ms: int) -> None:
+        """Sleep until the wall-clock deadline ``until_ms``; wakes early on abort.
+
+        The abort mark routes through the scheduler: after a wait cut short by
+        ``abort_task``, the next loop iteration invokes the definition's abort
+        handler instead of the phase the task would resume.
+        """
+        delay = (until_ms - int(time.time() * 1000)) / 1000
+        if delay <= 0:
+            return
+        tick = asyncio.ensure_future(asyncio.sleep(delay))
+        guard = asyncio.ensure_future(self.signal.wait())
+        try:
+            await asyncio.wait({tick, guard}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            tick.cancel()
+            guard.cancel()
 
     async def commit(self, change: Callable[[Any, TaskRecord], Optional[TaskState]]) -> None:
         """Commit after rereading the task; a returned state replaces its state.
@@ -139,9 +159,10 @@ def _scope_for_conversation(conversation_id: int):
 class Harness:
     """Durable agent harness over one Session (compact port of Harness)."""
 
-    def __init__(self, session: Session, model: Model) -> None:
+    def __init__(self, session: Session, model: Model, retry: Optional[RetryPolicy] = None) -> None:
         self.session = session
         self.model = model
+        self.retry = retry
         self.definitions: Dict[str, TaskDefinition] = {}
         self.tools: Dict[str, Any] = {}
         self.register_definition(generation_definition())
@@ -285,6 +306,8 @@ class Harness:
             tx._mark_table_write()
 
         await self.session.commit(change, _scope_for(self, task_id))
+        # Wake a running phase (e.g. a retry backoff sleep) so the abort mark is
+        # honored promptly instead of after the full wait.
         signal = self._signals.get(task_id)
         if signal is not None:
             signal.set()
@@ -391,8 +414,8 @@ class Harness:
             return
 
         signal = asyncio.Event()
-        runtime = TaskRuntime(self, task.id, signal)
         self._signals[task.id] = signal
+        runtime = TaskRuntime(self, task.id, signal)
         try:
             # Reserve: pending -> running. On reopen, running resets to pending.
             # A task that cannot be reserved (for example a version migration)
@@ -443,7 +466,6 @@ class Harness:
                 await self._fault_or_orphan(
                     current, "faulted", f"{type(exc).__name__}: {error_message(exc)}"
                 )
-
         finally:
             self._signals.pop(task.id, None)
 
@@ -660,7 +682,8 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
     """The built-in generation task (compact port of GenerationTask).
 
     Phases: prepare (transcript -> LLM context), stream (provider request,
-    response committed as a checkpoint), settle (assistant entry + submission
+    response committed as a checkpoint), retry (transient-error backoff, when
+    a retry policy is configured), settle (assistant entry + submission
     settlement). A crash between phases resumes from the durable checkpoint.
     """
 
@@ -675,17 +698,55 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         stored = [ai_to_json(m) for m in llm_messages]
         await runtime.commit(
             lambda tx, current: TaskState(
-                status="running", checkpoint={"phase": "stream", "messages": stored}
+                status="running", checkpoint={"phase": "stream", "messages": stored, "attempt": 1}
             )
         )
 
     async def stream(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
-        messages = [message_from_json(m) for m in (task.state.checkpoint.get("messages") or [])]
+        checkpoint = task.state.checkpoint
+        messages = [message_from_json(m) for m in (checkpoint.get("messages") or [])]
+        attempt = int(checkpoint.get("attempt") or 1)
         response = await _stream_once(harness.model, messages, harness)
+        # Transient failures retry with backoff before the response becomes
+        # visible; an overflow is never retried (only compaction can fit it).
+        if response.stop_reason == "error" and not is_context_overflow(response):
+            policy = harness.retry
+            if (
+                policy is not None
+                and policy.enabled
+                and is_retryable_assistant_error(response)
+                and attempt <= policy.max_retries
+            ):
+                until = int(time.time() * 1000) + retry_delay_ms(policy, attempt)
+                await runtime.commit(
+                    lambda tx, current: TaskState(
+                        status="running",
+                        checkpoint={
+                            "phase": "retry",
+                            "attempt": attempt,
+                            "until": until,
+                            "messages": checkpoint.get("messages") or [],
+                        },
+                    )
+                )
+                return
         await runtime.commit(
             lambda tx, current: TaskState(
                 status="running",
                 checkpoint={"phase": "settle", "response": ai_to_json([response])[0]},
+            )
+        )
+
+    async def retry(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
+        await runtime.sleep(int(task.state.checkpoint["until"]))
+        await runtime.commit(
+            lambda tx, current: TaskState(
+                status="running",
+                checkpoint={
+                    "phase": "stream",
+                    "attempt": int(current.state.checkpoint["attempt"]) + 1,
+                    "messages": current.state.checkpoint.get("messages") or [],
+                },
             )
         )
 
@@ -718,7 +779,7 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         name="pi.generation",
         version=1,
         initial=lambda input: {"phase": "prepare"},
-        phases={"prepare": prepare, "stream": stream, "settle": settle},
+        phases={"prepare": prepare, "stream": stream, "retry": retry, "settle": settle},
         abort=abort,
     )
 

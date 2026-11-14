@@ -15,6 +15,7 @@ import sys
 from typing import List, Optional
 
 from ..ai.models import ModelError, resolve_model
+from ..ai.retry import RetryPolicy
 from ..coding_agent.tools import create_default_tools
 from .harness import Harness
 from .session import Session
@@ -30,6 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", help="API key")
     parser.add_argument("--base-url", help="Provider base URL override")
     parser.add_argument("--concurrency", type=int, default=1, help="Concurrent task executions")
+    parser.add_argument("--retry", type=int, default=0, metavar="N",
+                        help="Retry transient provider errors up to N times (default: 0, disabled)")
+    parser.add_argument("--retry-base-delay-ms", type=int, default=2000,
+                        help="Base retry backoff in ms (default: 2000)")
+    parser.add_argument("--retry-max-delay-ms", type=int, default=60000,
+                        help="Per-attempt retry delay cap in ms (default: 60000)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("create", help="Create a conversation; prints its id")
     submit = sub.add_parser("input", help="Submit user input and run tasks")
@@ -87,7 +94,14 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     except ModelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    harness = Harness(session, model)
+    retry = None
+    if args.retry > 0:
+        retry = RetryPolicy(
+            max_retries=args.retry,
+            base_delay_ms=max(0, args.retry_base_delay_ms),
+            max_agent_delay_ms=max(0, args.retry_max_delay_ms),
+        )
+    harness = Harness(session, model, retry=retry)
     register_builtin_tasks(harness, tools={tool.name: tool for tool in create_default_tools(".")})
 
     if args.command == "create":

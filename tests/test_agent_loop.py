@@ -23,14 +23,30 @@ from pi.agent.types import (
     AgentLoopConfig,
     AgentTool,
     AgentToolResult,
+    AutoRetryEndEvent,
+    AutoRetryStartEvent,
     BeforeToolCallResult,
+    MessageEndEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
 )
 from pi.ai.models import Model
 from pi.ai.providers import faux
 from pi.ai.providers.base import make_partial
-from pi.ai.types import DoneEvent, StreamStartEvent, SystemMessage, TextContent, ToolCall, ToolResultMessage, UserMessage
+from pi.ai.retry import RetryPolicy
+from pi.ai.types import (
+    AssistantMessage,
+    DoneEvent,
+    StreamErrorEvent,
+    StreamStartEvent,
+    SystemMessage,
+    TextContent,
+    ToolCall,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+)
+from pi.coding_agent.session import SessionManager
 from pi.util import AbortSignal
 
 
@@ -450,6 +466,35 @@ def test_abort_answers_remaining_tool_calls_sequential():
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------------
+# Agent auto-retry
+# ---------------------------------------------------------------------------
+
+
+def test_agent_auto_retries_transient_error():
+    async def scenario():
+        use_script([{"error": "terminated"}, {"text": "recovered"}])
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=0))
+        events = []
+        agent.subscribe(events.append)
+        messages = await agent.prompt("hello")
+        assert [getattr(m, "role", None) for m in messages] == ["user", "assistant", "assistant"]
+        assert messages[-1].content[0].text == "recovered"
+        # The superseded attempt stays in raw history (so memory and the session
+        # log agree) but is omitted from the model projection.
+        assert messages[1].stop_reason == "error"
+        assert messages[1].retried is True
+        assert agent.messages[-1].content[0].text == "recovered"
+        assert [m.role for m in default_convert_to_llm(agent.messages)] == ["user", "assistant"]
+        starts = [e for e in events if isinstance(e, AutoRetryStartEvent)]
+        ends = [e for e in events if isinstance(e, AutoRetryEndEvent)]
+        assert [(s.attempt, s.max_attempts, s.delay_ms) for s in starts] == [(1, 3, 0)]
+        assert starts[0].error_message == "terminated"
+        assert [(e.success, e.attempt) for e in ends] == [(True, 1)]
+
+    asyncio.run(scenario())
+
+
 def test_abort_answers_remaining_tool_calls_parallel():
     """An abort during preparation still answers the calls that never started."""
 
@@ -484,6 +529,66 @@ def test_abort_answers_remaining_tool_calls_parallel():
         ends = [e.tool_call_id for e in events if isinstance(e, ToolExecutionEndEvent)]
         assert starts == ["t1", "t2", "t3"]
         assert ends == ["t1", "t2", "t3"]
+
+    asyncio.run(scenario())
+
+
+def test_retried_attempt_round_trips_through_session(tmp_path):
+    """A retried-away attempt is persisted and re-omitted after a session reload."""
+
+    async def scenario():
+        use_script([{"error": "terminated"}, {"text": "recovered"}])
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=0))
+        session = SessionManager(session_dir=str(tmp_path), cwd=str(tmp_path))
+        session.start_new()
+
+        async def record(event):
+            if isinstance(event, MessageEndEvent):
+                session.append(event.message)
+
+        agent.subscribe(record)
+        await agent.prompt("hello")
+
+        loaded = session.load(session.session_file)
+        assert [getattr(m, "role", None) for m in loaded] == ["user", "assistant", "assistant"]
+        assert loaded[1].retried is True
+        assert [m.role for m in default_convert_to_llm(loaded)] == ["user", "assistant"]
+        assert loaded[-1].content[0].text == "recovered"
+
+    asyncio.run(scenario())
+
+
+def test_stream_events_survives_auto_retry():
+    """The event stream only ends when the prompt does, not on the failed attempt."""
+
+    async def scenario():
+        use_script([{"error": "terminated"}, {"text": "recovered"}])
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=100))
+        types = []
+        async for event in agent.stream_events("hello"):
+            types.append(event.type)
+        assert types.count("agent_end") == 2
+        assert "auto_retry_start" in types
+        assert "auto_retry_end" in types
+        assert agent.messages[-1].content[0].text == "recovered"
+
+    asyncio.run(scenario())
+
+
+def test_agent_auto_retry_does_not_retry_non_retryable_error():
+    async def scenario():
+        use_script([{"error": "insufficient_quota"}])
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=0))
+        events = []
+        agent.subscribe(events.append)
+        messages = await agent.prompt("hello")
+        assert messages[-1].stop_reason == "error"
+        assert messages[-1].error_message == "insufficient_quota"
+        # A deterministic error is neither discarded nor omitted.
+        assert messages[-1].retried is False
+        assert agent.messages[-1].stop_reason == "error"
+        assert len(default_convert_to_llm(agent.messages)) == 2
+        assert not [e for e in events if isinstance(e, (AutoRetryStartEvent, AutoRetryEndEvent))]
 
     asyncio.run(scenario())
 
@@ -527,6 +632,69 @@ def test_abort_during_tool_batch_does_not_request_another_model_turn():
     asyncio.run(scenario())
 
 
+def test_agent_auto_retry_skips_context_overflow():
+    async def scenario():
+        use_script([{"error": "context_length_exceeded"}])
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=0))
+        events = []
+        agent.subscribe(events.append)
+        messages = await agent.prompt("hello")
+        assert messages[-1].stop_reason == "error"
+        assert messages[-1].retried is False
+        assert not [e for e in events if isinstance(e, (AutoRetryStartEvent, AutoRetryEndEvent))]
+
+    asyncio.run(scenario())
+
+
+def test_agent_auto_retry_gives_up_after_max_retries():
+    async def scenario():
+        use_script([{"error": "terminated"}] * 4)
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=0, max_retries=2))
+        events = []
+        agent.subscribe(events.append)
+        messages = await agent.prompt("hello")
+        assert messages[-1].stop_reason == "error"
+        # The two superseded attempts are marked; the final error is not.
+        assert [m.retried for m in messages[1:]] == [True, True, False]
+        starts = [e.attempt for e in events if isinstance(e, AutoRetryStartEvent)]
+        assert starts == [1, 2]
+        end = next(e for e in events if isinstance(e, AutoRetryEndEvent))
+        assert end.success is False
+        assert end.attempt == 2
+        assert end.final_error == "terminated"
+
+    asyncio.run(scenario())
+
+
+def test_agent_auto_retry_resets_budget_after_success():
+    async def scenario():
+        use_script([
+            {"error": "terminated"},
+            {"toolCalls": [{"id": "t1", "name": "echo", "arguments": {"text": "x"}}]},
+            {"error": "terminated"},
+            {"text": "done"},
+        ])
+        agent = Agent(model=make_model(), tools=[make_tool()], retry=RetryPolicy(base_delay_ms=0))
+        events = []
+        agent.subscribe(events.append)
+        messages = await agent.prompt("hello")
+        assert messages[-1].content[0].text == "done"
+        # Both superseded attempts are omitted from the projection; the tool
+        # round and the final answer remain.
+        assert [m.role for m in default_convert_to_llm(messages)] == [
+            "system", "user", "assistant", "toolResult", "assistant",
+        ]
+        # The budget reset after the successful tool-call turn: both retries are attempt 1.
+        starts = [e.attempt for e in events if isinstance(e, AutoRetryStartEvent)]
+        assert starts == [1, 1]
+        ends = [(e.success, e.attempt) for e in events if isinstance(e, AutoRetryEndEvent)]
+        # TS emits auto_retry_end on every non-error assistant message after a retry:
+        # the tool-call turn and the final answer each end a retry cycle.
+        assert ends == [(True, 1), (True, 1)]
+
+    asyncio.run(scenario())
+
+
 def test_aborted_stream_answers_streamed_tool_calls():
     """A request aborted after a tool_use block was streamed still gets a result."""
 
@@ -557,5 +725,62 @@ def test_aborted_stream_answers_streamed_tool_calls():
         assert result.tool_call_id == "t1"
         assert result.is_error
         assert "aborted" in result.content[0].text.lower()
+
+    asyncio.run(scenario())
+
+
+def test_agent_auto_retry_aborts_during_backoff():
+    async def scenario():
+        use_script([{"error": "terminated"}, {"text": "unused"}])
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=50_000))
+        events = []
+        agent.subscribe(events.append)
+        task = asyncio.ensure_future(agent.prompt("hello"))
+        while not any(isinstance(e, AutoRetryStartEvent) for e in events):
+            await asyncio.sleep(0.01)
+        agent.abort()
+        messages = await task
+        # The failed attempt is retained (marked) and the cancellation ends the run.
+        assert [getattr(m, "role", None) for m in messages] == ["user", "assistant"]
+        assert messages[1].retried is True
+        end = next(e for e in events if isinstance(e, AutoRetryEndEvent))
+        assert end.success is False
+        assert end.attempt == 1
+        assert end.final_error == "Retry cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_agent_auto_retry_reports_aborted_retry_as_failed(monkeypatch):
+    """An aborted retried attempt is not reported as a successful retry."""
+
+    calls = {"n": 0}
+
+    async def stream(model, context, options):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            error = AssistantMessage(
+                content=[], api="faux", provider="faux", model="faux", usage=Usage(),
+                stop_reason="error", timestamp=0, error_message="terminated",
+            )
+            yield StreamErrorEvent(reason="error", error=error)
+        else:
+            aborted = AssistantMessage(
+                content=[], api="faux", provider="faux", model="faux", usage=Usage(),
+                stop_reason="aborted", timestamp=0,
+            )
+            yield StreamErrorEvent(reason="aborted", error=aborted)
+
+    monkeypatch.setattr("pi.agent.agent.get_default_stream_fn", lambda: stream)
+
+    async def scenario():
+        agent = Agent(model=make_model(), retry=RetryPolicy(base_delay_ms=0))
+        events = []
+        agent.subscribe(events.append)
+        messages = await agent.prompt("hello")
+        assert messages[-1].stop_reason == "aborted"
+        assert messages[1].retried is True
+        ends = [e for e in events if isinstance(e, AutoRetryEndEvent)]
+        assert [(e.success, e.attempt, e.final_error) for e in ends] == [(False, 1, "Retry cancelled")]
 
     asyncio.run(scenario())

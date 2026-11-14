@@ -8,5 +8,6 @@ dist/
 .pi/
 .eval/
 _hang.log
+.audit-pytest.log
 .venv/
 docs/

@@ -97,6 +97,7 @@ def validate_settings(settings: dict) -> None:
     allowed.update({"packages", "sync_catalog", "markdown", "fold_output", "codemode"})
     allowed.update({"images"})
     allowed.update({"default_project_trust", "enable_install_telemetry", "cache_retention"})
+    allowed.update({"retry"})
     if set(settings) - allowed:
         raise ValueError("Unknown settings key; supported: " + ", ".join(sorted(allowed)))
     # Theme discovery belongs to the UI; user themes are named by their files.
@@ -146,6 +147,18 @@ def validate_settings(settings: dict) -> None:
         raise ValueError("enable_install_telemetry must be boolean")
     if "cache_retention" in settings and settings["cache_retention"] not in ("5m", "1h", False):
         raise ValueError("cache_retention must be 5m, 1h or false")
+    if "retry" in settings:
+        retry = settings["retry"]
+        if not isinstance(retry, dict) or set(retry) - {
+            "enabled", "max_retries", "base_delay_ms", "max_agent_delay_ms"
+        }:
+            raise ValueError("Invalid retry settings")
+        for key, value in retry.items():
+            if key == "enabled":
+                if type(value) is not bool:
+                    raise ValueError("Invalid retry setting: enabled")
+            elif type(value) is not int or value < 0:
+                raise ValueError(f"Invalid retry setting: {key}")
     if settings.get("thinking", "off") not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
         raise ValueError("Invalid thinking level")
     compaction = settings.get("compaction", {})

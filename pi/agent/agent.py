@@ -13,15 +13,18 @@ from typing import Any, AsyncIterator, Callable, Deque, List, Optional
 
 from ..ai.models import Model
 from ..ai.providers import get_default_stream_fn
+from ..ai.retry import RetryPolicy, RetrySleepAbortError, is_retryable_assistant_error, retry_delay_ms, sleep_ms
 from ..ai.types import SystemMessage, TextContent, ToolResultMessage, UserMessage
 from ..util import AbortSignal
 from .agent_loop import default_convert_to_llm, run_agent_loop
-from .compaction import CompactionSettings, ContextCompactor
+from .compaction import CompactionSettings, ContextCompactor, is_context_overflow
 from .types import (
     AgentContext,
     AgentEvent,
     AgentLoopConfig,
     AgentTool,
+    AutoRetryEndEvent,
+    AutoRetryStartEvent,
     MessageEndEvent,
 )
 
@@ -39,9 +42,14 @@ class Agent:
         compaction: Optional[CompactionSettings] = None,
         cache_retention: Optional[str] = "5m",
         block_images: bool = False,
+        retry: Optional[RetryPolicy] = None,
     ) -> None:
         self.model = model
         self.compactor = ContextCompactor(compaction or CompactionSettings())
+        self.retry = retry
+        # Compaction summarization shares the agent's retry policy (TS wires the
+        # same settings.retry budget into every summarization call).
+        self.compactor.retry = retry
         self.thinking_level = thinking_level
         self.cache_retention = cache_retention if cache_retention in ("5m", "1h") else None
         self.block_images = block_images
@@ -144,7 +152,8 @@ class Agent:
         self.is_streaming = True
         self.error_message = None
         self._abort = AbortSignal()
-        new_messages: List[Any] = []
+        attempt = 0
+        stream = get_default_stream_fn()
         completed_messages: List[Any] = []
         deferred_listener_error: Optional[Exception] = None
 
@@ -166,27 +175,110 @@ class Agent:
                 if deferred_listener_error is None:
                     deferred_listener_error = exc
 
+        all_new: List[Any] = []
         try:
             config = self._build_config()
-            stream = get_default_stream_fn()
+            # Reads the live attempt count: the same config drives every retry
+            # round, and the predicate decides whether a failure is superseded.
+            config.should_omit_error = lambda message: self._should_retry(message, attempt)
+            transcript = list(self.messages)
+            prompts_list = prompts
 
             async def compacted_stream(model, context, options):
                 async for event in self.compactor.stream(model, context, options, stream):
                     yield event
 
-            new_messages = await run_agent_loop(
-                prompts=prompts,
-                context=AgentContext(messages=list(self.messages), tools=list(self.tools)),
-                config=config,
-                emit=emit,
-                signal=self._abort,
-                stream_fn=compacted_stream,
-            )
+            while True:
+                new_messages = await run_agent_loop(
+                    prompts=prompts_list,
+                    context=AgentContext(messages=list(transcript), tools=list(self.tools)),
+                    config=config,
+                    emit=emit,
+                    signal=self._abort,
+                    stream_fn=compacted_stream,
+                )
+                prompts_list = []
+                transcript.extend(new_messages)
+                all_new.extend(new_messages)
+
+                # A completed assistant response resets the retry budget (TS
+                # resets it on the first non-error assistant message); an aborted
+                # response ends a retry cycle unsuccessfully.
+                last_assistant = next(
+                    (m for m in reversed(new_messages) if getattr(m, "role", None) == "assistant"),
+                    None,
+                )
+                if attempt > 0:
+                    if last_assistant is not None and last_assistant.stop_reason == "aborted":
+                        await self._emit(
+                            AutoRetryEndEvent(success=False, attempt=attempt, final_error="Retry cancelled")
+                        )
+                        attempt = 0
+                    elif any(
+                        getattr(m, "role", None) == "assistant" and m.stop_reason not in ("error", "aborted")
+                        for m in new_messages
+                    ):
+                        await self._emit(AutoRetryEndEvent(success=True, attempt=attempt))
+                        attempt = 0
+
+                failed = next(
+                    (
+                        m
+                        for m in reversed(new_messages)
+                        if getattr(m, "role", None) == "assistant" and m.stop_reason == "error"
+                    ),
+                    None,
+                )
+                if failed is None:
+                    break
+                # Context overflow is handled by compaction, not retry.
+                if not self._should_retry(failed, attempt):
+                    if attempt > 0:
+                        await self._emit(
+                            AutoRetryEndEvent(success=False, attempt=attempt, final_error=failed.error_message)
+                        )
+                    break
+
+                attempt += 1
+                delay = retry_delay_ms(self.retry, attempt)
+                await self._emit(
+                    AutoRetryStartEvent(
+                        attempt=attempt,
+                        max_attempts=self.retry.max_retries,
+                        delay_ms=delay,
+                        error_message=failed.error_message or "Unknown error",
+                    )
+                )
+                # The superseded attempt stays in the raw transcript (and in
+                # session history) but is omitted from model projections, so
+                # resume and live runs agree on both the history and the request.
+                failed.retried = True
+                try:
+                    await sleep_ms(delay, self._abort)
+                except RetrySleepAbortError:
+                    await self._emit(
+                        AutoRetryEndEvent(success=False, attempt=attempt, final_error="Retry cancelled")
+                    )
+                    break
         finally:
             self.is_streaming = False
             self._abort = None
             self.messages = _sync_messages(self, completed_messages)
-        return new_messages
+        return all_new
+
+    def _should_retry(self, message: Any, attempt: int) -> bool:
+        """Whether a failed assistant message is retried at this attempt count.
+
+        Shared by the loop and the pre-persist marking callback so the session
+        log and the projection agree on which attempts were superseded.
+        """
+        return (
+            self.retry is not None
+            and self.retry.enabled
+            and attempt < self.retry.max_retries
+            and not is_context_overflow(message)
+            and is_retryable_assistant_error(message)
+        )
 
     def _build_config(self) -> AgentLoopConfig:
         async def prepare_request(context, signal):
@@ -229,6 +321,7 @@ class Agent:
         """Run a prompt while yielding every event (subscribe-free helper)."""
 
         queue: Deque[AgentEvent] = deque()
+
         async def listener(event: AgentEvent) -> None:
             queue.append(event)
 
@@ -240,6 +333,8 @@ class Agent:
                 if queue:
                     yield queue.popleft()
                     continue
+                # Only a finished prompt ends the stream: an auto-retry emits its
+                # own agent_end for the superseded attempt before continuing.
                 if task.done():
                     break
                 await asyncio.sleep(0.01)

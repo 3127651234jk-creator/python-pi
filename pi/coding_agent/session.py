@@ -75,6 +75,7 @@ def _from_dict(data: dict) -> Any:
             error_message=data.get("error_message"),
             raw_stop_reason=data.get("raw_stop_reason"),
             thinking_level=data.get("thinking_level"),
+            retried=bool(data.get("retried", False)),
         )
     if role == "toolResult":
         content = []

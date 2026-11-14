@@ -386,6 +386,8 @@ async def stream_assistant_response(
         if isinstance(event, (DoneEvent, StreamErrorEvent)):
             final = event.message if isinstance(event, DoneEvent) else event.error
             final = _finalize_message(final, config)
+            if config.should_omit_error is not None and config.should_omit_error(final):
+                final.retried = True
             if added_partial:
                 context.messages[-1] = final
             else:
@@ -998,14 +1000,20 @@ def _filter_message_images(message: Any) -> Any:
 
 
 def default_convert_to_llm(messages: List[Any], block_images: bool = False) -> List[Any]:
-    """Pass through the four LLM roles, filtering UI-only custom messages.
+    """Pass through the four LLM roles, filtering UI-only custom messages and
+    failed attempts superseded by an auto-retry.
 
     With ``block_images`` set, image blocks in user and toolResult messages are
     swapped for a text placeholder (defense-in-depth for the block_images
     setting). The filter runs at the stream boundary so setting changes take
     effect on the next request without touching stored history.
     """
-    converted = [m for m in messages if getattr(m, "role", None) in ("system", "user", "assistant", "toolResult")]
+    converted = [
+        m
+        for m in messages
+        if getattr(m, "role", None) in ("system", "user", "assistant", "toolResult")
+        and not getattr(m, "retried", False)
+    ]
     if not block_images:
         return converted
     return [

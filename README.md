@@ -17,6 +17,7 @@ pi（TypeScript monorepo）的 Python 移植版。目标是 1:1 复刻整个 mon
 | `pi.ai.types` | `packages/ai/src/types.ts` | 四角色消息模型（system/user/assistant/toolResult）、内容块、Usage、事件协议 |
 | `pi.ai.providers` | `packages/ai/src/api/*`、`providers/*` | `anthropic-messages`、`openai-completions`、`openai-responses`、`google-generative-ai`、`google-vertex`、`azure-openai`、`azure-openai-responses`、`bedrock-converse-stream`、`pi-messages`（Radius 网关）的流式适配 + `faux` 脚本化测试 provider |
 | `pi.ai.utils` | `packages/ai/src/utils` | `normalize_context`（系统消息重放折叠）、`get_tool_state_changes`（工具集增量声明）、JSON Schema 参数校验 |
+| `pi.ai.retry` | `packages/ai/src/utils/retry.ts` | `is_retryable_assistant_error` 瞬时错误分类（含 #10379 的 HTTP/2 `pending stream has been canceled`）+ `retry_assistant_call` 有界重试循环（指数退避、abort 归一化、回调） |
 | `pi.agent.agent_loop` | `packages/agent/src/agent-loop.ts` | 主循环：steering/follow-up 队列、顺序/并行工具执行、`beforeToolCall`/`afterToolCall` 钩子、截断消息失败、错误/中止处理 |
 | `pi.agent.agent` | `packages/agent/src/agent.ts` | 有状态 Agent：transcript、队列、事件订阅、prompt/abort |
 | `pi.coding_agent.tools` | `coding-agent/src/core/tools/*` | `read`（截断/offset/limit/图片）、`write`（父目录自动创建）、`edit`（唯一匹配 + 重叠校验 + CRLF/BOM 保留 + 模糊匹配）、`bash`（流式输出、尾截断、超时、进程树终止） |
@@ -430,7 +431,7 @@ Review the changes. Focus on ${1:-correctness and tests}.
 
 | 文件 | 内容 |
 | --- | --- |
-| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention、default_project_trust、enable_install_telemetry、sync_catalog、codemode |
+| `settings.json` | 默认 provider、model、thinking、session_dir、compaction、cache_retention、default_project_trust、enable_install_telemetry、sync_catalog、codemode、retry |
 | `models.json` | 自定义 provider、模型元数据与覆盖 |
 | `auth.json` | API key、OAuth access/refresh token 和过期时间 |
 | `trust.json` | 项目信任决策（`{规范化路径: true/false}`，沿父目录就近生效） |
@@ -451,11 +452,19 @@ Review the changes. Focus on ${1:-correctness and tests}.
     "reserve_tokens": 16384,
     "keep_recent_tokens": 20000,
     "summary_tokens": 2048
+  },
+  "retry": {
+    "enabled": true,
+    "max_retries": 3,
+    "base_delay_ms": 2000,
+    "max_agent_delay_ms": 60000
   }
 }
 ```
 
 Prompt caching 默认开启（`cache_retention: "5m"`，设为 `"1h"` 或 `false` 可调整/关闭，仅影响支持显式缓存标记的 API）：`anthropic-messages` 在 system 提示、最后一个工具与最后一条消息上写 `cache_control` 断点（1h 需追加 `extended-cache-ttl-2025-04-11` beta 头）；Bedrock 在 system 与最后一条用户消息后插入 `cachePoint`（仅 Claude 模型，其他型号自动跳过）。OpenAI 系为自动缓存，无请求侧标记；`prompt_cache_key` 等参数可经 `models.json` 的 `params` 传入（Responses 适配器同样生效）。用量统计区分 `cache_read`、`cache_write` 与 `cache_write_1h`（1h 写入按目录价或 2 倍基础输入价计）。
+
+自动重试默认开启（`retry.enabled`），对瞬时 provider/传输错误（overloaded、rate limit、连接中断、HTTP/2 停滞等；配额/订阅类错误不重试，context overflow 由 compaction 处理）按 `base_delay_ms * 2^(attempt-1)` 指数退避重试，单次延迟上限 `max_agent_delay_ms`。CLI/RPC 的 agent 运行在可重试错误后自动继续并发出 `auto_retry_start` / `auto_retry_end` 事件；被重试替换的失败轮次保留在原始 transcript 和 session 中（`AssistantMessage.retried`），但不进入模型请求，resume 后投影一致。compaction 摘要调用共用同一重试预算；durable harness 的 `pi.generation` 与 `pi.compact` 在 checkpoint 中记录 attempt 并以 `retry` phase 退避（`Harness(session, model, retry=RetryPolicy(...))` 传入，默认不重试；`pi durable --retry N` 可为 CLI 打开）。库调用通过 `Agent(..., retry=RetryPolicy(...))` 配置，默认 `None` 不重试。
 
 保存和移除凭据：
 

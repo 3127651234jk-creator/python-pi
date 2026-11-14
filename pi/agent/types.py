@@ -167,6 +167,10 @@ class AgentLoopConfig:
     cache_retention: Optional[str] = "5m"
     # Session-scoped nested-call runner; the loop creates one per run when unset.
     nested_tool_call_runner: Any = None
+    # Returns True for a failed assistant message that an auto-retry will
+    # supersede; such attempts are flagged before message_end so subscribers
+    # persist them as retried (raw history, omitted from model projections).
+    should_omit_error: Optional[Callable[[Any], bool]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,27 @@ class ToolExecutionEndEvent:
     parent_tool_call_id: Optional[str] = None
 
 
+@dataclass
+class AutoRetryStartEvent:
+    """Auto-retry of a failed assistant turn is about to back off (1-indexed attempt)."""
+
+    type: str = field(default="auto_retry_start", init=False)
+    attempt: int = 0
+    max_attempts: int = 0
+    delay_ms: int = 0
+    error_message: str = ""
+
+
+@dataclass
+class AutoRetryEndEvent:
+    """The auto-retry cycle ended: success, or exhausted/cancelled with the reason."""
+
+    type: str = field(default="auto_retry_end", init=False)
+    success: bool = False
+    attempt: int = 0
+    final_error: Optional[str] = None
+
+
 AgentEvent = Union[
     AgentStartEvent,
     AgentEndEvent,
@@ -256,4 +281,6 @@ AgentEvent = Union[
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
     ToolExecutionEndEvent,
+    AutoRetryStartEvent,
+    AutoRetryEndEvent,
 ]

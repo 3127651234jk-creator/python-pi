@@ -13,8 +13,9 @@ import time
 from typing import Dict, List, Optional
 
 from ..ai.json_io import message_from_json, to_json as ai_to_json
+from ..ai.retry import is_retryable_assistant_error, retry_delay_ms
 from ..ai.types import ImageContent, SystemMessage, TextContent, ToolResultMessage, Usage, UserMessage
-from ..agent.compaction import estimate_tokens
+from ..agent.compaction import estimate_tokens, is_context_overflow
 from .entries import COMPACTION_ENTRY, TOOL_RESULT_ENTRY
 from .harness import Harness, TaskRuntime, _stream_once
 from .types import TaskDefinition, TaskOutcome, TaskState, define_task
@@ -95,7 +96,8 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
     """The ``pi.compaction`` task: summarize older entries, shrink the context.
 
     Input: ``{"conversation_id": int}``. Phases: prepare (token accounting and
-    cut-point selection), summarize (model call), settle (compaction entry
+    cut-point selection), summarize (model call), retry (transient-error
+    backoff, when a retry policy is configured), settle (compaction entry
     with a head marker that moves the active transcript start).
     """
 
@@ -137,7 +139,8 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
                 outcome=TaskOutcome(status="completed", result={"compacted": False, "tokens": total})))
             return
         await runtime.commit(lambda tx, current: TaskState(status="running",
-            checkpoint={"phase": "summarize", "cut": cut, "head_entry_id": head_entry, "tokens": total}))
+            checkpoint={"phase": "summarize", "cut": cut, "head_entry_id": head_entry,
+                        "tokens": total, "attempt": 1}))
 
     async def summarize(task, runtime: TaskRuntime, harness: Harness) -> None:
         entries = await harness.transcript(task.conversation_id)
@@ -153,6 +156,21 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
         request = [SystemMessage(content=SUMMARIZATION_PROMPT, timestamp=0),
                    _as_user("Conversation data:\n" + digest)]
         response = await _stream_once(harness.model, request, harness)
+        # Transient stream drops retry with backoff before the compaction fails.
+        if response.stop_reason == "error" and not is_context_overflow(response):
+            policy = harness.retry
+            attempt = int(task.state.checkpoint.get("attempt") or 1)
+            if (
+                policy is not None
+                and policy.enabled
+                and is_retryable_assistant_error(response)
+                and attempt <= policy.max_retries
+            ):
+                until = int(time.time() * 1000) + retry_delay_ms(policy, attempt)
+                checkpoint = dict(task.state.checkpoint)
+                checkpoint.update({"phase": "retry", "attempt": attempt, "until": until})
+                await runtime.commit(lambda tx, current: TaskState(status="running", checkpoint=checkpoint))
+                return
         summary = "\n".join(b.text for b in response.content if isinstance(b, TextContent)).strip()
         if not summary:
             raise RuntimeError("Compaction summarization returned an empty summary")
@@ -160,6 +178,13 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
             checkpoint={"phase": "settle", "summary": summary,
                         "head_entry_id": task.state.checkpoint["head_entry_id"],
                         "tokens": task.state.checkpoint["tokens"]}))
+
+    async def retry(task, runtime: TaskRuntime, harness: Harness) -> None:
+        await runtime.sleep(int(task.state.checkpoint["until"]))
+        checkpoint = dict(task.state.checkpoint)
+        checkpoint["phase"] = "summarize"
+        checkpoint["attempt"] = int(checkpoint["attempt"]) + 1
+        await runtime.commit(lambda tx, current: TaskState(status="running", checkpoint=checkpoint))
 
     async def settle(task, runtime: TaskRuntime, harness: Harness) -> None:
         async def tx_change(tx, current):
@@ -181,7 +206,8 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
 
     return define_task(name="pi.compact", version=1,
                        initial=lambda input: {"phase": "prepare"},
-                       phases={"prepare": prepare, "summarize": summarize, "settle": settle}, abort=abort)
+                       phases={"prepare": prepare, "summarize": summarize, "retry": retry, "settle": settle},
+                       abort=abort)
 
 
 def _as_user(text: str) -> UserMessage:
