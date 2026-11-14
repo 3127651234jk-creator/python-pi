@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from .. import types
 from ..json_io import to_json, message_from_json
+from ..utils import repair_tool_results
 from .base import SimpleStreamOptions, run_provider_stream
 
 
@@ -95,7 +96,7 @@ def build_request(model, context, options):
               "reasoning": options.reasoning,
               "cacheRetention": resolve_cache_retention(options.cache_retention),
               "sessionId": options.session_id, "toolChoice": options.tool_choice}
-    return {"model": model.id, "context": {"messages": [wire_message(m) for m in context.messages]},
+    return {"model": model.id, "context": {"messages": [wire_message(m) for m in repair_tool_results(context.messages)]},
             "options": {key: value for key, value in values.items() if value is not None}}
 
 

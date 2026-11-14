@@ -7,6 +7,7 @@ and ``validateToolArguments`` from ``packages/ai/src``.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import time
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +17,9 @@ from .types import (
     Message,
     SystemMessage,
     Tool,
+    ToolCall,
+    ToolResultMessage,
+    TextContent,
     ToolReference,
     TranscriptContext,
     UserMessage,
@@ -41,6 +45,44 @@ NO_CHANGES = ToolStateChanges(tools_added=[], tools_removed=[])
 def normalize_tool_call_id(call_id: str) -> str:
     """Use the call portion of compound IDs and satisfy Claude's ID limits."""
     return re.sub(r"[^a-zA-Z0-9_-]", "_", call_id.split("|", 1)[0])[:64] or "call"
+
+
+def repair_tool_results(messages: List[Message]) -> List[Message]:
+    """Close interrupted tool batches in request context without changing history."""
+    result: List[Message] = []
+    pending: List[ToolCall] = []
+    answered: set = set()
+    held_system: List[Message] = []
+
+    def close_pending() -> None:
+        for call in pending:
+            if call.id not in answered:
+                result.append(ToolResultMessage(
+                    tool_call_id=call.id, tool_name=call.name,
+                    content=[TextContent(text="No result provided")], is_error=True,
+                    timestamp=int(time.time() * 1000),
+                ))
+        pending.clear()
+        answered.clear()
+        result.extend(held_system)
+        held_system.clear()
+
+    for message in messages:
+        if isinstance(message, (AssistantMessage, UserMessage)):
+            close_pending()
+            if isinstance(message, AssistantMessage):
+                pending.extend(block for block in message.content
+                               if isinstance(block, ToolCall) and block.raw_item is None)
+            result.append(message)
+        elif isinstance(message, ToolResultMessage):
+            answered.add(message.tool_call_id)
+            result.append(message)
+        elif isinstance(message, SystemMessage) and pending:
+            held_system.append(message)
+        else:
+            result.append(message)
+    close_pending()
+    return result
 
 
 def normalize_context(context: TranscriptContext) -> Tuple[Optional[SystemMessage], List[Message]]:
@@ -90,7 +132,7 @@ def normalize_context(context: TranscriptContext) -> Tuple[Optional[SystemMessag
             sections=dict(sections) or None,
             tools_added=tools or None,
         )
-    return system, rest
+    return system, repair_tool_results(rest)
 
 
 def get_current_tools(messages: List[Message]) -> List[Tool]:

@@ -108,7 +108,8 @@ def test_sse_native_mapping(monkeypatch, module, api, payload):
         restored = message_from_json(to_json(done.message))
         assert restored.content[-1].thought_signature == "signed"
         body = google.build_request(model, TranscriptContext([*context().messages, restored]), SimpleStreamOptions())
-        assert body["contents"][-1]["parts"][-1]["thoughtSignature"] == "signed"
+        assert body["contents"][-2]["parts"][-1]["thoughtSignature"] == "signed"
+        assert body["contents"][-1]["parts"][0]["functionResponse"]["response"] == {"error": "No result provided"}
     else:
         assert len([event for event in events if event.type == "toolcall_delta"]) == 1
         assert captured["body"]["tools"][0]["name"] == "echo"
