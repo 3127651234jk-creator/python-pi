@@ -42,6 +42,8 @@ class Session:
         self._commit_listeners: List[Callable[[CommitPublication], None]] = []
         self._close_listeners: List[Callable[[], None]] = []
         self._line_lock = asyncio.Lock()
+        # Scheduler ownership spans task execution, beyond individual commits.
+        self._scheduler_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
         self._close_task: Optional[asyncio.Task] = None

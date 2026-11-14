@@ -27,6 +27,44 @@ def make_model() -> Model:
     return Model(id="faux", name="Faux", api="faux", provider="faux", base_url="")
 
 
+def test_overlapping_schedulers_do_not_repeat_generation(tmp_path, monkeypatch):
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        first = Harness(session, make_model())
+        second = Harness(session, make_model())
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def stream_once(model, messages, harness):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return AssistantMessage(content=[TextContent(text="answer")], api="faux",
+                provider="faux", model="faux", usage=Usage(), stop_reason="stop", timestamp=0)
+
+        monkeypatch.setattr("pi.durable.harness._stream_once", stream_once)
+        cid = await first.create_conversation()
+        await first.submit_input(cid, "hello")
+        running = asyncio.create_task(first.run_pending_tasks())
+        await asyncio.wait_for(entered.wait(), 2)
+        overlapping = asyncio.create_task(second.run_pending_tasks())
+        try:
+            await asyncio.sleep(0.05)
+            assert calls == 1
+            assert not overlapping.done()
+        finally:
+            release.set()
+            counts = await asyncio.gather(running, overlapping)
+        assert counts == [1, 0]
+        assert calls == 1
+        assert [entry.kind for entry in await first.transcript(cid)] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        await session.close()
+
+    asyncio.run(scenario())
+
+
 def test_durable_conversation_end_to_end(tmp_path):
     """Submit input, run the scheduler, and observe the committed turn."""
 

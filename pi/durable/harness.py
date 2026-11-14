@@ -288,8 +288,17 @@ class Harness:
         With ``concurrency > 1`` up to that many pending tasks run at once.
         The batch takes at most one task per conversation, so tasks that share
         a conversation serialize while other conversations still run in
-        parallel.
+        parallel. Overlapping scheduler calls on the same Session serialize,
+        including calls from different Harness instances.
         """
+
+        # Recovery is safe only after the previous scheduler has finished or
+        # cancelled all its phase handlers. Share ownership across harnesses
+        # over this session, not just concurrent calls on this harness.
+        async with self.session._scheduler_lock:
+            return await self._drain_pending_tasks(concurrency)
+
+    async def _drain_pending_tasks(self, concurrency: int) -> int:
 
         executed = 0
         await self._recover_running_tasks()
@@ -338,7 +347,10 @@ class Harness:
         return batch[0] if batch else None
 
     async def _recover_running_tasks(self) -> None:
-        """Reset stale running tasks to pending (crash recovery on reopen)."""
+        """Recover abandoned running tasks under exclusive scheduler ownership.
+
+        This covers reopening and retrying after scheduler cancellation.
+        """
 
         async def change(tx):
             from .types import write_task
