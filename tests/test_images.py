@@ -28,6 +28,7 @@ from pi.coding_agent.file_processor import process_file_arguments
 from pi.images import (
     ImageResizeOptions,
     ProcessImageOptions,
+    convert_image_bytes_to_png,
     detect_supported_image_mime_type,
     format_dimension_note,
     process_image,
@@ -185,6 +186,49 @@ def test_resize_image_passthrough_within_limits():
     assert not result.was_resized
     assert result.data == TINY_PNG_BASE64
     assert format_dimension_note(result) is None
+
+
+def test_cmyk_tiff_converts_to_rgb_png():
+    buffer = io.BytesIO()
+    Image.new("CMYK", (32, 16), (0, 255, 255, 0)).save(buffer, format="TIFF")
+    converted = convert_image_bytes_to_png(buffer.getvalue())
+    assert converted is not None
+    with Image.open(io.BytesIO(converted)) as image:
+        assert image.format == "PNG"
+        assert image.mode == "RGB"
+        assert image.size == (32, 16)
+        assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_cmyk_jpeg_resizes_instead_of_being_omitted():
+    buffer = io.BytesIO()
+    Image.new("CMYK", (200, 100), (0, 255, 255, 0)).save(buffer, format="JPEG")
+    result = resize_image(buffer.getvalue(), "image/jpeg",
+                          ImageResizeOptions(max_width=40, max_height=40, max_bytes=1000))
+    assert result is not None
+    assert result.was_resized
+    assert (result.width, result.height) == (40, 20)
+    assert len(result.data) < 1000
+    with Image.open(io.BytesIO(base64.b64decode(result.data))) as image:
+        assert image.mode == "RGB"
+        assert image.size == (40, 20)
+
+
+def test_jpeg_candidate_survives_png_encoder_failure(monkeypatch):
+    source = large_png(100, 100)
+    save = Image.Image.save
+
+    def fail_png(self, fp, format=None, **params):
+        if format == "PNG":
+            raise OSError("PNG encoder unavailable")
+        return save(self, fp, format=format, **params)
+
+    monkeypatch.setattr(Image.Image, "save", fail_png)
+    result = resize_image(source, "image/png", ImageResizeOptions(max_width=20, max_height=20))
+    assert result is not None
+    assert result.mime_type == "image/jpeg"
+    with Image.open(io.BytesIO(base64.b64decode(result.data))) as image:
+        assert image.size == (20, 20)
 
 
 # ---------------------------------------------------------------------------

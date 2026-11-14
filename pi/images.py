@@ -108,6 +108,13 @@ def _read_uint32_le(buffer: bytes, offset: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _png_source(image: Any) -> Any:
+    """Normalize modes that Pillow's PNG encoder cannot write."""
+    if image.mode in ("1", "L", "LA", "I", "I;16", "P", "RGB", "RGBA"):
+        return image
+    return image.convert("RGBA" if "A" in image.getbands() else "RGB")
+
+
 def convert_image_bytes_to_png(data: bytes) -> Optional[bytes]:
     """Decode any Pillow-supported image and re-encode as PNG; None on failure."""
     try:
@@ -119,7 +126,7 @@ def convert_image_bytes_to_png(data: bytes) -> Optional[bytes]:
             image.load()
             oriented = ImageOps.exif_transpose(image)
             out = io.BytesIO()
-            oriented.save(out, format="PNG")
+            _png_source(oriented).save(out, format="PNG")
             return out.getvalue()
     except Exception:  # noqa: BLE001 - failed conversion is a null result, like TS
         return None
@@ -238,8 +245,13 @@ def resize_image(input_bytes: bytes, mime_type: str, options: Optional[ImageResi
             candidates: List[_EncodedCandidate] = []
             resized = image.resize((current_width, current_height), resampling)
             png_buffer = io.BytesIO()
-            resized.save(png_buffer, format="PNG")
-            candidates.append(_EncodedCandidate(base64.b64encode(png_buffer.getvalue()).decode("ascii"), "image/png"))
+            try:
+                _png_source(resized).save(png_buffer, format="PNG")
+            except OSError:
+                # A failed PNG candidate must not prevent trying JPEG.
+                pass
+            else:
+                candidates.append(_EncodedCandidate(base64.b64encode(png_buffer.getvalue()).decode("ascii"), "image/png"))
             # JPEG encoding rejects alpha and palette modes.
             jpeg_source = resized if resized.mode in ("RGB", "L") else resized.convert("RGB")
             for quality in quality_steps:
