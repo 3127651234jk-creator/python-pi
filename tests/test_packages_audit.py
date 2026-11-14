@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from pi.coding_agent.config import Configuration
-from pi.coding_agent.packages import PackageManager, parse_source, safe_extract_tar
+from pi.coding_agent.packages import InstalledPackage, PackageManager, parse_source, safe_extract_tar
 
 
 def test_git_install_uses_hostname(tmp_path, monkeypatch):
@@ -75,3 +75,35 @@ def test_archive_extracts_regular_npm_files(tmp_path):
         archive.addfile(member, io.BytesIO(b"ok"))
     safe_extract_tar(buffer.getvalue(), tmp_path / "target")
     assert (tmp_path / "target" / "skills" / "example.md").read_bytes() == b"ok"
+
+
+def test_remove_rejects_recorded_path_outside_package_root(tmp_path):
+    agent_dir = tmp_path / "agent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    root = agent_dir / "extensions" / "plugin"
+    escaped = root / ".." / ".." / ".." / outside.name
+    manager = PackageManager(Configuration(str(tmp_path), str(agent_dir)))
+    manager._remove_files(InstalledPackage(
+        name="plugin", source="npm:plugin", version="1",
+        files={"extensions": [str(escaped)]},
+    ))
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_remove_corrupt_file_root_does_not_delete_kind_directory(tmp_path):
+    agent_dir = tmp_path / "agent"
+    root = agent_dir / "extensions" / "plugin"
+    root.parent.mkdir(parents=True)
+    root.write_text("corrupt", encoding="utf-8")
+    sibling = root.parent / "keep.txt"
+    sibling.write_text("keep", encoding="utf-8")
+    manager = PackageManager(Configuration(str(tmp_path), str(agent_dir)))
+    manager._remove_files(InstalledPackage(
+        name="plugin", source="npm:plugin", version="1",
+        files={"extensions": [str(root)]},
+    ))
+    assert not root.exists()
+    assert sibling.read_text(encoding="utf-8") == "keep"

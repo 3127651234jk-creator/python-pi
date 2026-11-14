@@ -399,26 +399,31 @@ class PackageManager:
             if kind not in KINDS:
                 continue
             if kind == "prompts":
-                base = self.config.agent_dir / "prompts"
+                base = (self.config.agent_dir / "prompts").resolve()
                 for path in paths:
-                    target = Path(path)
                     try:
+                        target = Path(path).resolve()
                         if target.parent == base and target.name.startswith(safe + "--") and target.exists():
                             target.unlink()
                     except (OSError, ValueError):
                         continue
                 continue
+            base = (self.config.agent_dir / kind).resolve()
+            root = (base / package.name).resolve()
+            if not root.is_relative_to(base):
+                continue
             for path in paths:
-                target = Path(path)
-                root = self.config.agent_dir / kind / package.name
                 try:
+                    target = Path(path).resolve()
                     if target.is_relative_to(root) and target.exists():
-                        shutil.rmtree(target.parent if target.is_file() else target, ignore_errors=True)
+                        if target.is_dir():
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            target.unlink()
                 except (OSError, ValueError):
                     continue
-            base = self.config.agent_dir / kind / package.name
-            if base.exists() and not any(base.iterdir()):
-                base.rmdir()
+            if root.is_dir() and not any(root.iterdir()):
+                root.rmdir()
 
     def _persist_setting(self, source: str) -> None:
         packages = self.config.settings.get("packages", [])

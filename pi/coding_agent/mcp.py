@@ -65,6 +65,8 @@ def is_mcp_tool_name(name: str) -> bool:
 
 def _windows_batch_command(command: str, args: List[str]) -> str:
     """Escape both cmd.exe parses when a batch shim forwards arguments with %*."""
+    if any("\r" in value or "\n" in value for value in [command, *args]):
+        raise ValueError("stdio command and args must not contain CR or LF")
     meta = re.compile(r'([()\[\]%!^"`<>&|;, *?])')
     escaped = [meta.sub(r"^\1", command)]
     for arg in args:

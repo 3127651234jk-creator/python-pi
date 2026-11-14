@@ -322,12 +322,28 @@ class Server:
                         pending[message["id"]] = (task, cancelled, target)
         except (ConnectionError, OSError, ValueError, asyncio.TimeoutError):
             pass
+        except Exception:
+            if not ready:
+                try:
+                    await send({"type": "hello_error", "error": {
+                        "code": "internal_error", "message": "Internal server error"}})
+                except (ConnectionError, OSError):
+                    pass
         finally:
             writer.close()
             for pump in encoders.values():
                 pump.stop()
             if pending:
-                await asyncio.gather(*(entry[0] for entry in list(pending.values())), return_exceptions=True)
+                active = list(pending.values())
+                for _, cancelled, _ in active:
+                    cancelled.set()
+                # Let cooperative handlers observe cancellation before forcing
+                # tasks that ignore the signal to stop with the connection.
+                await asyncio.sleep(0)
+                for task, _, _ in active:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*(entry[0] for entry in active), return_exceptions=True)
             presentation.retired.extend([item for item in (endpoint, presentation.endpoint) if item is not None])
             presentation.endpoint = None
             await presentation.release_retired()

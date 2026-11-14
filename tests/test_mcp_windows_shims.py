@@ -6,7 +6,17 @@ import sys
 
 import pytest
 
-from pi.coding_agent.mcp import McpClient
+from pi.coding_agent.mcp import McpClient, _windows_batch_command
+
+
+@pytest.mark.parametrize(("command", "args"), [
+    ("server.cmd\nwhoami", []),
+    ("server.cmd", ["line1\nline2"]),
+    ("server.cmd", ["line1\rline2"]),
+])
+def test_batch_command_rejects_command_boundaries(command, args):
+    with pytest.raises(ValueError, match="CR or LF"):
+        _windows_batch_command(command, args)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows command shims")

@@ -138,6 +138,68 @@ def test_identity_mismatch():
     asyncio.run(check())
 
 
+def test_disconnect_cancels_in_flight_request():
+    async def check():
+        started = asyncio.Event()
+        observed = asyncio.Event()
+
+        class WaitingEndpoint:
+            async def invoke_service(self, call, publish, cancelled):
+                started.set()
+                await cancelled.wait()
+                observed.set()
+
+            async def release(self):
+                pass
+
+        class WaitingHost:
+            async def attach_client(self, presentation=None):
+                return WaitingEndpoint()
+
+        server = Server(WaitingHost())
+        address = await server.start_tcp()
+        client = await Client(server.server_id).connect_tcp(*address[:2])
+        target = {"serverId": server.server_id}
+        request = asyncio.create_task(client.request(
+            target, {"serviceId": "test", "member": "wait", "args": []}))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            await client.close()
+            await asyncio.wait_for(observed.wait(), 2)
+            with pytest.raises(ConnectionError):
+                await request
+            await until(lambda: not server.connections)
+        finally:
+            if not request.done():
+                request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            await client.close()
+            await server.close()
+
+    asyncio.run(asyncio.wait_for(check(), 10))
+
+
+def test_host_attach_error_returns_handshake_error():
+    async def check():
+        class FailingHost:
+            async def attach_client(self, presentation=None):
+                raise RuntimeError("attach failed")
+
+        server = Server(FailingHost())
+        address = await server.start_tcp()
+        client = Client(server.server_id)
+        try:
+            with pytest.raises(ServerError) as error:
+                await client.connect_tcp(*address[:2])
+            assert error.value.code == "internal_error"
+            await until(lambda: not server.connections)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(asyncio.wait_for(check(), 10))
+
+
 async def until(predicate, timeout=2.0):
     async def wait():
         while not predicate():
