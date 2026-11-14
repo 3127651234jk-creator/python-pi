@@ -316,7 +316,7 @@ def write_ts_file(path: str, session) -> str:
             lines.append(json.dumps({**common, "type": "custom_message", "customType": entry.custom["kind"],
                                      "display": entry.custom["data"].get("display", True),
                                      "timestamp": entry.message.timestamp,
-                                     "content": entry.message.content}, ensure_ascii=False))
+                                     "content": our_message_to_ts(entry.message)["content"]}, ensure_ascii=False))
         elif entry.custom is not None:
             mapped = custom_to_ts_entry(entry.custom["kind"], entry.custom["data"])
             if mapped is not None:

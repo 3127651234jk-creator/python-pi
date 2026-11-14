@@ -12,6 +12,7 @@ import pytest
 
 from pi.ai.types import (
     AssistantMessage,
+    ImageContent,
     TextContent,
     ToolCall,
     ToolResultMessage,
@@ -161,6 +162,25 @@ def test_compaction_usage_roundtrip(tmp_path):
     assert data["usage"]["input"] == 7 and data["usage"]["output"] == 2
     assert data["usage"]["cost"]["total"] == 0.03
     assert [u.input for u in loaded.compaction_usages()] == [7]
+
+
+@pytest.mark.parametrize("content", ["plain 中文", [TextContent(text="block 中文")],
+    [TextContent(text="look"), ImageContent(data="aGVsbG8=", mime_type="image/png")]])
+def test_custom_message_export_after_native_reload(tmp_path, content):
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    path = manager.start_new()
+    manager.append_custom_message("note", content, display=False)
+    loaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    loaded.load(path)
+    exported = loaded.export_ts(str(tmp_path / "custom.jsonl"))
+    records = [json.loads(line) for line in (tmp_path / "custom.jsonl").read_text(encoding="utf-8").splitlines()]
+    custom = next(record for record in records if record["type"] == "custom_message")
+    assert custom["customType"] == "note"
+    assert custom["display"] is False
+    if isinstance(content, list) and len(content) > 1:
+        assert custom["content"][1]["mimeType"] == "image/png"
+    restored = read_ts_file(exported)["records"][0]
+    assert restored["message"].content == content
 
 
 def test_export_refuses_non_jsonl_and_overwrite(tmp_path):
