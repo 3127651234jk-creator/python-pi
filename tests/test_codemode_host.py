@@ -3,7 +3,7 @@
 Covers the source/identifier helpers, a real ``python -I`` round trip with
 out-of-order replies and record backfill, snapshot publish timing, pending
 cancellation on normal completion, timeout, abort, worker crash, a synthetic
-bridge failure, and store/write plumbing.
+bridge failure, malformed worker payloads, and store/write plumbing.
 """
 
 from __future__ import annotations
@@ -427,5 +427,138 @@ def test_bridge_failure_after_calls_still_reaps_pending(monkeypatch):
         assert outcome.error["name"] == "SandboxError"
         assert outcome.calls[0]["status"] == "cancelled"
         assert fake.killed
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Malformed worker payloads (mirrors packages/codemode test/sandbox.test.ts #10444)
+# ---------------------------------------------------------------------------
+
+
+def json_line(payload):
+    return (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+
+
+MALFORMED_PAYLOADS = [
+    ({"type": "done", "value": 1, "writes": 5}, "store writes are not an object"),
+    ({"type": "done", "value": 1, "writes": {"set": [], "delete": []}}, 'store writes "set" is not an object'),
+    ({"type": "done", "value": 1, "writes": {"set": {}, "delete": "k"}}, 'store writes "delete" is not a list of keys'),
+    ({"type": "done", "value": 1, "writes": {"set": {}, "delete": [5]}}, 'store writes "delete" is not a list of keys'),
+    ({"type": "done", "value": 1, "writes": {"set": {"k": 1}}}, 'store writes "delete" is not a list of keys'),
+    ({"type": "script_error", "error": 5}, "script error is not an object"),
+    ({"type": "script_error", "error": {}}, "script error is malformed"),
+    ({"type": "script_error", "error": {"name": "E"}}, "script error is malformed"),
+    ({"type": "script_error", "error": {"message": "x", "name": 5}}, "script error is malformed"),
+    ({"type": "script_error", "error": {"message": "x", "stack": 5}}, "script error is malformed"),
+    ({"type": "nonsense"}, "unknown message from the worker"),
+    ({"no_type": 1}, "unknown message from the worker"),
+    ([1, 2], "unknown message from the worker"),
+    ({"type": "output"}, "output message has no item object"),
+    ({"type": "output", "item": "text"}, "output message has no item object"),
+    ({"type": "call", "id": "1", "tool": "slow", "args": {}}, "call message has no integer id"),
+    ({"type": "call", "id": True, "tool": "slow", "args": {}}, "call message has no integer id"),
+    ({"type": "call", "id": 1, "args": {}}, "call message has no tool name"),
+    ({"type": "call", "id": 1, "tool": 5, "args": {}}, "call message has no tool name"),
+    ({"type": "call", "id": 1, "tool": "slow", "args": 5}, "tool arguments are not an object"),
+]
+
+
+@pytest.mark.parametrize("payload,reason", MALFORMED_PAYLOADS)
+def test_malformed_worker_payload_fails_as_sandbox_error(monkeypatch, payload, reason):
+    async def scenario():
+        fake = FakeProcess()
+        fake.stdout = FakeStream([json_line(payload)])
+
+        async def fake_exec(*args, **kwargs):
+            return fake
+
+        calls = []
+
+        async def on_call(name, args, signal, record):
+            calls.append(name)
+            return None
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        outcome = await run_host("result = 1\n", on_call=on_call)
+
+        assert outcome.status == host.STATUS_SCRIPT_ERROR
+        assert outcome.error["name"] == "SandboxError"
+        assert outcome.error["message"].startswith("Sandbox bridge broken: ")
+        assert reason in outcome.error["message"]
+        assert outcome.value is None
+        assert calls == []  # the failure happened before any call
+        assert fake.killed
+        assert fake.returncode is not None
+
+    asyncio.run(scenario())
+
+
+def test_unparsable_worker_line_fails_as_sandbox_error(monkeypatch):
+    async def scenario():
+        fake = FakeProcess()
+        fake.stdout = FakeStream([b"not json\n"])
+
+        async def fake_exec(*args, **kwargs):
+            return fake
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        outcome = await run_host("result = 1\n")
+
+        assert outcome.status == host.STATUS_SCRIPT_ERROR
+        assert "worker message is not valid JSON" in outcome.error["message"]
+        assert fake.killed
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_call_id_fails_as_sandbox_error(monkeypatch):
+    async def scenario():
+        call_line = json_line({"type": "call", "id": 1, "tool": "slow", "args": {}})
+        fake = FakeProcess()
+        fake.stdout = FakeStream([call_line, call_line])
+
+        async def fake_exec(*args, **kwargs):
+            return fake
+
+        async def on_call(name, args, signal, record):
+            await asyncio.Event().wait()  # stays pending until the host cancels it
+            return None
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        outcome = await run_host("tools.slow.start({})\n", on_call=on_call)
+
+        assert outcome.status == host.STATUS_SCRIPT_ERROR
+        assert "duplicate call id 1" in outcome.error["message"]
+        assert [record["status"] for record in outcome.calls] == ["cancelled"]
+        assert fake.killed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"type": "script_error", "error": {"name": "ValueError", "message": "boom"}},
+     {"status": host.STATUS_SCRIPT_ERROR, "error": {"name": "ValueError", "message": "boom"}}),
+    ({"type": "done", "value": {"a": 1}, "writes": {"set": {"k": [1, 2]}, "delete": ["d"]}},
+     {"status": host.STATUS_OK, "value": {"a": 1}, "writes": {"set": {"k": [1, 2]}, "delete": ["d"]}}),
+])
+def test_valid_payloads_still_work(monkeypatch, payload, expected):
+    async def scenario():
+        fake = FakeProcess()
+        fake.stdout = FakeStream([json_line(payload)])
+
+        async def fake_exec(*args, **kwargs):
+            return fake
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        outcome = await run_host("result = 1\n")
+
+        assert outcome.status == expected["status"]
+        if "error" in expected:
+            assert outcome.error == expected["error"]
+        if "value" in expected:
+            assert outcome.value == expected["value"]
+        if "writes" in expected:
+            assert outcome.writes == expected["writes"]
 
     asyncio.run(scenario())

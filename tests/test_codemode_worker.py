@@ -504,6 +504,109 @@ def test_worker_script_error_carries_traceback_and_keeps_output(tmp_path):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------------
+# Script-controlled values cannot break the worker bridge (v1.0.4 codemode)
+# ---------------------------------------------------------------------------
+
+
+BAD_STR_CLASS = (
+    "class BadStr:\n"
+    "    def __str__(self):\n"
+    "        raise RuntimeError('boom from __str__')\n"
+)
+
+
+@pytest.mark.parametrize("code,name,message_part", [
+    # A result the bridge cannot serialize fails the script instead of the worker.
+    (BAD_STR_CLASS + "result = {'x': BadStr()}\n", "RuntimeError", "boom from __str__"),
+    # Non-string dict keys never reach the default= conversion.
+    ("result = {object(): 1}\n", "TypeError", "keys must be str"),
+])
+def test_worker_unserializable_result_is_script_error(tmp_path, code, name, message_part):
+    async def scenario():
+        run = await run_script(tmp_path, code)
+        assert run.crashed is False
+        assert run.error is not None
+        assert run.error["name"] == name
+        assert message_part in run.error["message"]
+        assert run.writes is None  # nothing reported when the script fails
+
+    asyncio.run(scenario())
+
+
+def test_worker_store_snapshots_value_at_store_time(tmp_path):
+    async def scenario():
+        # v1.0.4: store() keeps a JSON snapshot, so mutating the object later
+        # (even into something unserializable) cannot change the quota, the
+        # done payload, or the value load() returns.
+        code = (
+            "value = {'k': 1}\n"
+            "store('a', value)\n" + BAD_STR_CLASS +
+            "value['k'] = BadStr()\n"
+            "result = {'loaded': load('a')}\n"
+        )
+        run = await run_script(tmp_path, code)
+        assert run.crashed is False
+        assert run.error is None
+        assert run.value == {"loaded": {"k": 1}}
+        assert run.writes == {"set": {"a": {"k": 1}}, "delete": []}
+
+    asyncio.run(scenario())
+
+
+def test_worker_load_returns_a_detached_copy(tmp_path):
+    async def scenario():
+        code = (
+            "store('a', {'x': 1})\n"
+            "value = load('a')\n"
+            "value['x'] = 2\n"
+            "result = load('a')\n"
+        )
+        run = await run_script(tmp_path, code)
+        assert run.error is None
+        assert run.value == {"x": 1}
+        assert run.writes == {"set": {"a": {"x": 1}}, "delete": []}
+
+    asyncio.run(scenario())
+
+
+def test_worker_store_quota_cannot_be_bypassed_by_later_mutation(tmp_path):
+    async def scenario():
+        code = (
+            "value = {'k': 1}\n"
+            "store('a', value)\n"
+            "value['k'] = 'x' * (1024 * 1024)\n"
+            "result = load('a')['k']\n"
+        )
+        run = await run_script(tmp_path, code)
+        assert run.error is None
+        assert run.value == 1  # load() sees the snapshot, not the mutation
+        assert len(json.dumps(run.writes["set"])) < 1024
+
+    asyncio.run(scenario())
+
+
+def test_worker_hostile_error_still_reports_string_fields(tmp_path):
+    async def scenario():
+        # Mirrors the TS fix: an error whose str() raises must reach the host
+        # as string fields, not kill the worker's error reporting.
+        code = (
+            "class BadError(Exception):\n"
+            "    def __str__(self):\n"
+            "        raise RuntimeError('nope')\n"
+            "raise BadError()\n"
+        )
+        run = await run_script(tmp_path, code)
+        assert run.crashed is False
+        assert run.error is not None
+        # The traceback head qualifies script-defined classes with the module.
+        assert run.error["name"].endswith("BadError")
+        assert isinstance(run.error["message"], str) and run.error["message"]
+        assert isinstance(run.error["stack"], str) and run.error["stack"].startswith("Traceback")
+
+    asyncio.run(scenario())
+
+
 def test_worker_exit_and_result_variable(tmp_path):
     async def scenario():
         code = "exit('bye')\ntext('unreached')\n"

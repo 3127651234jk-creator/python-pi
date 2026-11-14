@@ -7,6 +7,15 @@ time and started with ``python -I`` per script run, so it must run without the
 It carries its own copies of the output and store quotas; boundary tests keep
 the two sides from drifting. Never build this string with templates or inject
 host state into it.
+
+The TS prelude freezes every object reachable from the built-in globals before
+the script runs, because the script shares a JS realm with the serialization
+prelude. The Python worker needs no lockdown pass: built-in types cannot be
+patched, the script gets a fresh copy of the builtins mapping, and underscore
+attribute access is compiled out. What stays script-controlled are the values
+it hands back, so serializing those is hardened: error fields are coerced to
+text and a result the bridge cannot serialize fails the script instead of the
+worker process.
 """
 
 from __future__ import annotations
@@ -50,6 +59,13 @@ WORKER_SOURCE = textwrap.dedent('''
     def restricted_builtins():
         return {name: value for name, value in vars(builtins).items()
                 if name not in BLOCKED_BUILTINS}
+
+    def safe_text(value, fallback):
+        """str() on script-controlled values can raise; the bridge needs text."""
+        try:
+            return str(value)
+        except BaseException:
+            return fallback
 
     def compile_script(source, filename):
         tree = ast.parse(source, filename, "exec")
@@ -273,7 +289,11 @@ WORKER_SOURCE = textwrap.dedent('''
             js_names[js] = meta["name"]
             all_tools.append({"name": js, "description": meta.get("description", "")})
 
-        stored = dict(init.get("store", {}))
+        # Values are kept as JSON text, like the TS prelude: store() snapshots
+        # the value, so later mutations of the object cannot change what was
+        # validated, what the host receives, or what load() returns.
+        stored = {key: json.dumps(value, ensure_ascii=False)
+                  for key, value in init.get("store", {}).items()}
         writes_set = {}
         writes_delete = set()
         output_items = []
@@ -346,7 +366,7 @@ WORKER_SOURCE = textwrap.dedent('''
                 writes_delete.add(key)
                 writes_set.pop(key, None)
                 return
-            previous = len(key) + len(json.dumps(stored[key], ensure_ascii=False)) if key in stored else 0
+            previous = len(key) + len(stored[key]) if key in stored else 0
             try:
                 encoded = json.dumps(value, ensure_ascii=False)
             except (TypeError, ValueError) as exc:
@@ -356,21 +376,22 @@ WORKER_SOURCE = textwrap.dedent('''
                     f"store({key!r}) value has {len(encoded)} characters of JSON, more than the "
                     f"limit of {MAX_STORE_VALUE_CHARS}. store() is for small state such as IDs or "
                     "summaries; keep large data in variables or write it to a file with a tool.")
-            total = sum(len(k) + len(json.dumps(v, ensure_ascii=False)) for k, v in stored.items())
+            total = sum(len(k) + len(text) for k, text in stored.items())
             total = total - previous + len(key) + len(encoded)
             if total > MAX_STORE_TOTAL_CHARS:
                 raise ValueError(
                     f"store is full: stored values would exceed {MAX_STORE_TOTAL_CHARS} characters "
                     "of JSON. Delete keys with store(key). store() is for small state such as IDs "
                     "or summaries.")
-            stored[key] = value
+            stored[key] = encoded
             writes_delete.discard(key)
-            writes_set[key] = value
+            writes_set[key] = encoded
 
         def load(key):
             if not isinstance(key, str):
                 raise TypeError("load() key must be a string")
-            return stored.get(key)
+            text = stored.get(key)
+            return None if text is None else json.loads(text)
 
         def wait(handle):
             return handle.result()
@@ -478,14 +499,35 @@ WORKER_SOURCE = textwrap.dedent('''
             value = stop.value
         except SystemExit:
             raise
-        except BaseException:
-            stack = traceback.format_exc(limit=12)
-            head = stack.splitlines()[-1] if stack else "script failed"
-            bridge._send({"type": "script_error", "error": {"name": head.split(":")[0].strip() or "Error",
-                                                            "message": head.strip(), "stack": stack}})
+        except BaseException as stop:
+            # The script controls its errors: rendering one can itself raise
+            # (a __str__ that throws), so every field is coerced to text and a
+            # value whose coercion raises gets a placeholder. The host
+            # requires string fields here.
+            try:
+                stack = traceback.format_exc(limit=12)
+            except BaseException:
+                stack = ""
+            head = stack.splitlines()[-1] if stack else ""
+            name = head.split(":")[0].strip() or "Error"
+            message = safe_text(head.strip() or stop, "The script threw a value that cannot be described")
+            bridge._send({"type": "script_error",
+                          "error": {"name": name, "message": message, "stack": stack or None}})
             return 1
-        bridge._send({"type": "done", "value": value,
-                      "writes": {"set": writes_set, "delete": sorted(writes_delete)}})
+        # A result the bridge cannot serialize must fail the script, not kill
+        # the worker: the host would only see an unexplained process exit with
+        # no reason. The write set is JSON text snapshotted by store(), so it
+        # always decodes; only the result can fail here.
+        try:
+            bridge._send({"type": "done", "value": value,
+                          "writes": {"set": {key: json.loads(text) for key, text in writes_set.items()},
+                                     "delete": sorted(writes_delete)}})
+        except BaseException as stop:
+            bridge._send({"type": "script_error",
+                          "error": {"name": type(stop).__name__,
+                                    "message": safe_text(stop, "the script result cannot be serialized to JSON"),
+                                    "stack": None}})
+            return 1
         return 0
 
     sys.exit(main())
