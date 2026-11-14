@@ -182,6 +182,58 @@ def test_run_ssh_feeds_stdin_while_reading_stderr(tmp_path):
     asyncio.run(main())
 
 
+def test_run_ssh_cancellation_reaps_process(monkeypatch):
+    """Cancelling bootstrap must not leave an SSH process with undrained pipes."""
+    from pi.env import ssh as ssh_module
+
+    class Stream:
+        def __init__(self, stopped):
+            self.stopped = stopped
+
+        async def read(self):
+            await self.stopped.wait()
+            return b""
+
+    class Process:
+        def __init__(self):
+            self.stopped = asyncio.Event()
+            self.stdout = Stream(self.stopped)
+            self.stderr = Stream(self.stopped)
+            self.stdin = None
+            self.returncode = None
+            self.killed = False
+            self.waits = 0
+
+        async def wait(self):
+            self.waits += 1
+            await self.stopped.wait()
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self.stopped.set()
+
+    async def main():
+        process = Process()
+
+        async def create_subprocess_exec(*args, **kwargs):
+            return process
+
+        monkeypatch.setattr(ssh_module.asyncio, "create_subprocess_exec", create_subprocess_exec)
+        target_ = SshTarget(host="h", known_hosts_file="k", host_key_alias="a")
+        task = asyncio.create_task(ssh_module.run_ssh(target_, "true", args=[]))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.killed
+        assert process.returncode == -9
+        assert process.waits >= 1
+
+    asyncio.run(main())
+
+
 @pytest.mark.skipif("PI_ENV_SSH_HOST" not in os.environ, reason="set PI_ENV_SSH_HOST to run against a real SSH server")
 def test_ssh_external(tmp_path):
     host = os.environ["PI_ENV_SSH_HOST"]

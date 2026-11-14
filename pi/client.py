@@ -119,12 +119,16 @@ class Client:
             self.pending.pop(request_id, None)
 
     async def close(self):
-        if self.writer is not None:
-            self.writer.close()
-            await self.writer.wait_closed()
-        if self.reader_task is not None:
-            self.reader_task.cancel()
-            await asyncio.gather(self.reader_task, return_exceptions=True)
-        self.writer = None
-        self.reader_task = None
-        self.attachment = None
+        writer = self.writer
+        reader_task = self.reader_task
+        try:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            if reader_task is not None:
+                reader_task.cancel()
+                await asyncio.gather(reader_task, return_exceptions=True)
+            self.writer = None
+            self.reader_task = None
+            self.attachment = None

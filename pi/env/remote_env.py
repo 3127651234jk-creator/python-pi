@@ -586,34 +586,19 @@ class RemoteExecutionEnv:
                     if read is None:
                         raise abort()
                     return _concat(read[0])
-                # Decoding: reads of min(size, 512 KiB) until the size, a short read, or the end of the file.
-                length = min(size, READ_FILE_CHUNK)
+                # Decode exactly the size observed at open. ``read_range`` bounds the final read,
+                # so a file that grows concurrently cannot extend this operation indefinitely.
                 decoder = range_decoder()
-                text = ""
-                total = 0
-                first = True
-                in_flight: List["asyncio.Task[bytes]"] = []
-                next_offset = 0
-                try:
-                    while True:
-                        while len(in_flight) < READ_DEPTH:
-                            in_flight.append(asyncio.ensure_future(handle.pread(next_offset, length)))
-                            next_offset += length
-                        data = await in_flight.pop(0)
-                        if aborted():
-                            await _cancel_pending(in_flight)
-                            raise abort()
-                        total += len(data)
-                        if len(data) == 0 or total == size or len(data) != length:
-                            await _cancel_pending(in_flight)
-                            if first:
-                                return data.decode("utf-8", "replace")
-                            return text + decoder.decode(data) + decoder.decode()
-                        text += decoder.decode(data)
-                        first = False
-                except BaseException:
-                    await _cancel_pending(in_flight)
-                    raise
+                read = await read_range(
+                    lambda at, length: handle.pread(at, length),
+                    0,
+                    size,
+                    READ_FILE_CHUNK,
+                    aborted,
+                )
+                if read is None:
+                    raise abort()
+                return "".join(decoder.decode(chunk) for chunk in read[0]) + decoder.decode()
             finally:
                 await handle.close()
 

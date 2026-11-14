@@ -220,14 +220,22 @@ async def run_ssh(
                 except BaseException:
                     pass
 
+    async def terminate() -> None:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            await process.wait()
+        except (OSError, RuntimeError):
+            pass
+
     feeding = asyncio.ensure_future(feed()) if stdin is not None else None
     try:
         stdout, stderr = await asyncio.wait_for(collect(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        try:
-            process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+        await terminate()
         diagnostics = ""
         if process.stderr is not None:
             try:
@@ -237,9 +245,16 @@ async def run_ssh(
         raise SshError(
             f"ssh {target.host} did not finish within {int(timeout_s)} s: {diagnostics.strip()}", None, diagnostics
         ) from None
+    except BaseException:
+        await terminate()
+        raise
     finally:
         if feeding is not None:
             feeding.cancel()
+            try:
+                await feeding
+            except BaseException:
+                pass
 
     output = stdout.decode("utf-8", "replace")
     diagnostics = stderr.decode("utf-8", "replace")

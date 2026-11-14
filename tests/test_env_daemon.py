@@ -410,7 +410,7 @@ def test_file_operations_match_the_local_env(tmp_path):
     asyncio.run(main())
 
 
-def test_handle_close_waits_for_operations_in_flight():
+def test_handle_close_waits_for_operations_in_flight(monkeypatch):
     """A handle closes after the operations already running on it, like Rust's ``Arc<File>``."""
     from pi.env import daemon as daemon_module
 
@@ -431,6 +431,123 @@ def test_handle_close_waits_for_operations_in_flight():
     idle = _TestHandle()
     idle.close()
     assert idle.released is True  # nothing in flight: closes immediately
+
+    monkeypatch.setattr(daemon_module, "MAX_HANDLES", 1)
+    server = object.__new__(daemon_module.Server)
+    server.handles = {1: object()}
+    server.next_handle = 2
+    overflow = _TestHandle()
+    with pytest.raises(daemon_module.Failure) as failure:
+        server.insert(overflow)
+    assert failure.value.code == "EMFILE"
+    assert overflow.released is True
+
+
+def test_stdin_shell_command_receives_eof(tmp_path, monkeypatch):
+    """The legacy WSL stdin transport cannot finish until the daemon closes stdin."""
+    import concurrent.futures
+
+    from pi.durable.env import ok
+    from pi.durable.env.local import ShellConfig
+    from pi.env import daemon as daemon_module
+
+    class Output:
+        def bulk(self, frame, counter=None):
+            if counter is not None:
+                counter.count += 1
+                counter.count -= 1
+
+        async def wait_for_room(self, stop):
+            return None
+
+    async def get_shell_config(shell_path):
+        return ok(
+            ShellConfig(
+                sys.executable,
+                ["-c", "import sys; exec(sys.stdin.read())"],
+                command_transport="stdin",
+            )
+        )
+
+    monkeypatch.setattr(daemon_module, "get_shell_config", get_shell_config)
+
+    async def main():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            result = await asyncio.wait_for(
+                daemon_module.run_exec(
+                    1,
+                    {"command": "print('done')", "cwd": str(tmp_path)},
+                    str(tmp_path),
+                    Output(),
+                    daemon_module.Control(),
+                    set(),
+                    asyncio.get_running_loop(),
+                    executor,
+                ),
+                timeout=5,
+            )
+        assert result["exitCode"] == 0
+
+    asyncio.run(main())
+
+
+def test_growing_text_file_read_stops_at_opened_size():
+    from pi.env.remote_env import READ_FILE_CHUNK
+
+    class Handle:
+        def __init__(self):
+            self.lengths = []
+
+        async def pread(self, offset, length):
+            self.lengths.append(length)
+            return b"x" * length
+
+        async def close(self):
+            return None
+
+    class Environment(RemoteExecutionEnv):
+        def __init__(self, handle):
+            super().__init__(connection=None, id="test", cwd="/")
+            self.handle = handle
+
+        async def _resolve(self, path):
+            return path
+
+        async def _open(self, resolved, json):
+            size = READ_FILE_CHUNK + 1
+            return self.handle, {"stat": {"kind": "file", "size": size}}
+
+    async def main():
+        handle = Handle()
+        environment = Environment(handle)
+        result = get_or_throw(
+            await asyncio.wait_for(environment.read_text_file("growing.txt", Context()), timeout=1)
+        )
+        assert len(result) == READ_FILE_CHUNK + 1
+        assert handle.lengths == [READ_FILE_CHUNK, 1]
+
+    asyncio.run(main())
+
+
+def test_watcher_request_ending_before_ready_fails_promptly():
+    from pi.env import RemoteWatcher
+
+    class ConnectionEndingEarly:
+        async def request(self, *args, **kwargs):
+            return None
+
+    async def main():
+        with pytest.raises(RemoteError, match="Watcher closed"):
+            await asyncio.wait_for(
+                RemoteWatcher.open(
+                    ConnectionEndingEarly(),
+                    [WatchTarget(path=".")],
+                    lambda change: None,
+                ),
+                timeout=1,
+            )
+
+    asyncio.run(main())
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows job objects")

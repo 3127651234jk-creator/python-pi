@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 from ..durable.env import Context, FileError, WatchChange, WatchTarget
-from .connection import Connection, Json, is_connection_lost
+from .connection import Connection, Json, RemoteError, is_connection_lost
 from .errors import to_file_error
 
 RECONNECT_FIRST_MS = 1000

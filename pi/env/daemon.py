@@ -498,6 +498,7 @@ class Server:
 
     def insert(self, handle: Any) -> int:
         if len(self.handles) >= MAX_HANDLES:
+            handle.close()
             raise Failure("EMFILE", "EMFILE: too many open files")
         handle_id = self.next_handle
         self.next_handle += 1
@@ -1580,6 +1581,11 @@ async def run_exec(
             await process.stdin.drain()
         except (OSError, RuntimeError):
             pass
+        finally:
+            try:
+                process.stdin.close()
+            except (OSError, RuntimeError):
+                pass
 
     pid = process.pid
     groups.add(pid)
