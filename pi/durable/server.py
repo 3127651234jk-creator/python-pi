@@ -80,7 +80,22 @@ def create_session_directory(root: str, cwd: Optional[str] = None) -> Dict[str, 
 
 def _read_meta(path: str) -> Dict[str, Any]:
     with open(os.path.join(path, "meta.json"), encoding="utf-8") as handle:
-        return json.load(handle)
+        metadata = json.load(handle)
+    if not isinstance(metadata, dict):
+        raise ValueError("Session metadata must be an object")
+    session_id = metadata.get("id")
+    created_ms = metadata.get("createdMs")
+    storage_path = metadata.get("storagePath")
+    if not isinstance(session_id, str) or session_id != os.path.basename(os.path.normpath(path)):
+        raise ValueError("Session metadata id does not match its directory")
+    if not isinstance(created_ms, int) or isinstance(created_ms, bool) or created_ms < 0:
+        raise ValueError("Session metadata createdMs must be a non-negative integer")
+    if not isinstance(storage_path, str):
+        raise ValueError("Session metadata storagePath must be a string")
+    expected_storage_path = os.path.realpath(os.path.join(path, "session.sqlite"))
+    if os.path.realpath(storage_path) != expected_storage_path:
+        raise ValueError("Session metadata storagePath does not match its directory")
+    return metadata
 
 
 def list_session_directories(root: str) -> List[Dict[str, Any]]:
@@ -104,8 +119,12 @@ def read_session_directory(root: str, session_id: str) -> Dict[str, Any]:
     return _read_meta(path)
 
 
-def delete_session_directory(metadata: Dict[str, Any]) -> None:
-    shutil.rmtree(os.path.dirname(metadata["storagePath"]), ignore_errors=True)
+def delete_session_directory(root: str, session_id: str) -> None:
+    root_path = os.path.realpath(root)
+    session_path = os.path.realpath(_session_path(root_path, session_id))
+    if os.path.commonpath([root_path, session_path]) != root_path or session_path == root_path:
+        raise ValueError("Session directory escapes the session root")
+    shutil.rmtree(session_path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +366,7 @@ class _ManagementService:
         metadata = read_session_directory(self._host.session_root, resolved)
         # Release routed attachments and close the worker before deleting durable metadata.
         await self._presentation.prepare_session_removal(resolved)
-        delete_session_directory(metadata)
+        delete_session_directory(self._host.session_root, metadata["id"])
         self._host.directory.refresh()
 
 
@@ -374,9 +393,9 @@ class ServerServicesEndpoint:
 class DurableServerHost:
     """Binds the session catalog and worker manager to the routed ``Server``."""
 
-    def __init__(self, manager: SessionWorkerManager) -> None:
+    def __init__(self, manager: SessionWorkerManager, server_id: Optional[str] = None) -> None:
         self.manager = manager
-        self.server_id: Optional[str] = None
+        self.server_id = server_id or str(uuid.uuid4())
         self.directory = SessionDirectoryState(self)
 
     @property
@@ -429,9 +448,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     os.makedirs(args.session_dir, exist_ok=True)
     manager = SessionWorkerManager(args.session_dir, model_args=_model_args(args), concurrency=args.concurrency)
-    host = DurableServerHost(manager)
-    server = Server(host, server_id=args.server_id)
-    host.server_id = server.server_id
+    host = DurableServerHost(manager, server_id=args.server_id)
+    server = Server(host, server_id=host.server_id)
     if args.unix:
         print(f"Socket: {await server.start_unix(args.unix)}", flush=True)
     else:

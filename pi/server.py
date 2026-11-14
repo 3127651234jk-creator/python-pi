@@ -104,7 +104,7 @@ class Presentation:
 class Server:
     def __init__(self, host, server_id=None, max_frame_length=MAX_FRAME_LENGTH, handshake_timeout=10):
         self.host = host
-        self.server_id = server_id or str(uuid.uuid4())
+        self.server_id = server_id or getattr(host, "server_id", None) or str(uuid.uuid4())
         validate_target({"serverId": self.server_id})
         self.limit, self.handshake_timeout = max_frame_length, handshake_timeout
         self.listener = None

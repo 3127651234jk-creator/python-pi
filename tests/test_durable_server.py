@@ -22,6 +22,10 @@ from pi.client import Client, ServerError
 from pi.durable.server import (
     DurableServerHost,
     SessionWorkerManager,
+    create_session_directory,
+    delete_session_directory,
+    list_session_directories,
+    read_session_directory,
 )
 from pi.server import Server
 
@@ -249,3 +253,46 @@ def test_session_directory_subscription_receives_updates(tmp_path):
             await server.close()
             await manager.shutdown()
     asyncio.run(asyncio.wait_for(check(), 120))
+
+
+def test_initial_directory_snapshot_uses_the_server_id_for_existing_sessions(tmp_path):
+    async def scenario():
+        root = str(tmp_path / "sessions")
+        metadata = create_session_directory(root)
+        manager = SessionWorkerManager(root, model_args=["--provider", "faux", "--model", "faux"])
+        host = DurableServerHost(manager)
+        server = Server(host)
+
+        assert server.server_id == host.server_id
+        assert host.directory.state.value == {
+            "revision": 0,
+            "sessions": [{"serverId": server.server_id, "sessionId": metadata["id"],
+                          "createdAt": metadata["createdMs"]}],
+        }
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_invalid_session_metadata_is_ignored_and_cannot_redirect_deletion(tmp_path):
+    root = tmp_path / "sessions"
+    invalid = root / "invalid"
+    invalid.mkdir(parents=True)
+    (invalid / "meta.json").write_text("[]", encoding="utf-8")
+    assert list_session_directories(str(root)) == []
+    with pytest.raises(ValueError, match="must be an object"):
+        read_session_directory(str(root), "invalid")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    valid = create_session_directory(str(root))
+    meta_path = root / valid["id"] / "meta.json"
+    tampered = {**valid, "storagePath": str(outside / "session.sqlite")}
+    meta_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="storagePath"):
+        read_session_directory(str(root), valid["id"])
+    assert outside.is_dir()
+
+    delete_session_directory(str(root), valid["id"])
+    assert not (root / valid["id"]).exists()
+    assert outside.is_dir()
