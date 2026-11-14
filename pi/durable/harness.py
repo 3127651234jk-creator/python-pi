@@ -22,7 +22,7 @@ from ..ai.models import Model
 from ..ai.types import AssistantMessage, ToolCall, TranscriptContext, UserMessage
 from ..ai.providers import get_default_stream_fn
 from ..ai.utils import normalize_context
-from .entries import ASSISTANT_ENTRY, SYSTEM_ENTRY, USER_ENTRY
+from .entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, USER_ENTRY
 from .errors import error_message
 from .session import Session
 from .types import (
@@ -653,7 +653,7 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         entries = await harness.transcript(conversation_id)
         llm_messages: List[Any] = []
         for entry in entries:
-            if entry.kind in (USER_ENTRY.kind, ASSISTANT_ENTRY.kind, SYSTEM_ENTRY.kind) and entry.model:
+            if entry.kind in (USER_ENTRY.kind, ASSISTANT_ENTRY.kind, SYSTEM_ENTRY.kind, COMPACTION_ENTRY.kind) and entry.model:
                 llm_messages.extend(entry.model)
         stored = [ai_to_json(m) for m in llm_messages]
         await runtime.commit(

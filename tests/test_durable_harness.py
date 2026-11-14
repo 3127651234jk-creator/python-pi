@@ -15,7 +15,7 @@ from pi.ai.providers import faux
 from pi.ai.types import AssistantMessage, TextContent, Usage, UserMessage
 from pi.agent.types import AgentToolResult
 from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
-from pi.durable.harness import Harness
+from pi.durable.harness import Harness, TaskRuntime
 from pi.durable.session import create_session
 from pi.durable.storage import JsonlStorage
 from pi.durable.tasks import compact_definition
@@ -254,6 +254,23 @@ def test_compact_cut_inside_last_entry_does_not_fault(tmp_path):
             assert record.state.outcome.result["compacted"] is True
             transcript = await harness.transcript(cid)
             assert transcript[-1].kind == COMPACTION_ENTRY.kind
+            assert all(entry.kind != USER_ENTRY.kind for entry in transcript)
+
+            # Every later generation must retain the summary after the head cut.
+            for text in ("continue", "continue again"):
+                generation_id = await harness.submit_input(cid, text)
+                task = await harness._get_task(generation_id)
+                definition = harness.definitions[task.kind]
+                await harness._reserve(task.id, definition, task)
+                current = await harness._get_task(task.id)
+                runtime = TaskRuntime(harness, task.id, asyncio.Event())
+                await definition.phases["prepare"](current, runtime, harness)
+                prepared = await harness._get_task(task.id)
+                messages = prepared.state.checkpoint["messages"]
+                assert any(message["role"] == "system" and
+                           message["content"] == "Conversation summary:\nsummary"
+                           for message in messages)
+                await harness.run_pending_tasks()
             await session.close()
         finally:
             os.environ.pop("FAUX_SCRIPT", None)
