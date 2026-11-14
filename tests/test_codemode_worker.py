@@ -128,6 +128,36 @@ def texts(run):
     return [item.get("text") for item in run.output if item.get("type") == "text"]
 
 
+def test_worker_keyword_tool_arguments(tmp_path):
+    async def scenario():
+        run = await run_script(tmp_path, (
+            "result = [tools.echo(x='hi'), wait(tools.read.start(path='a.txt')),\n"
+            "          tools.echo(args='value'), tools.echo({'x': 'dict'}), tools.echo()]\n"
+        ), tools=[meta("echo"), meta("read")])
+        assert run.error is None
+        assert run.value == [
+            {"called": "echo", "args": {"x": "hi"}},
+            {"called": "read", "args": {"path": "a.txt"}},
+            {"called": "echo", "args": {"args": "value"}},
+            {"called": "echo", "args": {"x": "dict"}},
+            {"called": "echo", "args": {}},
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("code", [
+    "tools.echo({'x': 1}, x=2)", "tools.echo.start({'x': 1}, x=2)",
+])
+def test_worker_rejects_mixed_tool_arguments(tmp_path, code):
+    async def scenario():
+        run = await run_script(tmp_path, code, tools=[meta("echo")])
+        assert run.error["name"] == "TypeError"
+        assert "not both" in run.error["message"]
+
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # Independence
 # ---------------------------------------------------------------------------

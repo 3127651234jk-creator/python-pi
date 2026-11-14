@@ -136,10 +136,14 @@ WORKER_SOURCE = textwrap.dedent('''
             self._bridge = bridge
             self._name = name
 
-        def __call__(self, args=None):
-            return self._bridge.start(self._name, args).result()
+        def __call__(self, args=None, /, **kwargs):
+            return self.start(args, **kwargs).result()
 
-        def start(self, args=None):
+        def start(self, args=None, /, **kwargs):
+            if kwargs:
+                if args is not None:
+                    raise TypeError("pass either an argument object or keyword arguments, not both")
+                args = kwargs
             return self._bridge.start(self._name, args)
 
         def __repr__(self):
