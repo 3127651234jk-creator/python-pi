@@ -323,8 +323,8 @@ async def login_openai_chatgpt(notify, prompt, device_id):
     notify("Complete sign-in in your browser. If the callback does not complete, paste the final redirect URL here.")
     # Race the loopback callback against the pasted redirect URL, for when the browser cannot reach 127.0.0.1 (SSH).
     manual = asyncio.ensure_future(prompt("Complete login in your browser, or paste the final redirect URL here: "))
+    pending = {asyncio.ensure_future(callback.wait()), manual}
     try:
-        pending = {asyncio.ensure_future(callback.wait()), manual}
         done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         if manual in done:
             result = chatgpt_manual_result(manual.result(), state)
@@ -341,7 +341,9 @@ async def login_openai_chatgpt(notify, prompt, device_id):
             raise ValueError("OpenAI OAuth token response did not contain an ID token")
         return chatgpt_record(data, result["client_id"])
     finally:
-        manual.cancel()
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         await callback.close()
 
 

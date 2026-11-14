@@ -18,6 +18,7 @@ import threading
 from contextlib import nullcontext, redirect_stdout
 from typing import Any, Callable, List, Optional, Tuple
 import httpx
+from prompt_toolkit import PromptSession
 
 from ..ai.models import ModelError, resolve_image_model, resolve_model
 from ..ai.providers import generate_images
@@ -893,7 +894,9 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
         raise ModelError(f"Unknown provider: {provider}")
     if oauth or provider in OAUTH_DEFAULT_PROVIDERS:
         async def prompt(message):
-            return await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, message)
+            # Browser callbacks can cancel this prompt. Blocking getpass in
+            # the default executor would keep asyncio.run() alive afterwards.
+            return await PromptSession().prompt_async(message, is_password=True)
         if provider == "anthropic":
             credential = await login_claude(print, prompt)
         elif provider == "openai":
