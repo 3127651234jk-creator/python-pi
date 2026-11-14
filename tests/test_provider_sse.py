@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from pi.ai.models import Model
-from pi.ai.providers.base import trust_env_for_url
+from pi.ai.providers.base import iter_sse, trust_env_for_url
 from pi.ai.types import (
     DoneEvent,
     StreamErrorEvent,
@@ -41,6 +41,32 @@ def user_context() -> TranscriptContext:
     return TranscriptContext(messages=[UserMessage(content="hi", timestamp=0)])
 
 
+@pytest.mark.parametrize("ending", ["\n", "\r", "\r\n"])
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+def test_sse_preserves_unicode_separators(ending, chunk_size):
+    text = "before\u2028middle\u2029next\u0085after\v\fend"
+    payload = json.dumps({"text": text}, ensure_ascii=False)
+    wire = ("event: delta" + ending + "data: " + payload + ending * 2
+            + 'data: {"text":"following"}' + ending * 2
+            + "data: [DONE]").encode("utf-8")
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for offset in range(0, len(wire), chunk_size):
+                yield wire[offset:offset + chunk_size]
+
+    async def run():
+        response = httpx.Response(200, stream=Body())
+        try:
+            return [event async for event in iter_sse(response)]
+        finally:
+            await response.aclose()
+
+    assert asyncio.run(run()) == [
+        ("delta", {"text": text}), (None, {"text": "following"}), (None, "[DONE]"),
+    ]
+
+
 def stream_with(monkeypatch, provider_module, sse_body: str):
     """Patch httpx send to return a canned SSE response and collect events."""
 
@@ -53,9 +79,9 @@ def stream_with(monkeypatch, provider_module, sse_body: str):
         class FakeResponse:
             status_code = 200
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 for line in sse_body.splitlines():
-                    yield line
+                    yield line + "\n"
 
             async def aread(self):
                 return b""
@@ -248,7 +274,7 @@ def test_anthropic_request_includes_tools(monkeypatch):
         class FakeResponse:
             status_code = 200
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 return
                 yield
 
@@ -346,11 +372,11 @@ def test_loopback_provider_client_bypasses_the_system_proxy(monkeypatch):
             class FakeResponse:
                 status_code = 200
 
-                async def aiter_lines(self):
+                async def aiter_text(self):
                     for line in ('data: {"choices":[{"delta":{"content":"Hi"},'
                                  '"finish_reason":"stop"}]}\n\n'
                                  'data: [DONE]\n\n').splitlines():
-                        yield line
+                        yield line + "\n"
 
                 async def aread(self):
                     return b""
@@ -381,10 +407,10 @@ def _canned_send(monkeypatch, payloads):
         class FakeResponse:
             status_code = 200
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 for payload in payloads:
-                    yield "data: " + (payload if isinstance(payload, str) else json.dumps(payload))
-                    yield ""
+                    yield "data: " + (payload if isinstance(payload, str) else json.dumps(payload)) + "\n"
+                    yield "\n"
 
             async def aread(self):
                 return b""
@@ -519,7 +545,7 @@ def test_openai_http_error_with_empty_body_still_explains_itself(monkeypatch):
             status_code = 502
             reason_phrase = "Bad Gateway"
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 return
                 yield
 
@@ -552,7 +578,7 @@ def test_anthropic_http_error_yields_error_event(monkeypatch):
         class FakeResponse:
             status_code = 401
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 return
                 yield
 
@@ -587,7 +613,7 @@ def _capture_body_and_headers(monkeypatch):
         class FakeResponse:
             status_code = 200
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 return
                 yield
 
@@ -687,9 +713,9 @@ data: [DONE]
         class FakeResponse:
             status_code = 200
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 for line in sse.splitlines():
-                    yield line
+                    yield line + "\n"
 
             async def aread(self):
                 return b""

@@ -109,6 +109,31 @@ def apply_model_params(body: Dict[str, Any], model: Model, options: Optional[Sim
             body[key] = value
 
 
+async def _iter_sse_lines(response: httpx.Response) -> AsyncIterator[str]:
+    """Split only SSE line endings, preserving Unicode separators in JSON."""
+    fragments: List[str] = []
+    skip_lf = False
+    async for chunk in response.aiter_text():
+        start = 0
+        for index, char in enumerate(chunk):
+            if skip_lf:
+                skip_lf = False
+                if char == "\n":
+                    start = index + 1
+                    continue
+            if char in "\r\n":
+                fragments.append(chunk[start:index])
+                yield "".join(fragments)
+                fragments.clear()
+                start = index + 1
+                skip_lf = char == "\r"
+        fragments.append(chunk[start:])
+    if fragments:
+        line = "".join(fragments)
+        if line:
+            yield line
+
+
 async def iter_sse(response: httpx.Response) -> AsyncIterator[Tuple[Optional[str], Any]]:
     """Parse an SSE response body into (event_name, parsed_json) pairs."""
 
@@ -125,8 +150,7 @@ async def iter_sse(response: httpx.Response) -> AsyncIterator[Tuple[Optional[str
                 parsed = data
             yield event_name, parsed
 
-    async for raw_line in response.aiter_lines():
-        line = raw_line.rstrip("\r")
+    async for line in _iter_sse_lines(response):
         if line == "":
             async for item in dispatch():
                 yield item
