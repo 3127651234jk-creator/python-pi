@@ -13,7 +13,7 @@ except ImportError:
     boto3 = None
 
 from ..types import TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, ToolCall, ToolResultMessage, StreamStartEvent, StreamErrorEvent, get_system_message_text
-from ..utils import normalize_context
+from ..utils import normalize_context, normalize_tool_call_id
 from ...util import AbortError
 from .base import ProviderState, SimpleStreamOptions, usage_from_counts, thinking_budget
 from .blocks import BlockEvents
@@ -70,7 +70,7 @@ def build_request(model, context, options):
     for message in messages:
         content = []
         if isinstance(message, ToolResultMessage):
-            content = [{"toolResult": {"toolUseId": message.tool_call_id, "status": "error" if message.is_error else "success",
+            content = [{"toolResult": {"toolUseId": normalize_tool_call_id(message.tool_call_id), "status": "error" if message.is_error else "success",
                 "content": [{"text": b.text} for b in message.content if isinstance(b, TextContent)] or [{"text": "(empty result)"}]}}]
         else:
             for block in [TextContent(text=message.content)] if isinstance(message.content, str) else message.content:
@@ -83,7 +83,7 @@ def build_request(model, context, options):
                 elif isinstance(block, ToolCall):
                     if block.raw_item is not None:
                         continue  # Hosted calls are provider-executed; not replayable on Bedrock.
-                    content.append({"toolUse": {"toolUseId": block.id, "name": block.name, "input": block.arguments}})
+                    content.append({"toolUse": {"toolUseId": normalize_tool_call_id(block.id), "name": block.name, "input": block.arguments}})
                 elif isinstance(block, ThinkingContent) and block.thinking_signature:
                     content.append({"reasoningContent": {"reasoningText": {"text": block.thinking, "signature": block.thinking_signature}}})
         role = "assistant" if message.role == "assistant" else "user"

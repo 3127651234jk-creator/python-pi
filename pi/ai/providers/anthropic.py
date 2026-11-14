@@ -37,7 +37,7 @@ from ..types import (
     VideoContent,
     get_system_message_text,
 )
-from ..utils import normalize_context
+from ..utils import normalize_context, normalize_tool_call_id
 from .copilot import copilot_headers
 from .base import (
     ProviderState,
@@ -165,7 +165,7 @@ def convert_messages(messages: List[Any]) -> List[Dict[str, Any]]:
             pending_results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": message.tool_call_id,
+                    "tool_use_id": normalize_tool_call_id(message.tool_call_id),
                     "content": content,
                     "is_error": message.is_error,
                 }
@@ -218,7 +218,7 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
             elif block.thinking.strip():
                 blocks.append({"type": "text", "text": block.thinking})
         elif isinstance(block, ToolCall) and block.raw_item is None:
-            blocks.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.arguments})
+            blocks.append({"type": "tool_use", "id": normalize_tool_call_id(block.id), "name": block.name, "input": block.arguments})
         # Hosted tool calls have no Anthropic replay shape and are dropped.
     if not blocks:
         blocks = [{"type": "text", "text": "(empty)"}]

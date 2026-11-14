@@ -7,6 +7,7 @@ and ``validateToolArguments`` from ``packages/ai/src``.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..util import AbortError
@@ -35,6 +36,11 @@ class ToolStateChanges:
 
 
 NO_CHANGES = ToolStateChanges(tools_added=[], tools_removed=[])
+
+
+def normalize_tool_call_id(call_id: str) -> str:
+    """Use the call portion of compound IDs and satisfy Claude's ID limits."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", call_id.split("|", 1)[0])[:64] or "call"
 
 
 def normalize_context(context: TranscriptContext) -> Tuple[Optional[SystemMessage], List[Message]]:
