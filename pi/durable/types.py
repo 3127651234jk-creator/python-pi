@@ -7,6 +7,7 @@ Records are dataclasses with JSON conversion for serialization-backed stores.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
@@ -18,6 +19,52 @@ TASK_STATUSES = ("pending", "running", "waiting", "completing", "terminal")
 OUTCOME_STATUSES = ("completed", "failed", "aborted", "orphaned", "faulted")
 # Submission statuses
 SUBMISSION_STATUSES = ("queued", "placed", "done", "unanswered")
+
+
+@dataclass(frozen=True)
+class ProgressPolicy:
+    """How often running progress is committed (TS ``ProgressPolicy``).
+
+    Each commit is a storage write. ``partial_interval_ms`` paces the answer
+    being generated; ``output_interval_ms`` paces running tool output, whose
+    commits also pause in proportion to their size.
+    """
+
+    partial_interval_ms: float = 100
+    output_interval_ms: float = 100
+
+
+def resolve_progress_policy(value: Any = None) -> ProgressPolicy:
+    """Resolve ``settings.progress`` field by field over the 100 ms defaults.
+
+    ``None`` and absent fields take the default; ``0`` is a real value and is
+    preserved. Negative, non-finite, boolean and non-numeric values fail with a
+    diagnostic instead of silently becoming the default.
+    """
+
+    if value is None:
+        return ProgressPolicy()
+    if isinstance(value, ProgressPolicy):
+        return value
+    if not isinstance(value, dict):
+        raise ValueError("progress must be an object")
+
+    def interval(snake: str, camel: str, default: float) -> float:
+        raw = value[snake] if snake in value else value.get(camel)
+        if raw is None:
+            return default
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"progress.{snake} must be a finite non-negative number")
+        if not math.isfinite(raw):
+            raise ValueError(f"progress.{snake} must be finite")
+        if raw < 0:
+            raise ValueError(f"progress.{snake} must not be negative")
+        return float(raw)
+
+    return ProgressPolicy(
+        partial_interval_ms=interval("partial_interval_ms", "partialIntervalMs", 100),
+        output_interval_ms=interval("output_interval_ms", "outputIntervalMs", 100),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -150,10 +150,10 @@ class Transaction:
 
     # -- creation -------------------------------------------------------------
 
-    async def create_conversation(self, ownership: dict) -> ConversationRecord:
+    async def create_conversation(self, ownership: dict, parent: Optional[Dict[str, int]] = None) -> ConversationRecord:
         self._before_table_read()
         rid = await self._host.storage.mint_id()
-        record = ConversationRecord(id=rid)
+        record = ConversationRecord(id=rid, parent=parent)
         if ownership.get("kind") == "task":
             task_id = ownership["task_id"]
             task = await self.task(task_id)
@@ -176,8 +176,7 @@ class Transaction:
         stored = await self._host.storage.entry_visible(parent_conversation_id, at)
         if stored is None:
             raise StorageRejected(f"Entry {at} is not visible from conversation {parent_conversation_id}")
-        record = await self.create_conversation(ownership)
-        record.parent = {"conversation_id": parent_conversation_id, "at": at}
+        record = await self.create_conversation(ownership, {"conversation_id": parent_conversation_id, "at": at})
         return record
 
     async def append_entry(self, cid: int, draft: Dict[str, Any]) -> EntryRecord:
@@ -316,8 +315,10 @@ class Transaction:
     # -- documents -------------------------------------------------------------
 
     async def doc(self, definition: DocDefinition, *args: Any) -> DocDraft:
-        self._before_table_read()
         address_id, address, next_index = resolve_address(definition, list(args))
+        created = any(record.id == address["scope"].get("conversation_id") for record in self._created_conversations)
+        if not created:
+            self._before_table_read()
         if address_id in self._drafts_by_address:
             return self._drafts_by_address[address_id]
         loaded = await self._host.load_document(definition, address)
@@ -368,8 +369,8 @@ class Transaction:
                     kind=draft.definition.kind,
                     scope=dict(draft.address["scope"]),
                     key=draft.address["key"],
-                    history=None,
-                    fork=None,
+                    history=draft.definition.history if draft.definition.scope == "conversation" else None,
+                    fork=draft.definition.fork if draft.definition.scope == "conversation" else None,
                 )
                 self._writes.append(write_document_create(record, draft.definition.version, draft.value))
                 self._mark_table_write()

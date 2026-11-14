@@ -59,6 +59,9 @@ def documentation_available() -> bool:
 class SystemPromptOptions:
     custom_prompt: Optional[str] = None
     selected_tools: List[str] = field(default_factory=lambda: ["read", "bash", "edit", "write"])
+    # Selected tools that requests leave out (reachable only through another
+    # tool). The tool list, rules and skills hint follow the declared tools.
+    hidden_tools: List[str] = field(default_factory=list)
     tool_snippets: Dict[str, str] = field(default_factory=dict)
     tool_guidelines: Dict[str, List[str]] = field(default_factory=dict)
     prompt_guidelines: List[str] = field(default_factory=list)
@@ -84,9 +87,17 @@ def load_context_files(cwd: str) -> List[dict]:
     return files
 
 
+def declared_tool_names(options: SystemPromptOptions) -> List[str]:
+    """Tools requests declare: selected tools minus hidden ones, order preserved."""
+
+    hidden = set(options.hidden_tools)
+    return [name for name in options.selected_tools if name not in hidden]
+
+
 def build_rules(options: SystemPromptOptions) -> str:
     rules: List[str] = []
     seen = set()
+    declared = declared_tool_names(options)
 
     def add_rule(rule: str) -> None:
         rule = rule.strip()
@@ -94,13 +105,21 @@ def build_rules(options: SystemPromptOptions) -> str:
             seen.add(rule)
             rules.append(rule)
 
-    has_bash = "bash" in options.selected_tools
-    has_search_tools = any(t in options.selected_tools for t in ("grep", "find", "ls"))
+    has_bash = "bash" in declared
+    has_search_tools = any(t in declared for t in ("grep", "find", "ls"))
     if os.name == "nt":
-        add_rule("This host runs Windows. Follow each tool's declared shell. Prefer powershell for Windows commands; use Get-ChildItem, Select-String and Select-Object -First instead of ls -la, grep and head. Use $null instead of /dev/null in PowerShell. Prefer dedicated read, ls, find and grep tools when available.")
+        windows = ["This host runs Windows. Follow each tool's declared shell."]
+        if "powershell" in declared:
+            windows.append("Prefer powershell for Windows commands; use Get-ChildItem, Select-String "
+                           "and Select-Object -First instead of ls -la, grep and head. Use $null instead "
+                           "of /dev/null in PowerShell.")
+        dedicated = [name for name in ("read", "ls", "find", "grep") if name in declared]
+        if dedicated:
+            windows.append("Prefer dedicated " + ", ".join(dedicated) + " tools when available.")
+        add_rule(" ".join(windows))
     if has_bash and not has_search_tools:
         add_rule("Use bash for file operations like ls, rg, find")
-    for name in options.selected_tools:
+    for name in declared:
         for rule in options.tool_guidelines.get(name, []):
             add_rule(rule)
     for rule in options.prompt_guidelines:
@@ -125,7 +144,8 @@ def build_system_prompt(options: SystemPromptOptions) -> str:
 
     sections: List[str] = [preamble]
 
-    visible_tools = [name for name in options.selected_tools if name in options.tool_snippets]
+    declared = declared_tool_names(options)
+    visible_tools = [name for name in declared if name in options.tool_snippets]
     tools_text = "\n".join(f"- {name}: {options.tool_snippets[name]}" for name in visible_tools) or "(none)"
     sections.append(
         f"<tools>\n{tools_text}\n\n"

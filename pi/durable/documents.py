@@ -26,6 +26,8 @@ class DocDefinition:
     initial: Callable[[Any], Dict[str, Any]]
     family: bool = False
     migrate: Optional[Callable[[Dict[str, Any], int], Dict[str, Any]]] = None
+    history: str = "rewindable"
+    fork: str = "asOf"
 
     def __post_init__(self) -> None:
         if not isinstance(self.version, int) or self.version <= 0:

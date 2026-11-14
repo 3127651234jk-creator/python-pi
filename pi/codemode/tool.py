@@ -119,8 +119,9 @@ def _describe_output(output_schema: Optional[dict]) -> str:
 
 
 def render_tool_sample(name: str, description: str, parameters: dict,
-                       output_schema: Optional[dict] = None) -> str:
-    """The declaration a script sees for one tool: signature plus description."""
+                       output_schema: Optional[dict] = None,
+                       guidelines: Optional[List[str]] = None) -> str:
+    """The declaration a script sees for one tool: signature, description and guidelines."""
 
     identifier = host.to_codemode_identifier(name)
     properties = parameters.get("properties") if isinstance(parameters, dict) else None
@@ -137,6 +138,9 @@ def render_tool_sample(name: str, description: str, parameters: dict,
     signature = f"tools.{identifier}({args_text}) -> {_describe_output(output_schema)}"
     lines = [signature]
     body = (description or "").strip()
+    bullets = [guideline.strip() for guideline in (guidelines or []) if guideline.strip()]
+    if bullets:
+        body = (body + "\n\n" if body else "") + "\n".join(f"- {bullet}" for bullet in bullets)
     if body:
         lines.append("")
         lines.append(body)
@@ -201,10 +205,11 @@ def create_codemode_description(tools: List[AgentTool], inline_budget: Optional[
     sections = [DESCRIPTION_INTRO, DESCRIPTION_GLOBALS]
     declarations = []
     for tool in tools:
-        if tool.name == "codemode":
+        if tool.name == "codemode" or tool.exposure == "model-only":
             continue
         sample = render_tool_sample(tool.name, tool.description or "",
-                                    tool.parameters or {}, tool.output_schema)
+                                    tool.parameters or {}, tool.output_schema,
+                                    tool.prompt_guidelines)
         declarations.append({"name": tool.name, "sample": sample})
     if not declarations:
         return "\n\n".join(sections)
@@ -349,33 +354,37 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
     direct calls. The CLI always passes the unified callback.
     """
 
-    settings = settings or {}
-    configured_timeout = settings.get("timeout_ms")
-    inline_budget = settings.get("inline_budget", DEFAULT_INLINE_BUDGET)
-    callable_tools = [tool for tool in tools if tool.name != "codemode"]
-    allowed = {tool.name: tool for tool in callable_tools}
+    state = {"settings": settings or {}}
     runtime = host.prepare_runtime()
 
-    js_names: Dict[str, str] = {}
-    tool_meta: List[dict] = []
-    for tool in callable_tools:
-        js = host.to_codemode_identifier(tool.name)
-        if js in js_names:
-            js = ""
-        else:
-            js_names[js] = tool.name
-        tool_meta.append({
-            "name": tool.name, "js_name": js,
-            "namespace": _tool_namespace(tool.name),
-            "description": render_tool_sample(tool.name, tool.description or "",
-                                              tool.parameters or {}, tool.output_schema),
-        })
+    def current_tools() -> List[AgentTool]:
+        # The list is owned by the agent and changes on MCP/extension refreshes;
+        # read it at call time so codemode sees tools registered after setup.
+        return [tool for tool in tools if tool.name != "codemode" and tool.exposure != "model-only"]
+
+    def build_tool_meta() -> List[dict]:
+        js_names: Dict[str, str] = {}
+        meta: List[dict] = []
+        for tool in current_tools():
+            js = host.to_codemode_identifier(tool.name)
+            if js in js_names:
+                js = ""
+            else:
+                js_names[js] = tool.name
+            meta.append({
+                "name": tool.name, "js_name": js,
+                "namespace": _tool_namespace(tool.name),
+                "description": render_tool_sample(tool.name, tool.description or "",
+                                                  tool.parameters or {}, tool.output_schema,
+                                                  tool.prompt_guidelines),
+            })
+        return meta
 
     async def run_tool(name: str, args: dict, signal,
                        fallback_id: str = "") -> NestedToolCallOutcome:
         if execute_tool is not None:
             return await execute_tool(name, args, signal)
-        tool = allowed.get(name)
+        tool = next((candidate for candidate in current_tools() if candidate.name == name), None)
         if tool is None:
             raise ValueError(f"tool not available: {name}")
         call_id = fallback_id or f"codemode-{name}"
@@ -405,7 +414,7 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
             options, code = host.parse_codemode_source(code)
         except ValueError as exc:
             return _failed_result(call_id, [], [], f"Script error:\n{exc}")
-        timeout_ms = options.get("timeout_ms", configured_timeout)
+        timeout_ms = options.get("timeout_ms", state["settings"].get("timeout_ms"))
         max_tokens = options.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
 
         def publish(snapshot: dict) -> None:
@@ -416,7 +425,7 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
                     asyncio.ensure_future(outcome)
 
         outcome = await host.execute_codemode(
-            code=code, root_id=call_id, tools_meta=tool_meta,
+            code=code, root_id=call_id, tools_meta=build_tool_meta(),
             store=load_codemode_store(session), timeout_ms=timeout_ms,
             signal=signal, on_call=run_script_tool,
             on_update=publish if on_update is not None else None, runtime=runtime)
@@ -451,10 +460,24 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
             content=[TextContent(text=f"Script completed\nWall time {outcome.wall_time:.1f} seconds\nOutput:")] + items,
             details={"calls": outcome.calls})
 
-    return AgentTool(
+    codemode = AgentTool(
         name="codemode",
-        description=create_codemode_description(callable_tools, inline_budget),
+        description=create_codemode_description(
+            current_tools(), state["settings"].get("inline_budget", DEFAULT_INLINE_BUDGET)),
         parameters={"type": "object", "properties": {"code": {"type": "string", "description": "Raw Python source."}},
                     "required": ["code"]},
         execute=execute,
     )
+
+    def refresh_description() -> None:
+        codemode.description = create_codemode_description(
+            current_tools(), state["settings"].get("inline_budget", DEFAULT_INLINE_BUDGET))
+
+    def update_settings(settings: dict) -> None:
+        state["settings"] = settings or {}
+        refresh_description()
+
+    # Called by the CLI when tools, guidelines or codemode settings change.
+    codemode._codemode_refresh = refresh_description
+    codemode._codemode_update_settings = update_settings
+    return codemode

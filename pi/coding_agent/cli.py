@@ -48,6 +48,7 @@ from .bug_report import (BUG_REPORT_CUSTOM_ENTRY_TYPE, bug_report_archive_file_n
                          generate_bug_report_summary, upload_bug_report, write_bug_report_archive)
 from .file_processor import process_file_arguments
 from .markdown_render import render_markdown
+from .syntax_highlight import MONO_THEME
 from .terminal_image import render_image_lines
 from .output_guard import raw_stdout, restore_stdout, take_over_stdout
 from .packages import PackageManager
@@ -68,6 +69,7 @@ from ..agent.compaction import CompactionSettings
 from . import timings
 from .resources import ResourceCatalog
 from .mcp import McpManager, create_tool_name_matcher, is_mcp_tool_name
+from .tool_search import STORE_TYPE as TOOL_SEARCH_STORE_TYPE, create_tool_search_tool
 from .rpc import JsonWriter, RpcServer
 from .extensions import ExtensionManager
 from .ts_extension import to_jsonable as to_json_value
@@ -159,8 +161,7 @@ class ToolSelection:
 
     MCP tools the allowlist keeps without naming them stay registered for codemode scripts
     but are not declared to the model, matching the TS session that keeps them out of the
-    declared loadout. pi-python has no tool_search, so codemode is the only way to reach
-    them.
+    declared loadout. tool_search can load searchable tools for direct model calls.
     """
 
     def __init__(self, allowed: Optional[List[str]], excluded: List[str]) -> None:
@@ -203,25 +204,73 @@ def tool_selection_from_args(args: argparse.Namespace) -> Optional[ToolSelection
 def apply_tool_selection(agent: Agent) -> None:
     """Re-apply the run's tool selection to the agent's current tool set."""
     selection = getattr(agent, "_tool_selection", None)
-    if selection is None:
-        return
-    agent.tools[:] = [tool for tool in agent.tools if selection.keeps(tool.name)]
+    if selection is not None:
+        agent.tools[:] = [tool for tool in agent.tools if selection.keeps(tool.name)]
+    session = getattr(agent, "_tool_search_session", None)
+    loaded = (session.latest_custom(TOOL_SEARCH_STORE_TYPE) or {}).get("loaded", []) if session else getattr(agent, "_loaded_tools", [])
     # Kept MCP tools stay executable for codemode but are not declared to the
     # model when the allowlist did not name them.
     for tool in agent.tools:
-        tool.declared = selection.declares(tool.name)
+        selected = tool.declared if selection is None else selection.declares(tool.name)
+        if tool.exposure in ("deferred", "codemode"):
+            tool.declared = tool.name in loaded
+        else:
+            tool.declared = selected
+            if not selected and is_mcp_tool_name(tool.name):
+                tool.exposure = "codemode"
+                tool.declared = tool.name in loaded
+    refresh_system_prompt(agent)
 
 
 def skill_file_read_tool(agent: Agent) -> Optional[str]:
-    """The declared tool that loads skill files: read, bash, or None when neither is
-    declared and the skills hint names no tool at all."""
+    """The tool that loads skill files.
 
-    declared = {tool.name for tool in agent.tools}
+    ``read``/``bash`` when declared; ``indirect`` when either is active but
+    hidden (reachable through codemode); None when neither is available at all.
+    """
+
+    declared = {tool.name for tool in agent.tools if tool.declared}
     if "read" in declared:
         return "read"
     if "bash" in declared:
         return "bash"
+    active = {tool.name for tool in agent.tools}
+    if "read" in active or "bash" in active:
+        return "indirect"
     return None
+
+
+def refresh_system_prompt(agent: Agent) -> None:
+    """Rebuild the tool list, rules and skills hint from the current loadout.
+
+    Hidden tools are selected but not declared: they leave the tool list and
+    rules while codemode still reaches them. Called after MCP refreshes,
+    extension reloads and selection changes.
+    """
+
+    options = getattr(agent, "_system_prompt_options", None)
+    if options is None:
+        return
+    tools = agent.tools
+    for tool in tools:
+        refresh = getattr(tool, "_codemode_refresh", None)
+        if refresh is not None:
+            refresh()
+    snippets, guidelines = tool_prompt_contributions(tools)
+    options.selected_tools = [tool.name for tool in tools]
+    options.hidden_tools = [tool.name for tool in tools if not tool.declared]
+    options.tool_snippets = snippets
+    options.tool_guidelines = guidelines
+    prompt = build_system_prompt(options)
+    agent.system_prompt = prompt
+    if agent.messages and getattr(agent.messages[0], "role", None) == "system":
+        agent.messages[0].content = prompt
+        resources = getattr(agent, "_resources", None)
+        if resources is not None:
+            agent.messages[0].sections = {
+                **(agent.messages[0].sections or {}),
+                "skills": resources.system_prompt(file_read_tool=skill_file_read_tool(agent)) or None,
+            }
 
 
 def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegistry] = None,
@@ -248,7 +297,10 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
     if selection is not None:
         tools = [tool for tool in tools if selection.keeps(tool.name)]
     snippets, guidelines = tool_prompt_contributions(tools)
-    options = SystemPromptOptions(cwd=cwd, selected_tools=[tool.name for tool in tools], tool_snippets=snippets, tool_guidelines=guidelines)
+    options = SystemPromptOptions(
+        cwd=cwd, selected_tools=[tool.name for tool in tools],
+        hidden_tools=[tool.name for tool in tools if not tool.declared],
+        tool_snippets=snippets, tool_guidelines=guidelines)
     system_prompt = build_system_prompt(options)
     agent = Agent(model=model, tools=tools, system_prompt=system_prompt,
                  thinking_level=args.thinking or os.environ.get("PI_PY_THINKING") or settings.get("thinking", "off"),
@@ -257,10 +309,25 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
                  block_images=bool(image_settings.get("block_images", False)),
                  retry=RetryPolicy(**settings.get("retry", {})))
     apply_attribution(model, settings)
-    # Kept on the agent so every later tool change re-applies the same selection.
+    # Kept on the agent so every later tool change re-applies the same selection
+    # and rebuilds the prompt from the new loadout.
     agent._tool_selection = selection
+    agent._system_prompt_options = options
     current_agent["agent"] = agent
+    agent._loaded_tools = []
+    def activate_tools(names: List[str]) -> None:
+        loaded = list(dict.fromkeys([tool.name for tool in agent.tools
+                                    if tool.declared and tool.exposure in ("deferred", "codemode")] + names))
+        session = getattr(agent, "_tool_search_session", None)
+        if session is not None:
+            session.append_custom(TOOL_SEARCH_STORE_TYPE, {"loaded": loaded})
+        agent._loaded_tools = loaded
+        apply_tool_selection(agent)
+    agent._activate_searched_tools = activate_tools
+    if selection is not None and selection.allowed is not None and selection.keeps("tool_search"):
+        agent.tools.append(create_tool_search_tool(agent.tools, activate_tools))
     resources = resources or ResourceCatalog(registry.config)
+    agent._resources = resources
     agent.messages[0].sections = {"skills": resources.system_prompt(file_read_tool=skill_file_read_tool(agent)) or None}
     return agent
 
@@ -320,7 +387,8 @@ class CliRenderer:
                 if text.strip():
                     if self.extensions is not None:
                         text = await self.extensions.transform_markdown(text, "assistant")
-                    print("\n" + render_markdown(text), flush=True)
+                    theme = MONO_THEME if self.settings.get("theme") == "mono" else None
+                    print("\n" + render_markdown(text, theme=theme), flush=True)
             for block in event.message.content:
                 if isinstance(block, ImageContent):
                     self.print_image_block(block)
@@ -622,9 +690,11 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             sync_mcp_tools(agent, mcp)
                         elif parts and parts[0] == "login" and len(parts) > 1:
                             await mcp.oauth_login(parts[1])
+                            sync_mcp_tools(agent, mcp)
                             print(f"credentials saved for MCP server {parts[1]}")
                         elif parts and parts[0] == "logout" and len(parts) > 1:
-                            mcp.oauth_logout(parts[1])
+                            await mcp.oauth_logout(parts[1])
+                            sync_mcp_tools(agent, mcp)
                             print(f"credentials removed for MCP server {parts[1]}")
                         for name, client in mcp.clients.items():
                             state = "lazy" if name in mcp.lazy_servers else f"connected, {len(client.tools)} tools"
@@ -792,6 +862,10 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             if ui and ui.full_screen:
                                 extensions.set_ui_sink(ui.ui_request)
                             registry.register_extension_providers(extensions.all_providers())
+                        for tool in agent.tools:
+                            update = getattr(tool, "_codemode_update_settings", None)
+                            if update is not None:
+                                update(registry.config.settings.get("codemode", {}))
                         apply_tool_selection(agent)
                         if resources:
                             # The skills hint follows the tools that are declared now.
@@ -812,6 +886,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         session.append(message)
                 restore_compaction(agent.compactor, agent.messages,
                                    session.latest_custom("compaction") if session else None)
+                agent._loaded_tools = []
+                apply_tool_selection(agent)
                 print("conversation cleared")
                 continue
             if command == "/export-ts":
@@ -1354,6 +1430,7 @@ def handle_session_command(command: str, argument: str, agent: Agent,
         print(session.export(argument))
     if command in ("/resume", "/tree", "/fork", "/clone") and (argument or command in ("/fork", "/clone")):
         restore_compaction(agent.compactor, agent.messages, session.latest_custom("compaction"))
+        apply_tool_selection(agent)
 
 
 async def render_custom_entries(session: SessionManager, extensions: ExtensionManager) -> None:
@@ -1397,6 +1474,12 @@ def sync_mcp_tools(agent: Agent, mcp: Optional[McpManager]) -> None:
     for tool in mcp.tools:
         tool._mcp_managed = True
     agent.tools[:] = [tool for tool in agent.tools if not getattr(tool, "_mcp_managed", False)] + list(mcp.tools)
+    selection = getattr(agent, "_tool_selection", None)
+    activate = getattr(agent, "_activate_searched_tools", None)
+    if (activate and any(tool.exposure == "deferred" for tool in mcp.tools)
+            and (selection is None or selection.keeps("tool_search"))
+            and not any(tool.name == "tool_search" for tool in agent.tools)):
+        agent.tools.append(create_tool_search_tool(agent.tools, activate))
     apply_tool_selection(agent)
 
 
@@ -1581,6 +1664,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                               session_id=os.path.basename(session.session_file or ""))
 
     renderer = CliRenderer(settings=registry.config.settings)
+    agent._tool_search_session = session
 
     # --no-mcp disables built-in MCP support: no servers connect, no MCP tools,
     # and extensions see no MCP manager to register servers on.

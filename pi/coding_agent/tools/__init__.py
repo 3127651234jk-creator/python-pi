@@ -35,6 +35,24 @@ __all__ = [
 ]
 
 
+PROMPT_SNIPPETS = {
+    "read": READ_PROMPT_SNIPPET,
+    "bash": BASH_PROMPT_SNIPPET,
+    "edit": EDIT_PROMPT_SNIPPET,
+    "write": WRITE_PROMPT_SNIPPET,
+    "grep": GREP_PROMPT_SNIPPET,
+    "find": FIND_PROMPT_SNIPPET,
+    "ls": LS_PROMPT_SNIPPET,
+    "powershell": POWERSHELL_PROMPT_SNIPPET,
+}
+
+PROMPT_GUIDELINES = {
+    "read": list(READ_PROMPT_GUIDELINES),
+    "edit": list(EDIT_PROMPT_GUIDELINES),
+    "write": list(WRITE_PROMPT_GUIDELINES),
+}
+
+
 def create_default_tools(
     cwd: str,
     get_model: Optional[Callable[[], Any]] = None,
@@ -45,7 +63,7 @@ def create_default_tools(
     ``get_model``/``image_settings`` are passed to the read tool for per-model
     image resize profiles and live ``images`` settings.
     """
-    return [
+    tools = [
         create_read_tool(cwd, get_model=get_model, image_settings=image_settings),
         create_bash_tool(cwd),
         create_edit_tool(cwd),
@@ -55,27 +73,17 @@ def create_default_tools(
         create_ls_tool(cwd),
         create_powershell_tool(cwd),
     ]
+    # Carry the contributions on the tool so extensions and codemode can read
+    # them from the same place, including when a tool is hidden.
+    for tool in tools:
+        tool.prompt_snippet = PROMPT_SNIPPETS.get(tool.name, "")
+        tool.prompt_guidelines = list(PROMPT_GUIDELINES.get(tool.name, []))
+    return tools
 
 
 def tool_prompt_contributions(tools: List[AgentTool]) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     """Snippet and guideline contributions for the system prompt, by tool name."""
-    snippets = {
-        "read": READ_PROMPT_SNIPPET,
-        "bash": BASH_PROMPT_SNIPPET,
-        "edit": EDIT_PROMPT_SNIPPET,
-        "write": WRITE_PROMPT_SNIPPET,
-        "grep": GREP_PROMPT_SNIPPET,
-        "find": FIND_PROMPT_SNIPPET,
-        "ls": LS_PROMPT_SNIPPET,
-        "powershell": POWERSHELL_PROMPT_SNIPPET,
-    }
-    guidelines: Dict[str, List[str]] = {
-        "read": list(READ_PROMPT_GUIDELINES),
-        "edit": list(EDIT_PROMPT_GUIDELINES),
-        "write": list(WRITE_PROMPT_GUIDELINES),
-    }
-    selected = {t.name for t in tools}
     return (
-        {name: text for name, text in snippets.items() if name in selected},
-        {name: rules for name, rules in guidelines.items() if name in selected},
+        {tool.name: tool.prompt_snippet for tool in tools if tool.prompt_snippet},
+        {tool.name: list(tool.prompt_guidelines) for tool in tools if tool.prompt_guidelines},
     )

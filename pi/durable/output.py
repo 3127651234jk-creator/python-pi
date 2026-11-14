@@ -1,15 +1,17 @@
-"""Tool output bounding (port of ``harness/output.ts``, runtime parts).
+"""Tool output bounding and adaptive progress commits (port of ``harness/output.ts``).
 
-Retention limits of one tool's output, exact slicing within the limits, and a
-bounded running output buffer. Progress commits (``Progress``) are not ported;
-the Python harness has no output-commit surface yet.
+Retention limits of one tool's output, exact slicing within the limits, a
+bounded running output buffer, and the ``Progress`` throttle that commits
+partial answers and running tool output.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Awaitable, Callable, List, Optional, Union
 
 from .env import ShellOutputSkip, range_decoder
 from .truncate import utf8_byte_length
@@ -250,6 +252,9 @@ class OutputBuffer:
     def snapshot(self) -> BoundedOutput:
         """Retained, sanitized output and what the limits dropped from the whole stream."""
         stored = "".join(chunk["text"] for chunk in self._chunks)
+        return self._snapshot_stored(stored)
+
+    def _snapshot_stored(self, stored: str) -> BoundedOutput:
         kept = bound_output(stored, self._limits)
         stored_lines = _lines(self._stored_newlines, stored == "" or stored.endswith("\n"))
         kept_lines = stored_lines - kept.dropped_lines
@@ -266,3 +271,118 @@ class OutputBuffer:
             dropped_bytes=self._total_bytes - kept.bytes,
             dropped_lines=_lines(self._total_newlines, self._ends_with_newline) - kept_lines,
         )
+
+
+PROGRESS_BYTES_PER_SECOND = 100 * 1024
+
+
+class Progress:
+    """Adaptive progress commits (port of the TS ``Progress``).
+
+    The first change after an idle period commits at once. Each commit then
+    delays the next by at least ``min_interval_ms`` and by the bytes it wrote at
+    100 KiB/s. At most one commit is in flight; changes made meanwhile coalesce
+    into the next one. ``stop()`` cancels the timer, waits for the in-flight
+    commit, and returns the waiters the final transaction must settle.
+    """
+
+    def __init__(
+        self,
+        write: Callable[[], Awaitable[int]],
+        on_error: Callable[[BaseException], None],
+        min_interval_ms: float,
+        clock: Callable[[], float] = time.monotonic,
+        schedule: Optional[Callable[[float, Callable[[], None]], Any]] = None,
+    ) -> None:
+        self._write = write
+        self._on_error = on_error
+        self._min_interval_ms = float(min_interval_ms)
+        self._clock = clock
+        self._schedule_fn = schedule or self._default_schedule
+        self._waiters: List[asyncio.Future] = []
+        self._timer: Any = None
+        self._in_flight: Optional[asyncio.Task] = None
+        self._next_at = 0.0
+        self._dirty = False
+        self._stopped = False
+
+    @staticmethod
+    def _default_schedule(delay: float, callback: Callable[[], None]) -> Any:
+        return asyncio.get_running_loop().call_later(max(0.0, delay), callback)
+
+    def mark(self) -> None:
+        self._dirty = True
+        self._schedule()
+
+    def mark_and_wait(self) -> "asyncio.Future":
+        """Schedule a commit; the future settles with the commit including this change."""
+
+        future = asyncio.get_running_loop().create_future()
+        self._waiters.append(future)
+        self.mark()
+        return future
+
+    async def stop(self) -> List["asyncio.Future"]:
+        """Stop committing, await the in-flight commit, and return pending waiters."""
+
+        self._stopped = True
+        if self._timer is not None:
+            try:
+                self._timer.cancel()
+            except Exception:  # noqa: BLE001 - injected schedulers may not cancel
+                pass
+            self._timer = None
+        if self._in_flight is not None:
+            await asyncio.shield(self._in_flight)
+        waiters, self._waiters = self._waiters, []
+        return waiters
+
+    def _schedule(self) -> None:
+        if self._stopped or self._timer is not None or self._in_flight is not None:
+            return
+        wait = self._next_at - self._clock()
+        if wait <= 0:
+            self._flush()
+        else:
+            self._timer = self._schedule_fn(wait, self._on_timer)
+
+    def _on_timer(self) -> None:
+        self._timer = None
+        self._flush()
+
+    def _flush(self) -> None:
+        if self._stopped or not self._dirty:
+            return
+        self._dirty = False
+        waiters, self._waiters = self._waiters, []
+        started = self._clock()
+
+        async def run() -> None:
+            try:
+                written = await self._write()
+                written = int(written or 0)
+            except BaseException as exc:  # noqa: BLE001 - delivered through waiters and on_error
+                self._next_at = started + self._min_interval_ms / 1000.0
+                for waiter in waiters:
+                    if not waiter.done():
+                        waiter.set_exception(exc)
+                try:
+                    self._on_error(exc)
+                except Exception:  # noqa: BLE001 - reporting must not break the throttle
+                    pass
+                return
+            delay_ms = max(self._min_interval_ms, written * 1000.0 / PROGRESS_BYTES_PER_SECOND)
+            self._next_at = started + delay_ms / 1000.0
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
+
+        task = asyncio.ensure_future(run())
+        self._in_flight = task
+
+        def finished(_task: asyncio.Task) -> None:
+            self._in_flight = None
+            if self._dirty and not self._stopped:
+                self._schedule()
+
+        task.add_done_callback(finished)

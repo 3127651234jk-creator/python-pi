@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "httpx>=0.27",
     "Pillow>=9.2",
+    "Pygments==2.21.0",
     "PyYAML==6.0.3",
     "prompt_toolkit==3.0.52",
     "wcwidth==0.2.13",
@@ -26,6 +27,9 @@ pi = "pi.coding_agent.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pi*"]
+
+[tool.setuptools.package-data]
+"pi.env" = ["bin/*/pi-env", "bin/*/pi-env.exe", "bin/*/manifest.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

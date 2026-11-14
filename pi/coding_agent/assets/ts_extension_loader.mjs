@@ -518,6 +518,9 @@ const pi = {
 			description: definition.description ?? "",
 			parameters: definition.parameters ?? { type: "object", properties: {} },
 			outputSchema: definition.outputSchema,
+			promptSnippet: definition.promptSnippet,
+			promptGuidelines: definition.promptGuidelines,
+			exposure: definition.exposure,
 			handlerId,
 			rendererId: definition.renderCall || definition.renderResult ? `${handlerId}:renderer` : undefined,
 		});

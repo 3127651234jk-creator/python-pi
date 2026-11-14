@@ -55,6 +55,12 @@ class AgentTool(Tool):
     # registered for codemode scripts and nested calls only: the model never
     # receives its declaration and a top-level call to it is rejected.
     declared: bool = True
+    exposure: Literal["direct", "deferred", "codemode", "model-only"] = "direct"
+    # One-line entry for the default system prompt's tool list. Empty omits it.
+    prompt_snippet: str = ""
+    # Guideline bullets for the system prompt; hidden tools leave them out and
+    # codemode shows them with the tool's declaration instead.
+    prompt_guidelines: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.label:

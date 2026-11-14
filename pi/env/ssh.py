@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -483,7 +484,19 @@ async def detect_platform(target: SshTarget) -> RemotePlatform:
 def packaged_daemon(remote: RemotePlatform) -> str:
     """The daemon binary this package ships for a remote system."""
     name = f"pi-env-{remote.platform}-{remote.arch}"
-    return os.path.join(package_root(), "env", "bin", name, "pi-env.exe" if remote.platform == "windows" else "pi-env")
+    binary = os.path.join(package_root(), "env", "bin", name, "pi-env.exe" if remote.platform == "windows" else "pi-env")
+    manifest_file = os.path.join(os.path.dirname(binary), "manifest.json")
+    if not os.path.isfile(binary):
+        raise RuntimeError(f"No bundled daemon for {remote.platform}-{remote.arch}; install a daemon distribution or pass binary=")
+    with open(manifest_file, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if (manifest.get("platform"), manifest.get("arch"), manifest.get("protocol")) != (remote.platform, remote.arch, 1):
+        raise RuntimeError("Bundled daemon manifest does not match the target platform/protocol")
+    with open(binary, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    if manifest.get("sha256") != digest:
+        raise RuntimeError("Bundled daemon checksum mismatch")
+    return binary
 
 
 def quote_posix(text: str) -> str:

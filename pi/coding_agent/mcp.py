@@ -26,7 +26,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -34,7 +34,30 @@ from ..agent.types import AgentTool, AgentToolResult
 from ..ai.models import ModelError
 from ..ai.types import TextContent, ImageContent
 from .config import Configuration, read_json, write_json
+from .mcp_oauth import (
+    REFRESH_REQUEST_TIMEOUT_SECONDS,
+    McpAuthorizationRequired,
+    McpLoginRequired,
+    McpOAuthError,
+    OAuthIssuerMismatchError,
+    callback_settings,
+    client_metadata,
+    discover_authorization_server_metadata,
+    discover_oauth_server_info,
+    exchange_authorization_code,
+    merge_scopes,
+    oauth_settings,
+    parse_www_authenticate,
+    record_from_tokens,
+    refresh_authorization,
+    register_client,
+    select_resource,
+    start_authorization,
+    static_client,
+    validate_oauth_settings,
+)
 from .model_registry import expand, validate_url
+from .oauth_callback import start_oauth_callback_server
 
 RESOURCE_TOOLS = ("list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource")
 
@@ -121,78 +144,6 @@ def oauth_key(namespace: str, url: str) -> str:
     return namespace + "|" + url
 
 
-async def oauth_refresh(oauth: dict, credential: dict) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(oauth["token_url"], data={
-            "grant_type": "refresh_token", "client_id": oauth["client_id"],
-            "refresh_token": credential["refresh"],
-        })
-    if response.status_code >= 400:
-        raise RuntimeError(f"MCP OAuth refresh failed (HTTP {response.status_code})")
-    data = response.json()
-    access, expires = data.get("access_token"), data.get("expires_in", 3600)
-    if not isinstance(access, str) or not access:
-        raise RuntimeError("MCP OAuth refresh returned no access token")
-    return {"access": access, "refresh": data.get("refresh_token", credential.get("refresh", "")),
-            "expires": time.time() + float(expires)}
-
-
-async def oauth_login(oauth: dict, notify, url: str) -> dict:
-    """Interactive authorization-code + PKCE flow with a loopback callback."""
-    verifier = secrets.token_urlsafe(48)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    port = int(oauth.get("callback_port", 0))
-    path = "/callback"
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-
-    async def callback(reader, writer):
-        try:
-            request = await asyncio.wait_for(reader.readline(), 10)
-            parts = request.decode("ascii", "replace").split(" ")
-            target = urlsplit(parts[1]) if len(parts) == 3 else None
-            params = parse_qs(target.query) if target else {}
-            code = params.get("code", [""])[0]
-            returned_state = params.get("state", [""])[0]
-            if target and target.path == path and code and returned_state == state and not future.done():
-                future.set_result(code)
-                writer.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 18\r\n\r\nReturn to terminal")
-            else:
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            await writer.drain()
-        except (ValueError, asyncio.TimeoutError, ConnectionError):
-            pass
-        finally:
-            writer.close()
-
-    server = await asyncio.start_server(callback, "127.0.0.1", port)
-    try:
-        actual_port = server.sockets[0].getsockname()[1]
-        redirect = f"http://127.0.0.1:{actual_port}{path}"
-        state = secrets.token_urlsafe(16)
-        authorize = oauth["authorize_url"] + ("&" if "?" in oauth["authorize_url"] else "?") + urlencode({
-            "response_type": "code", "client_id": oauth["client_id"],
-            "redirect_uri": redirect, "scope": oauth.get("scope", ""),
-            "state": state, "code_challenge": challenge,
-            "code_challenge_method": "S256", "resource": url,
-        })
-        notify(f"MCP authorization required for {url}\nOpen: {authorize}")
-        code = await asyncio.wait_for(future, float(oauth.get("timeout", 600)))
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(oauth["token_url"], data={
-                "grant_type": "authorization_code", "client_id": oauth["client_id"], "code": code,
-                "redirect_uri": redirect, "code_verifier": verifier})
-        if response.status_code >= 400:
-            raise RuntimeError(f"MCP OAuth exchange failed (HTTP {response.status_code})")
-        data = response.json()
-        access = data.get("access_token")
-        if not isinstance(access, str) or not access:
-            raise RuntimeError("MCP OAuth exchange returned no access token")
-        return {"access": access, "refresh": data.get("refresh_token", ""),
-                "expires": time.time() + float(data.get("expires_in", 3600))}
-    finally:
-        server.close()
-        await server.wait_closed()
 
 
 class McpClient:
@@ -216,15 +167,17 @@ class McpClient:
         # Set by close(); a connect in progress checks it between stages and aborts
         # before doing any I/O on a transport the shutdown already closed.
         self.shutdown = asyncio.Event()
+        # One teardown shared by every caller: a second close() must wait for the
+        # first cleanup instead of returning early because the fields were cleared.
+        self._close_task: Optional[asyncio.Task] = None
 
     @property
     def closed(self) -> bool:
         return self.shutdown.is_set()
 
     def bearer(self) -> str:
-        oauth = self.config.get("oauth")
-        if not oauth:
-            return ""
+        # Automatic OAuth (a 401 without an ``oauth`` config block) still stores a
+        # credential; servers configured with an Authorization header never get one.
         return self.credential.get("access", "") if getattr(self, "credential", None) else ""
 
     async def connect(self, auth_header: str = ""):
@@ -252,7 +205,7 @@ class McpClient:
             if self.closed:
                 # close() ran while the process was being spawned; tear it down
                 # instead of leaving a live server nobody will talk to.
-                await self._teardown_transports()
+                await self.close()
                 raise RuntimeError(f"MCP server {self.name} is closed")
             self.pump_task = asyncio.create_task(self._stdio_pump())
             async def drain():
@@ -266,7 +219,7 @@ class McpClient:
                 headers["Authorization"] = "Bearer " + auth_header
             self.http = httpx.AsyncClient(timeout=self.config.get("timeout", 60), headers=headers)
             if self.closed:
-                await self._teardown_transports()
+                await self.close()
                 raise RuntimeError(f"MCP server {self.name} is closed")
         try:
             result = await self.request("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
@@ -274,7 +227,7 @@ class McpClient:
         except BaseException:
             # A failed or cancelled connect must not leave the transport open:
             # cancelling the pump alone keeps a spawned stdio server running.
-            await self._teardown_transports()
+            await self.close()
             raise
         self.version = result.get("protocolVersion", "2025-03-26")
         capabilities = result.get("capabilities", {}) or {}
@@ -463,8 +416,12 @@ class McpClient:
         if self.bearer():
             headers["Authorization"] = "Bearer " + self.bearer()
         async with self.http.stream("POST", self.config["url"], json=message, headers=headers) as response:
-            if response.status_code == 401 or response.status_code == 403:
-                raise RuntimeError(f"MCP authorization required (HTTP {response.status_code})")
+            if response.status_code in (401, 403):
+                # Keep the status and WWW-Authenticate challenge: discovery and
+                # sign-in need the advertised resource metadata URL and scope.
+                raise McpAuthorizationRequired(
+                    response.status_code,
+                    parse_www_authenticate(response.headers.get("www-authenticate")))
             if response.status_code >= 400:
                 raise RuntimeError(f"MCP HTTP {response.status_code}")
             self.session_id = response.headers.get("Mcp-Session-Id", self.session_id)
@@ -526,10 +483,18 @@ class McpClient:
     async def close(self):
         """Close the transport; resolves once nothing of this server is open, including a
         transport that was still connecting: an in-flight initialize fails against the
-        closed transport and the connect aborts."""
+        closed transport and the connect aborts.
+
+        Concurrent callers share one teardown task, so a second close waits for the
+        cleanup the first started rather than returning once the fields look empty.
+        """
 
         self.shutdown.set()
-        await self._teardown_transports()
+        if self._close_task is None:
+            self._close_task = asyncio.ensure_future(self._teardown_transports())
+        # Shield the shared task: a cancelled caller must not abort cleanup that a
+        # concurrent close (or the manager) is still waiting for.
+        await asyncio.shield(self._close_task)
 
     async def _teardown_transports(self) -> None:
         """Stop the pump and close the HTTP client or stdio process. Idempotent: a connect
@@ -579,6 +544,37 @@ class McpManager:
         self._reconnect_locks: Dict[str, asyncio.Lock] = {}
         self.extension_servers: Dict[str, dict] = {}
         self.extension_server_owners: Dict[str, str] = {}
+        # Lifecycle: every reload opens a new generation. A close invalidates the
+        # current generation before waiting, so a connect that finishes late cannot
+        # register a client into the generation the caller just shut down.
+        # Created on first async use: asyncio.Lock() binds to the running loop, and a
+        # manager may be constructed before the loop exists (Python 3.9).
+        self._state_lock: Optional[asyncio.Lock] = None
+        self._reload_lock: Optional[asyncio.Lock] = None
+        self._generation = 0
+        self._active = True
+        # id(client) -> (client, task) for connects that have not settled yet.
+        self._opening: Dict[int, tuple] = {}
+        # Notification-triggered refreshes, cancelled and awaited by close().
+        self._refresh_tasks: set = set()
+        # Close tasks still running; a concurrent close waits for these too.
+        self._cleanup_tasks: set = set()
+        # OAuth: servers that failed for lack of a usable grant stay loginable, and
+        # refreshes share one lock per credential so a rotated refresh token is not
+        # spent twice. Logout bumps the epoch to discard late refresh results.
+        self.login_servers: Dict[str, dict] = {}
+        self.login_challenges: Dict[str, dict] = {}
+        self._oauth_locks: Dict[str, asyncio.Lock] = {}
+        self._oauth_tasks: set = set()
+        self._oauth_epoch: Dict[str, int] = {}
+
+    def _ensure_locks(self) -> None:
+        """Create the lifecycle locks inside the running loop (Python 3.9 binding)."""
+
+        if self._state_lock is None:
+            self._state_lock = asyncio.Lock()
+        if self._reload_lock is None:
+            self._reload_lock = asyncio.Lock()
 
     def _log_message(self, server: str, params: dict) -> None:
         """Append one ``notifications/message`` to mcp.log; continuation lines are indented."""
@@ -599,9 +595,18 @@ class McpManager:
             pass
 
     async def reload(self):
-        await self.close()
-        self.errors, self.tools = {}, []
-        self._refresh_locks = {}
+        self._ensure_locks()
+        async with self._reload_lock:
+            await self._close_all()
+            async with self._state_lock:
+                self._generation += 1
+                generation = self._generation
+                self._active = True
+                self.errors, self.tools = {}, []
+                self._refresh_locks = {}
+            await self._reload_servers(generation)
+
+    async def _reload_servers(self, generation: int) -> None:
         servers = {}
         paths = [self.config.agent_dir / "mcp.json"]
         if self.config.project_trusted:
@@ -634,6 +639,8 @@ class McpManager:
                 if settings.get("type") not in (None, "stdio", "http", "streamable-http"):
                     raise ValueError("Unsupported MCP transport")
                 timeout = settings.get("timeout", 60)
+                if settings.get("exposure", "direct") not in ("direct", "deferred", "codemode"):
+                    raise ValueError("exposure must be direct, deferred, or codemode")
                 if type(timeout) not in (int, float) or not 0 < timeout <= 86400:
                     raise ValueError("timeout must be between 0 and 86400 seconds")
                 if "command" in settings and (not isinstance(settings["command"], str) or not isinstance(settings.get("args", []), list) or not all(isinstance(arg, str) for arg in settings.get("args", []))):
@@ -654,36 +661,46 @@ class McpManager:
                     validate_url(settings["url"])
                 oauth = settings.get("oauth")
                 if oauth is not None:
-                    if not isinstance(oauth, dict) or not all(isinstance(oauth.get(k), str) and oauth[k]
-                                                              for k in ("authorize_url", "token_url", "client_id")):
-                        raise ValueError("MCP oauth requires authorize_url, token_url and client_id")
-                    for key in ("authorize_url", "token_url"):
-                        validate_url(oauth[key])
+                    if not isinstance(oauth, dict):
+                        raise ValueError("oauth must be an object")
+                    # Static endpoints remain optional: without them the endpoints are
+                    # discovered from the server's 401 challenge and metadata documents.
+                    validate_oauth_settings(oauth)
                 client = McpClient(name, settings, self.config.cwd)
                 if client.lazy and "url" not in settings:
                     raise ValueError("lazy tool discovery requires an HTTP server")
-                await self._connect_client(client, namespace)
-                self.clients[name] = client
-                if client.lazy:
-                    self.lazy_servers.add(name)
-                else:
-                    self._register_server_tools(namespace, client)
+                # Registered as opening before the first await, so a concurrent
+                # close can signal it and wait for it to settle.
+                await self._open_client(client, namespace, generation, register_name=name)
+                async with self._state_lock:
+                    if not self._active or generation != self._generation:
+                        raise RuntimeError(f"MCP server {name} connection cancelled")
+                    if client.lazy:
+                        self.lazy_servers.add(name)
+                    else:
+                        self._register_server_tools(namespace, client)
                 if client.tools_changed:
                     # A list_changed notification raced the connect; list again now that
                     # the client is registered.
-                    await self.ensure_tools(name)
+                    await self.ensure_tools(name, generation)
             except asyncio.CancelledError:
                 # A cancelled reload must not leave the half-opened transport running.
                 if client:
                     await client.close()
                 raise
             except Exception as exc:  # noqa: BLE001 - one invalid server must not abort reload
-                self.errors[name] = str(exc) or type(exc).__name__
+                if self._active and generation == self._generation:
+                    self.errors[name] = str(exc) or type(exc).__name__
                 if client:
                     await client.close()
-                self.clients.pop(name, None)
-                self.tools = [tool for tool in self.tools if not getattr(tool, "_mcp_server", None) == name]
-        self._register_resource_tools()
+                async with self._state_lock:
+                    if self.clients.get(name) is client:
+                        self.clients.pop(name, None)
+                        self.tools = [tool for tool in self.tools
+                                      if not getattr(tool, "_mcp_server", None) == name]
+        async with self._state_lock:
+            if self._active and generation == self._generation:
+                self._register_resource_tools()
 
     async def register_extension_server(self, name: str, settings: dict, owner: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -720,40 +737,209 @@ class McpManager:
                  "extensionPath": self.extension_server_owners[name]}
                 for name, config in self.extension_servers.items()]
 
+    async def _open_client(self, client: McpClient, namespace: str, generation: int,
+                           register_name: Optional[str] = None) -> None:
+        """Connect a client registered as opening for ``generation``.
+
+        The registration and the move into ``clients`` happen under the state lock,
+        so close() sees every connect either as opening or as registered and never
+        misses one that finished in between. A client whose generation was closed
+        while connecting is not registered; the caller closes it.
+        """
+
+        self._ensure_locks()
+        async with self._state_lock:
+            if not self._active or generation != self._generation:
+                raise RuntimeError(f"MCP server {client.name} connection cancelled")
+            self._opening[id(client)] = (client, asyncio.current_task())
+        try:
+            await self._connect_client(client, namespace)
+            async with self._state_lock:
+                if not self._active or generation != self._generation:
+                    raise RuntimeError(f"MCP server {client.name} connection cancelled")
+                if register_name is not None:
+                    self.clients[register_name] = client
+        finally:
+            async with self._state_lock:
+                self._opening.pop(id(client), None)
+
+    @staticmethod
+    def _uses_oauth(settings: dict) -> bool:
+        """HTTP servers authenticate with OAuth unless the config supplies Authorization."""
+
+        if "url" not in settings:
+            return False
+        headers = settings.get("headers") or {}
+        return not any(str(name).lower() == "authorization" for name in headers)
+
+    @staticmethod
+    def _oauth_key(server: str, settings: dict) -> str:
+        return oauth_key(re.sub(r"[^A-Za-z0-9_]", "_", server), settings["url"])
+
+    def _remember_login(self, server: str, settings: dict, challenge: Optional[dict] = None) -> None:
+        # The failed client is removed from ``clients``, so sign-in needs the config
+        # (and the challenge's scope/resource metadata) kept separately.
+        self.login_servers[server] = dict(settings)
+        if challenge:
+            self.login_challenges[server] = dict(challenge)
+
+    @staticmethod
+    def _login_message(server: str) -> str:
+        return f'MCP server "{server}" requires sign-in. Run /mcp login {server}'
+
     async def _connect_client(self, client: McpClient, namespace: str) -> None:
         """Connect with OAuth credentials when configured; never auto-launches a browser."""
         client.credential = None
         client.on_log_message = self._log_message
-        client.on_tools_changed = self._handle_tools_changed
+        client.on_tools_changed = self._schedule_tools_changed
         auth_header = ""
-        oauth = client.config.get("oauth")
-        if oauth and "url" in client.config:
-            key = oauth_key(namespace, client.config["url"])
-            record = self.oauth_store.get(key)
+        if self._uses_oauth(client.config):
+            key = self._oauth_key(client.name, client.config)
+            try:
+                record = await self._initial_credential(client.name, client.config)
+            except McpLoginRequired:
+                record = self.oauth_store.get(key)
+            except (McpOAuthError, httpx.HTTPError, ValueError, OSError):
+                # A refresh failure must not block the connection: send the stored
+                # token and let the server's 401 decide whether sign-in is needed.
+                record = self.oauth_store.get(key)
             if record.get("access"):
                 client.credential = record
-                if record.get("expires", 0) <= time.time() + 60:
-                    if record.get("refresh"):
-                        record = await oauth_refresh(oauth, record)
-                        self.oauth_store.set(key, record)
-                        client.credential = record
-                    else:
-                        raise RuntimeError("MCP OAuth token expired; run /mcp login")
                 auth_header = record["access"]
-            else:
-                client.needs_login = True
-        await client.connect(auth_header)
+        try:
+            await client.connect(auth_header)
+        except McpAuthorizationRequired as exc:
+            client.needs_login = True
+            client.challenge = exc.challenge
+            # Discover endpoints from the challenge now, so sign-in does not have to
+            # and `/mcp` can report a loginable server. No browser is started here.
+            key = self._oauth_key(client.name, client.config)
+            record = self.oauth_store.get(key)
+            try:
+                async with httpx.AsyncClient(timeout=30) as http:
+                    discovery = await self._discover_oauth(client.config, record, exc.challenge, http)
+                self.oauth_store.set(key, {**record, "discovery": discovery})
+            except (McpOAuthError, httpx.HTTPError, ValueError, OSError):
+                pass
+            self._remember_login(client.name, client.config, exc.challenge)
+            raise McpLoginRequired(self._login_message(client.name)) from None
+
+    async def _initial_credential(self, server: str, settings: dict) -> dict:
+        record = self.oauth_store.get(self._oauth_key(server, settings))
+        expires = record.get("expires")
+        if record.get("access") and (expires is None or expires > time.time() + 30):
+            return record
+        if record.get("refresh"):
+            return await self._refresh_tracked(server, settings, record)
+        return record
+
+    def _oauth_task_done(self, task: asyncio.Task) -> None:
+        self._oauth_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _refresh_tracked(self, server: str, settings: dict, record: dict,
+                               challenge: Optional[dict] = None) -> dict:
+        """Run a refresh as a task so close() can wait for a token rotation to be saved."""
+
+        task = asyncio.ensure_future(self._refresh_oauth(server, settings, record, challenge))
+        self._oauth_tasks.add(task)
+        task.add_done_callback(self._oauth_task_done)
+        return await asyncio.shield(task)
+
+    async def _refresh_oauth(self, server: str, settings: dict, record: dict,
+                             challenge: Optional[dict] = None) -> dict:
+        oauth = settings.get("oauth") or {}
+        key = self._oauth_key(server, settings)
+        lock = self._oauth_locks.setdefault(key, asyncio.Lock())
+        epoch = self._oauth_epoch.get(key, 0)
+        async with lock:
+            latest = self.oauth_store.get(key)
+            if epoch != self._oauth_epoch.get(key, 0):
+                raise McpLoginRequired(self._login_message(server))
+            if latest.get("access") and latest.get("access") != record.get("access"):
+                # Another caller (or process) refreshed while this one waited.
+                return latest
+            if not latest.get("refresh"):
+                raise McpLoginRequired(self._login_message(server))
+            client_info = latest.get("client") or static_client(oauth)
+            if not client_info:
+                raise McpLoginRequired(self._login_message(server))
+            async with httpx.AsyncClient(timeout=REFRESH_REQUEST_TIMEOUT_SECONDS) as http:
+                discovery = await self._discover_oauth(settings, latest, challenge, http)
+                metadata = discovery.get("authorization_server_metadata")
+                resource = select_resource(settings["url"], discovery.get("resource_metadata"))
+                tokens = await refresh_authorization(
+                    http, discovery["authorization_server_url"], client_info, latest["refresh"],
+                    metadata, resource, token_url=oauth_settings(oauth)["token_url"])
+            # Once the server answered, persist the rotation even if close() runs now.
+            task = asyncio.current_task()
+            if task is not None:
+                task.oauth_saving = True
+            updated = record_from_tokens(
+                {**latest, "client": client_info, "discovery": discovery}, tokens, latest.get("scope"))
+            await self._persist_oauth_record(key, updated, epoch, server)
+            return updated
+
+    async def _persist_oauth_record(self, key: str, record: dict, epoch: int, server: str) -> None:
+        """Save a rotated grant unless a logout (or another refresh) invalidated it."""
+
+        if epoch != self._oauth_epoch.get(key, 0) or not self.oauth_store.get(key).get("refresh"):
+            raise McpLoginRequired(self._login_message(server))
+        self.oauth_store.set(key, record)
+
+    async def _discover_oauth(self, settings: dict, record: dict, challenge: Optional[dict],
+                              http: httpx.AsyncClient) -> dict:
+        oauth = oauth_settings(settings.get("oauth") or {})
+        cached = record.get("discovery") or {}
+        if oauth["authorize_url"] and oauth["token_url"]:
+            server = urlsplit(settings["url"])
+            issuer = cached.get("authorization_server_url") or f"{server.scheme}://{server.netloc}/"
+            metadata = cached.get("authorization_server_metadata") or {
+                "issuer": issuer,
+                "authorization_endpoint": oauth["authorize_url"],
+                "token_endpoint": oauth["token_url"],
+                "registration_endpoint": None,
+                "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"],
+            }
+            return {"authorization_server_url": issuer,
+                    "authorization_server_metadata": metadata,
+                    "resource_metadata": cached.get("resource_metadata")}
+        if not oauth["auth_server_metadata_url"] and cached.get("authorization_server_url"):
+            metadata = cached.get("authorization_server_metadata")
+            if metadata is None:
+                metadata = await discover_authorization_server_metadata(
+                    cached["authorization_server_url"], http)
+            return {**cached, "authorization_server_metadata": metadata}
+        return await discover_oauth_server_info(
+            settings["url"], http,
+            (challenge or {}).get("resource_metadata"),
+            oauth["auth_server_metadata_url"])
+
+    def _schedule_tools_changed(self, server: str) -> None:
+        """Track a notification-triggered refresh so close() can cancel and await it."""
+
+        try:
+            task = asyncio.get_running_loop().create_task(self._handle_tools_changed(server))
+        except RuntimeError:
+            return
+        self._refresh_tasks.add(task)
+        task.add_done_callback(self._refresh_tasks.discard)
 
     async def _handle_tools_changed(self, server: str) -> None:
         """Refresh one server's tools after notifications/tools/list_changed. A server that
         is not registered yet is still connecting; reload lists its tools anyway."""
 
-        if server not in self.clients:
+        generation = self._generation
+        client = self.clients.get(server)
+        if client is None or not self._active:
             return
         try:
-            await self.ensure_tools(server)
+            await self.ensure_tools(server, generation)
         except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, httpx.HTTPError) as exc:
-            self.errors[server] = f"Failed to refresh tools: {exc}"
+            if self._active and generation == self._generation:
+                self.errors[server] = f"Failed to refresh tools: {exc}"
 
     def _register_server_tools(self, namespace: str, client: McpClient) -> None:
         for tool in client.tools:
@@ -780,6 +966,8 @@ class McpManager:
             return AgentToolResult(content=content or [TextContent(text=json.dumps(result))],
                 structured_content=result.get("structuredContent"), is_error=bool(result.get("isError")))
         tool = AgentTool(name=tool_name, description=description, parameters=parameters, execute=execute)
+        tool.exposure = self.clients[server].config.get("exposure", "direct")
+        tool.declared = tool.exposure == "direct"
         tool._mcp_server = server
         return tool
 
@@ -912,7 +1100,29 @@ class McpManager:
         client = self.clients.get(server)
         if client is None:
             raise ValueError(f"MCP server not connected: {server}")
+        used_token = client.bearer()
         try:
+            return await client.request(method, params)
+        except McpAuthorizationRequired as exc:
+            if not self._uses_oauth(client.config):
+                raise
+            key = self._oauth_key(server, client.config)
+            current = self.oauth_store.get(key)
+            if not (used_token and current.get("access") and current["access"] != used_token):
+                # The rejected token is still current: refresh once. If another
+                # caller already refreshed, the per-credential lock returns its
+                # result instead of spending the rotated refresh token twice.
+                try:
+                    current = await self._refresh_tracked(
+                        server, client.config, current, exc.challenge)
+                except McpLoginRequired:
+                    client.needs_login = True
+                    client.challenge = exc.challenge
+                    self._remember_login(server, client.config, exc.challenge)
+                    raise
+            client.credential = current
+            if signal:
+                signal.throw_if_aborted()
             return await client.request(method, params)
         except (RuntimeError, httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
             message = str(exc)
@@ -926,6 +1136,7 @@ class McpManager:
             return await self.clients[server].request(method, params)
 
     async def reconnect(self, server: str, client: Optional[McpClient] = None) -> None:
+        self._ensure_locks()
         if client is None:
             client = self.clients.get(server)
         if client is None:
@@ -935,10 +1146,11 @@ class McpManager:
             # A concurrent caller may already have replaced the failed connection.
             if self.clients.get(server) is not client:
                 return
+            generation = self._generation
             namespace = re.sub(r"[^A-Za-z0-9_]", "_", server)
             replacement = McpClient(server, client.config, client.cwd)
             try:
-                await self._connect_client(replacement, namespace)
+                await self._open_client(replacement, namespace, generation)
             except BaseException:
                 try:
                     await replacement.close()
@@ -949,13 +1161,25 @@ class McpManager:
             # reconnect must not leave a closed client registered, where every
             # later call would raise AttributeError and never retry.
             await client.close()
-            self.clients[server] = replacement
+            async with self._state_lock:
+                current = (self._active and generation == self._generation
+                           and self.clients.get(server) is client)
+                if current:
+                    self.clients[server] = replacement
+            if not current:
+                # The manager closed (or a reload replaced the client) while the
+                # replacement was connecting: release it instead of resurrecting it.
+                await replacement.close()
+                raise RuntimeError(f"MCP server {server} is closed")
             await self.ensure_tools(server)
     
 
-    async def ensure_tools(self, server: str) -> None:
+    async def ensure_tools(self, server: str, generation: Optional[int] = None) -> None:
         """Discover tools for a lazily-connected server and refresh changed tool sets."""
 
+        self._ensure_locks()
+        if generation is None:
+            generation = self._generation
         client = self.clients.get(server)
         if client is None:
             raise ValueError(f"MCP server not connected: {server}")
@@ -966,47 +1190,244 @@ class McpManager:
             if client.tools_changed or not client.tools:
                 await client.list_tools()
                 client.tools_changed = False
-            self.tools = [tool for tool in self.tools if getattr(tool, "_mcp_server", None) != server]
-            self._register_server_tools(namespace, client)
-            self.lazy_servers.discard(server)
-            after = [(tool.name, tool.description, tool.parameters) for tool in self.tools]
+            # A close or reload may have run while tools were being listed. The
+            # closed generation must not publish declarations afterwards.
+            async with self._state_lock:
+                if (not self._active or generation != self._generation
+                        or self.clients.get(server) is not client):
+                    return
+                self.tools = [tool for tool in self.tools if getattr(tool, "_mcp_server", None) != server]
+                self._register_server_tools(namespace, client)
+                self.lazy_servers.discard(server)
+                after = [(tool.name, tool.description, tool.parameters) for tool in self.tools]
             if self.on_tools_changed is not None and after != before:
                 await _maybe_call(self.on_tools_changed, server)
 
     async def refresh_changed(self) -> bool:
         """Re-list tools for servers that reported notifications/tools/list_changed."""
+        generation = self._generation
         changed = [name for name, client in self.clients.items() if client.tools_changed]
         for name in changed:
-            await self.ensure_tools(name)
+            await self.ensure_tools(name, generation)
         return bool(changed)
 
     async def oauth_login(self, server: str) -> None:
-        client = self.clients.get(server)
-        if client is None:
-            raise ValueError(f"MCP server not connected: {server}")
-        oauth = client.config.get("oauth")
-        if not oauth or "url" not in client.config:
-            raise ValueError(f"MCP server has no OAuth configuration: {server}")
-        record = await oauth_login(oauth, self.notify, client.config["url"])
-        self.oauth_store.set(oauth_key(re.sub(r"[^A-Za-z0-9_]", "_", server), client.config["url"]), record)
-        client.credential = record
+        """Run the browser authorization flow, save the grant and connect the server.
 
-    def oauth_logout(self, server: str) -> None:
+        Works after the first 401 removed the failed client: the configuration and
+        challenge are kept in ``login_servers``/``login_challenges``.
+        """
+
         client = self.clients.get(server)
-        if client is None:
+        settings = client.config if client is not None else self.login_servers.get(server)
+        if settings is None or "url" not in settings:
             raise ValueError(f"MCP server not connected: {server}")
-        if "url" in client.config:
-            self.oauth_store.remove(oauth_key(re.sub(r"[^A-Za-z0-9_]", "_", server), client.config["url"]))
-            client.credential = None
+        oauth = settings.get("oauth") or {}
+        values = validate_oauth_settings(oauth)
+        key = self._oauth_key(server, settings)
+        # A refresh already in flight must not overwrite the new sign-in.
+        self._oauth_epoch[key] = self._oauth_epoch.get(key, 0) + 1
+        challenge = self.login_challenges.get(server, {})
+        callback = callback_settings(oauth)
+        state = secrets.token_hex(16)
+        callback_server = await start_oauth_callback_server(
+            server, callback["listen_host"], callback["port"] or 0, callback["path"],
+            state=state, timeout_ms=int(values["timeout"] * 1000))
+        try:
+            redirect_url = callback["fixed_redirect_url"] or callback_server.redirect_uri
+            async with httpx.AsyncClient(timeout=30) as http:
+                record = self.oauth_store.get(key)
+                record, authorization_url = await self._prepare_login(
+                    server, settings, record, redirect_url, state, challenge, http)
+                # Keep the registered client and PKCE verifier even if the user never
+                # finishes; a later sign-in then reuses the registration.
+                self.oauth_store.set(key, record)
+                self.notify(f"MCP authorization required for {settings['url']}\nOpen: {authorization_url}")
+                params = await callback_server.wait()
+                if not params:
+                    raise ValueError("MCP sign-in cancelled")
+                record = await self._complete_login(server, settings, record, params, http)
+                self.oauth_store.set(key, record)
+        finally:
+            await callback_server.close()
+        self.login_challenges.pop(server, None)
+        self.errors.pop(server, None)
+        await self._connect_after_login(server, settings)
+
+    async def _prepare_login(self, server: str, settings: dict, record: dict, redirect_url: str,
+                             state: str, challenge: dict, http: httpx.AsyncClient):
+        oauth = settings.get("oauth") or {}
+        values = oauth_settings(oauth)
+        discovery = await self._discover_oauth(settings, record, challenge, http)
+        metadata = discovery.get("authorization_server_metadata")
+        if metadata is None:
+            raise McpOAuthError(
+                "discovery_failed",
+                f"Could not discover authorization server metadata for {settings['url']}")
+        resource = select_resource(settings["url"], discovery.get("resource_metadata"))
+        scope = (merge_scopes(values["scope"], challenge.get("scope"))
+                 or " ".join((discovery.get("resource_metadata") or {}).get("scopes_supported") or [])
+                 or None)
+        client_info = record.get("client") or static_client(oauth)
+        if not client_info:
+            client_info = await register_client(
+                http, discovery["authorization_server_url"],
+                client_metadata(oauth, redirect_url), metadata, scope)
+        authorization_url, verifier = start_authorization(
+            discovery["authorization_server_url"], client_info, redirect_url, metadata,
+            scope, state, resource, authorize_url=values["authorize_url"])
+        updated = {**record, "client": client_info, "discovery": discovery,
+                   "code_verifier": verifier, "oauth_state": state,
+                   "redirect_uri": redirect_url, "scope": scope}
+        return updated, authorization_url
+
+    async def _complete_login(self, server: str, settings: dict, record: dict,
+                              params: dict, http: httpx.AsyncClient) -> dict:
+        code = params.get("code")
+        if not code:
+            raise ValueError("OAuth callback did not include an authorization code")
+        discovery = record.get("discovery") or {}
+        metadata = discovery.get("authorization_server_metadata")
+        iss = params.get("iss")
+        # RFC 9207: never send a code from another authorization server to this one.
+        if metadata and (iss is not None or metadata.get("authorization_response_iss_parameter_supported")):
+            expected = metadata["issuer"].rstrip("/")
+            if (iss or "").rstrip("/") != expected:
+                raise OAuthIssuerMismatchError(expected, iss)
+        oauth = settings.get("oauth") or {}
+        values = oauth_settings(oauth)
+        client_info = record.get("client") or static_client(oauth)
+        if not client_info:
+            raise McpOAuthError("invalid_client", "OAuth client information is missing during code exchange")
+        resource = select_resource(settings["url"], discovery.get("resource_metadata"))
+        tokens = await exchange_authorization_code(
+            http, discovery["authorization_server_url"], client_info, code,
+            record["code_verifier"], record["redirect_uri"], metadata, resource,
+            token_url=values["token_url"])
+        updated = record_from_tokens(record, tokens, record.get("scope"))
+        updated.pop("code_verifier", None)
+        updated.pop("oauth_state", None)
+        return updated
+
+    async def _connect_after_login(self, server: str, settings: dict) -> None:
+        self._ensure_locks()
+        async with self._state_lock:
+            if not self._active:
+                return
+            generation = self._generation
+            existing = self.clients.pop(server, None)
+            self.lazy_servers.discard(server)
+            self.tools = [tool for tool in self.tools
+                          if not getattr(tool, "_mcp_server", None) == server]
+        if existing is not None:
+            await existing.close()
+        namespace = re.sub(r"[^A-Za-z0-9_]", "_", server)
+        client = McpClient(server, settings, self.config.cwd)
+        await self._open_client(client, namespace, generation, register_name=server)
+        async with self._state_lock:
+            if not self._active or generation != self._generation:
+                return
+            if client.lazy:
+                self.lazy_servers.add(server)
+            else:
+                self._register_server_tools(namespace, client)
+        if client.tools_changed:
+            await self.ensure_tools(server, generation)
+        if self.on_tools_changed is not None:
+            await _maybe_call(self.on_tools_changed, server)
+
+    async def oauth_logout(self, server: str) -> None:
+        client = self.clients.get(server)
+        settings = client.config if client is not None else self.login_servers.get(server)
+        if settings is None or "url" not in settings:
+            raise ValueError(f"MCP server not connected: {server}")
+        key = self._oauth_key(server, settings)
+        # A refresh that already got a response must not write the grant back.
+        self._oauth_epoch[key] = self._oauth_epoch.get(key, 0) + 1
+        self.oauth_store.remove(key)
+        self.login_challenges.pop(server, None)
+        self._remember_login(server, settings)
+        async with self._state_lock:
+            removed = self.clients.pop(server, None)
+            self.lazy_servers.discard(server)
+            self.tools = [tool for tool in self.tools
+                          if not getattr(tool, "_mcp_server", None) == server]
+        if removed is not None:
+            await removed.close()
+        if self.on_tools_changed is not None:
+            await _maybe_call(self.on_tools_changed, server)
 
     async def close(self):
-        # Connects run inline inside reload()/reconnect(), so by the time close()
-        # runs from the same task every connect has settled; each client's close()
-        # still aborts one that another task started mid-flight.
-        for client in self.clients.values():
+        """Close the current generation and wait until every connect, transport and
+        notification refresh of that generation has settled.
+
+        Concurrent callers all wait for the same cleanup tasks; the state lock is
+        only held while invalidating the generation and taking the snapshot, never
+        while waiting for a connect that may need that lock to finish.
+        """
+
+        self._ensure_locks()
+        await self._close_all()
+
+    async def _close_all(self) -> None:
+        async with self._state_lock:
+            # Invalidate the generation before any await: a connect that completes
+            # from here on cannot register itself into the generation being closed.
+            self._generation += 1
+            self._active = False
+            clients = list(self.clients.values())
+            self.clients.clear()
+            opening = list(self._opening.values())
+            self._opening.clear()
+            self.lazy_servers.clear()
+            self.login_servers.clear()
+            self.login_challenges.clear()
+            refresh_tasks = list(self._refresh_tasks)
+            self._refresh_tasks.clear()
+            oauth_tasks = list(self._oauth_tasks)
+            tasks = set(self._cleanup_tasks)
+            for client in clients:
+                tasks.add(self._track_cleanup(self._safe_close(client)))
+            for client, _ in opening:
+                tasks.add(self._track_cleanup(self._safe_close(client)))
+            current = asyncio.current_task()
+            for task in refresh_tasks:
+                if task is not current:
+                    task.cancel()
+                    tasks.add(self._track_cleanup(self._settle(task)))
+            for _, task in opening:
+                if task is not None and task is not current:
+                    tasks.add(self._track_cleanup(self._settle(task)))
+            for task in oauth_tasks:
+                if task is current:
+                    continue
+                if getattr(task, "oauth_saving", False):
+                    # The server already answered and the rotated tokens are being
+                    # saved; dropping them would lose the grant.
+                    tasks.add(self._track_cleanup(self._settle(task)))
+                else:
+                    task.cancel()
+                    tasks.add(self._track_cleanup(self._settle(task)))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _track_cleanup(self, coro) -> asyncio.Task:
+        task = asyncio.ensure_future(coro)
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        return task
+
+    async def _safe_close(self, client: McpClient) -> None:
+        try:
             await client.close()
-        self.clients = {}
-        self.lazy_servers = set()
+        except Exception:  # noqa: BLE001 - one failed client must not block the rest
+            pass
+
+    async def _settle(self, task: asyncio.Task) -> None:
+        try:
+            await task
+        except BaseException:  # noqa: BLE001 - cleanup waits, it does not re-raise
+            pass
 
 
 async def _maybe_call(fn, *args):

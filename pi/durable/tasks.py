@@ -9,15 +9,20 @@ its append-only history while the LLM context shrinks.
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..ai.json_io import message_from_json, to_json as ai_to_json
 from ..ai.retry import is_retryable_assistant_error, retry_delay_ms
 from ..ai.types import ImageContent, SystemMessage, TextContent, ToolResultMessage, Usage, UserMessage
+from ..agent.types import AgentToolResult
 from ..agent.compaction import estimate_tokens, is_context_overflow
 from .entries import COMPACTION_ENTRY, TOOL_RESULT_ENTRY
 from .harness import Harness, TaskRuntime, _stream_once
+from .live import LiveDoc, ensure_tool_slot, finish_slot, tool_slot
+from .output import OutputLimits, Progress, bound_output
+from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, utf8_byte_length
 from .types import TaskDefinition, TaskOutcome, TaskState, define_task
 
 SUMMARIZATION_PROMPT = (
@@ -37,14 +42,95 @@ def tool_definition() -> TaskDefinition:
     """
 
     async def execute(task, runtime: TaskRuntime, harness: Harness) -> None:
-        tool = (harness.tools or {}).get(task.input.get("tool"))
+        tools = await harness.resolved_tools(task.conversation_id)
+        tool = tools.get(task.input.get("tool"))
         if tool is None:
             raise ValueError(f"tool not available: {task.input.get('tool')!r}")
         arguments = task.input.get("arguments") or {}
-        if tool.prepare_arguments is not None:
-            arguments = tool.prepare_arguments(arguments)
-        result = await tool.execute(str(task.input.get("call_id") or f"durable-{task.id}"),
-                                    arguments, None, None)
+        prepare = getattr(tool, "prepare_arguments", None)
+        if prepare is not None:
+            arguments = prepare(arguments)
+        tool_name = str(task.input.get("tool"))
+        call_id = str(task.input.get("call_id") or f"durable-{task.id}")
+        call = {"id": call_id, "name": tool_name, "arguments": arguments}
+        try:
+            decision = await harness.run_hooks("before_tool", runtime, call)
+        except Exception as exc:
+            decision = {"block": str(exc)}
+        blocked = decision.get("block") if decision else None
+        if decision and "arguments" in decision:
+            arguments = decision["arguments"]
+            call["arguments"] = arguments
+        conversation_id = task.conversation_id
+        limits = OutputLimits(DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, "head")
+        latest: Dict[str, Any] = {"text": "", "details": None}
+        written: Dict[str, Any] = {"text": "", "details": None}
+
+        async def start(tx, current):
+            live = await tx.doc(LiveDoc, conversation_id)
+            slot = ensure_tool_slot(live.value, task.id, call_id, tool_name)
+            slot["status"] = "running"
+            live.dirty = True
+            return None
+
+        await runtime.commit(start)
+
+        async def write_progress() -> int:
+            text = latest["text"]
+            details = latest["details"]
+            bounded = bound_output(text, limits)
+            details_json = None if details is None else json.dumps(details, ensure_ascii=False, default=str)
+            bytes_written = utf8_byte_length(bounded.text) if bounded.text != written["text"] else 0
+            if details != written["details"]:
+                bytes_written += utf8_byte_length(details_json or "null")
+
+            async def change(tx, current):
+                live = await tx.doc(LiveDoc, conversation_id)
+                slot = ensure_tool_slot(live.value, task.id, call_id, tool_name)
+                slot["status"] = "running"
+                slot["output"] = bounded.text
+                slot["dropped_bytes"] = bounded.dropped_bytes
+                slot["dropped_lines"] = bounded.dropped_lines
+                if details is not None:
+                    slot["details"] = details
+                live.dirty = True
+                return None
+
+            await runtime.commit(change)
+            written["text"] = bounded.text
+            written["details"] = details
+            return bytes_written
+
+        progress = Progress(write_progress, harness.on_report, harness.progress.output_interval_ms)
+
+        async def on_update(update) -> None:
+            text = "\n".join(block.text for block in update.content or [] if isinstance(block, TextContent))
+            latest["text"] = text
+            if update.details is not None:
+                try:
+                    latest["details"] = ai_to_json({"details": update.details})["details"]
+                except (TypeError, ValueError):
+                    latest["details"] = str(update.details)
+            progress.mark()
+
+        try:
+            if blocked:
+                result = AgentToolResult(content=[TextContent(text=str(blocked))], is_error=True)
+            else:
+                try:
+                    result = await tool.execute(call_id, arguments, None, on_update)
+                except Exception as exc:
+                    result = AgentToolResult(content=[TextContent(text=str(exc))], is_error=True)
+            replacement = await harness.run_hooks("after_tool", runtime, call, result)
+            if replacement is not None:
+                result = replacement
+        except BaseException as exc:
+            pending = await progress.stop()
+            for waiter in pending:
+                if not waiter.done():
+                    waiter.set_exception(exc)
+            raise
+        pending = await progress.stop()
         blocks = []
         for block in result.content or []:
             if isinstance(block, ImageContent):
@@ -58,14 +144,26 @@ def tool_definition() -> TaskDefinition:
             except (TypeError, ValueError):
                 details = str(details)
         stored = {"blocks": blocks, "is_error": bool(result.is_error), "details": details}
-        await runtime.commit(
-            lambda tx, current: TaskState(status="running", checkpoint={"phase": "settle", "result": stored}))
+        try:
+            await runtime.commit(
+                lambda tx, current: TaskState(status="running",
+                                              checkpoint={"phase": "settle", "result": stored}))
+        except BaseException as exc:
+            for waiter in pending:
+                if not waiter.done():
+                    waiter.set_exception(exc)
+            raise
+        # The checkpoint is durable; settle resolves the waiters once the visible
+        # result entry commits.
+        harness.hold_progress_waiters(task.id, pending)
 
     async def settle(task, runtime: TaskRuntime, harness: Harness) -> None:
         async def tx_change(tx, current):
             stored = current.state.checkpoint["result"]
+            call_id = str(current.input.get("call_id") or f"durable-{current.id}")
+            live = await tx.doc(LiveDoc, current.conversation_id)
             message = ToolResultMessage(
-                tool_call_id=str(current.input.get("call_id") or f"durable-{current.id}"),
+                tool_call_id=call_id,
                 tool_name=str(current.input.get("tool", "")),
                 content=[ImageContent(data=b["data"], mime_type=b["mime_type"])
                          if b["type"] == "image" else TextContent(text=b["text"])
@@ -76,16 +174,33 @@ def tool_definition() -> TaskDefinition:
                 usage=Usage(),
             )
             entry = await tx.append_entry(current.conversation_id,
-                {"kind": TOOL_RESULT_ENTRY.kind, "model": [ai_to_json(message)]})
+                {"kind": TOOL_RESULT_ENTRY.kind, "model": [message]})
+            slot = tool_slot(live.value, current.id)
+            if slot is not None:
+                finish_slot(slot, entry.id)
+                live.dirty = True
             return TaskState(status="terminal",
                 outcome=TaskOutcome(status="completed", result={"entry_id": entry.id}))
 
-        await runtime.commit(tx_change)
+        try:
+            await runtime.commit(tx_change)
+        except BaseException as exc:
+            harness.settle_progress_waiters(task.id, exc)
+            raise
+        harness.settle_progress_waiters(task.id)
 
     async def abort(task, runtime: TaskRuntime, harness: Harness) -> None:
-        await runtime.commit(
-            lambda tx, current: TaskState(status="terminal",
-                outcome=TaskOutcome(status="aborted", reason="aborted")))
+        async def tx_change(tx, current):
+            live = await tx.doc(LiveDoc, current.conversation_id)
+            slot = tool_slot(live.value, current.id)
+            if slot is not None:
+                finish_slot(slot, None)
+                live.dirty = True
+            return TaskState(status="terminal",
+                             outcome=TaskOutcome(status="aborted", reason="aborted"))
+
+        await runtime.commit(tx_change)
+        harness.settle_progress_waiters(task.id, RuntimeError("tool aborted"))
 
     return define_task(name="pi.tool", version=1,
                        initial=lambda input: {"phase": "execute"},
@@ -137,6 +252,19 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
         if cut <= 0:
             await runtime.commit(lambda tx, current: TaskState(status="terminal",
                 outcome=TaskOutcome(status="completed", result={"compacted": False, "tokens": total})))
+            return
+        decision = await harness.run_hooks("before_compact", runtime, {
+            "entries": entries, "messages": messages[:cut], "first_kept": head_entry,
+            "instructions": task.input.get("instructions"), "reason": "manual"})
+        if decision and decision.get("decline"):
+            await runtime.commit(lambda tx, current: TaskState(status="terminal",
+                outcome=TaskOutcome(status="completed", result={"compacted": False, "declined": True})))
+            return
+        if decision and "summary" in decision:
+            if not isinstance(decision["summary"], str) or not decision["summary"].strip():
+                raise ValueError("Compaction hook summary must not be empty")
+            await runtime.commit(lambda tx, current: TaskState(status="running", checkpoint={
+                "phase": "settle", "summary": decision["summary"], "head_entry_id": head_entry, "tokens": total}))
             return
         await runtime.commit(lambda tx, current: TaskState(status="running",
             checkpoint={"phase": "summarize", "cut": cut, "head_entry_id": head_entry,

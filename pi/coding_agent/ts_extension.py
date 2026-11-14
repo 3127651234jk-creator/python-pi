@@ -387,10 +387,18 @@ class TsExtensionBridge:
             if method == "registerTool":
                 handler_id = params["handlerId"]
                 self.tool_handlers[params["name"]] = handler_id
+                exposure = params.get("exposure")
+                # TS "direct" (or absent) is declared; codemode/deferred/model-only
+                # tools are callable indirectly but not declared. "hidden" is also
+                # undeclared; Python keeps it reachable through codemode.
+                guidelines = params.get("promptGuidelines")
                 api.register_tool(AgentTool(
                     name=params["name"], description=params.get("description", ""),
                     parameters=params.get("parameters") or {"type": "object", "properties": {}},
                     output_schema=params.get("outputSchema"),
+                    declared=exposure in (None, "direct"),
+                    prompt_snippet=params.get("promptSnippet") or "",
+                    prompt_guidelines=[item for item in guidelines or [] if isinstance(item, str)],
                     execute=self._tool_execute(handler_id, params["name"])))
                 if params.get("rendererId"):
                     api.register_tool_renderer(self._tool_renderer(params["rendererId"]))

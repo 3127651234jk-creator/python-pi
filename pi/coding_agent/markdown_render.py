@@ -8,7 +8,9 @@ quotes and horizontal rules. Unknown lines pass through unchanged.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import Dict, List, Optional
+
+from .syntax_highlight import highlight_code
 
 BOLD = "\x1b[1m"
 ITALIC = "\x1b[3m"
@@ -33,20 +35,41 @@ def _inline(text: str, color: bool) -> str:
     return text
 
 
-def render_markdown(text: str, color: bool = True) -> str:
-    """Render Markdown source to an ANSI string (plain when color is off)."""
+def _code_line(line: str, color: bool) -> str:
+    return (DIM + line + RESET) if color else line
+
+
+def render_markdown(text: str, color: bool = True,
+                    theme: Optional[Dict[str, str]] = None) -> str:
+    """Render Markdown source to an ANSI string (plain when color is off).
+
+    Fenced blocks are collected whole and lexed at once, so multi-line strings
+    and comments keep their style on every line. Unknown languages and
+    unterminated fences fall back to dim plain code.
+    """
+
     out: List[str] = []
-    in_code = False
-    for line in text.splitlines():
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
         if line.strip().startswith("```"):
-            in_code = not in_code
-            if color:
-                out.append(DIM + line + RESET)
+            info = line.strip()[3:].strip()
+            language = info.split()[0] if info else ""
+            out.append(_code_line(line, color))
+            block: List[str] = []
+            while index < len(lines) and not lines[index].strip().startswith("```"):
+                block.append(lines[index])
+                index += 1
+            highlighted = highlight_code("\n".join(block), language, color, theme) if block else []
+            if highlighted is None:
+                out.extend(_code_line(code_line, color) for code_line in block)
             else:
-                out.append(line)
-            continue
-        if in_code:
-            out.append((DIM + line + RESET) if color else line)
+                out.extend(highlighted)
+            if index < len(lines):
+                out.append(_code_line(lines[index], color))
+                index += 1
             continue
         heading = _HEADING.match(line)
         if heading:

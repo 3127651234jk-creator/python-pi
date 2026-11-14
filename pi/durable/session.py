@@ -40,6 +40,7 @@ class Session:
     def __init__(self, storage) -> None:
         self.storage = storage
         self._commit_listeners: List[Callable[[CommitPublication], None]] = []
+        self._creation_hooks: List[Callable] = []
         self._close_listeners: List[Callable[[], None]] = []
         self._line_lock = asyncio.Lock()
         # Scheduler ownership spans task execution, beyond individual commits.
@@ -54,7 +55,10 @@ class Session:
     # -- hooks for subclasses (Harness stages built-in documents) --------------
 
     async def conversation_created(self, tx: Transaction, record) -> None:
-        return None
+        for hook in self._creation_hooks:
+            result = hook(tx, record)
+            if hasattr(result, "__await__"):
+                await result
 
     # -- commit line -------------------------------------------------------------
 

@@ -5,35 +5,46 @@ the phase state machine, waiting/join policy, abort marks, crash recovery
 (running resets to pending on reopen), and the generation task that commits a
 model turn to the transcript before it becomes visible.
 
-Porting deviations from the TS harness (documented in the README):
-- hooks, extensions, documents-per-conversation (pi.live/pi.inbox/...),
-  and full tool-task surfaces are not ported; ``pi.tool``/``pi.compact``
-  live in ``tasks.py`` and the scheduler supports bounded concurrency.
+Named extensions provide tools, tasks and hooks. Busy inputs and passive writes
+are admitted through the transactional inbox. ``pi.tool`` and ``pi.compact``
+live in ``tasks.py``; the scheduler supports bounded concurrency.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
+import json
+import logging
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from ..ai.json_io import message_from_json, to_json as ai_to_json
 from ..ai.models import Model
 from ..ai.retry import RetryPolicy, is_retryable_assistant_error, retry_delay_ms
-from ..ai.types import AssistantMessage, ToolCall, TranscriptContext, UserMessage
+from ..ai.types import AssistantMessage, SystemMessage, Tool, ToolCall, TranscriptContext, UserMessage
 from ..ai.providers import get_default_stream_fn
 from ..ai.utils import normalize_context
 from ..agent.compaction import is_context_overflow
-from .entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, USER_ENTRY
+from .entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
 from .errors import StorageRejected, error_message
+from .extensions import AgentDoc, ProviderDoc, Extension, HookApi, Registry, invoke
+from .inbox import InboxDoc, apply_boundary, prepare_boundary, withdraw_queued_inputs
+from .live import LiveDoc, clear_generation, finish_slot, generation_state, tool_slot
+from .output import Progress
 from .session import Session
+from .truncate import utf8_byte_length
 from .types import (
+    ProgressPolicy,
     TaskDefinition,
     TaskOutcome,
     TaskRecord,
     TaskState,
     define_task,
     record_to_dict,
+    resolve_progress_policy,
 )
 
 
@@ -159,20 +170,154 @@ def _scope_for_conversation(conversation_id: int):
 class Harness:
     """Durable agent harness over one Session (compact port of Harness)."""
 
-    def __init__(self, session: Session, model: Model, retry: Optional[RetryPolicy] = None) -> None:
+    def __init__(self, session: Session, model: Model, retry: Optional[RetryPolicy] = None,
+                 progress: Optional[ProgressPolicy] = None,
+                 on_report: Optional[Callable[[BaseException], None]] = None,
+                 registry: Optional[Registry] = None, extensions: Optional[List[Extension]] = None,
+                 conversation_created: Optional[Callable] = None,
+                 steering_mode: str = "all", follow_up_mode: str = "all") -> None:
         self.session = session
         self.model = model
         self.retry = retry
+        # Accepts a ProgressPolicy or the settings mapping (validated field by field).
+        self.progress = resolve_progress_policy(progress)
+        self.on_report = on_report or self._report_progress_error
         self.definitions: Dict[str, TaskDefinition] = {}
         self.tools: Dict[str, Any] = {}
+        self.registry = registry or Registry(extensions)
+        self.default_extensions = [extension.name for extension in (extensions or [])]
+        self.steering_mode, self.follow_up_mode = steering_mode, follow_up_mode
+        self.conversation_created = conversation_created
+        previous = getattr(session, "_harness_creation_hook", None)
+        if previous in session._creation_hooks:
+            session._creation_hooks.remove(previous)
+        session._harness_creation_hook = self._conversation_created
+        session._creation_hooks.append(self._conversation_created)
         self.register_definition(generation_definition())
         from .tasks import compact_definition
 
         self.register_definition(compact_definition())
+        from .tasks import tool_definition
+        self.register_definition(tool_definition())
         self._stop = asyncio.Event()
         self._signals: Dict[int, asyncio.Event] = {}
+        # Tool progress waiters survive from the execute phase to the settle
+        # transaction, which is the commit that makes the result visible.
+        self._progress_waiters: Dict[int, List[asyncio.Future]] = {}
+
+    @staticmethod
+    def _report_progress_error(error: BaseException) -> None:
+        """Default reporter: a failed progress commit must not look like success."""
+
+        logging.getLogger(__name__).warning("durable progress commit failed: %s", error)
+
+    def hold_progress_waiters(self, task_id: int, waiters: List[asyncio.Future]) -> None:
+        if waiters:
+            self._progress_waiters[task_id] = waiters
+
+    def settle_progress_waiters(self, task_id: int, error: Optional[BaseException] = None) -> None:
+        """Resolve (or reject) waiters with the task's final transaction outcome."""
+
+        for waiter in self._progress_waiters.pop(task_id, []):
+            if waiter.done():
+                continue
+            if error is None:
+                waiter.set_result(None)
+            else:
+                waiter.set_exception(error)
 
     # -- registration ---------------------------------------------------------
+
+    async def _conversation_created(self, tx, record) -> None:
+        for definition in (LiveDoc, InboxDoc, AgentDoc, ProviderDoc):
+            draft = await tx.doc(definition, record.id)
+            if definition is AgentDoc:
+                draft.value["extensions"] = list(self.default_extensions)
+                if record.parent:
+                    parent = record.parent
+                    address = {"kind": AgentDoc.kind, "scope": {"kind": "conversation", "conversation_id": parent["conversation_id"]}, "key": None}
+                    visible = await self.session.storage.entry_visible(parent["conversation_id"], parent["at"])
+                    found = await self.session.storage.find_document(address, visible[1])
+                    if found:
+                        stored = await self.session.storage.document(found.id, visible[1])
+                        draft.value = copy.deepcopy(stored.value)
+            if definition is ProviderDoc:
+                draft.value["session_id"] = str(uuid.uuid4())
+            draft.dirty = True
+        for extension in self.registry.installed():
+            for definition in extension.documents:
+                if definition.scope == "conversation":
+                    draft = await tx.doc(definition, record.id)
+                    if record.parent and definition.fork != "initial":
+                        parent = record.parent
+                        visible = await self.session.storage.entry_visible(parent["conversation_id"], parent["at"])
+                        at = "current" if definition.fork == "current" else visible[1]
+                        address = {"kind": definition.kind, "scope": {"kind": "conversation", "conversation_id": parent["conversation_id"]}, "key": None}
+                        found = await self.session.storage.find_document(address, at)
+                        if found:
+                            stored = await self.session.storage.document(found.id, at)
+                            draft.value = copy.deepcopy(stored.value)
+                    draft.dirty = True
+        if self.conversation_created:
+            await invoke(self.conversation_created, tx, record)
+
+    async def configure(self, conversation_id: int, extensions: Optional[List[str]] = None,
+                        instructions: Optional[str] = None) -> None:
+        async def change(tx):
+            if await tx.conversation(conversation_id) is None:
+                raise StorageRejected(f"Unknown conversation: {conversation_id}")
+            agent = await tx.doc(AgentDoc, conversation_id)
+            if extensions is not None:
+                if any(self.registry.extension(name) is None for name in extensions):
+                    raise ValueError("Unknown extension")
+                agent.value["extensions"] = list(extensions)
+            if instructions is not None:
+                agent.value["instructions"] = instructions
+            agent.dirty = True
+        await self.session.commit(change)
+
+    async def selected_extensions(self, conversation_id: int) -> List[Extension]:
+        agent = await self.session.snapshot(AgentDoc, conversation_id) or {}
+        result = []
+        for name in agent.get("extensions", self.default_extensions):
+            extension = self.registry.extension(name)
+            if extension is None:
+                raise ValueError(f"Missing extension: {name}")
+            result.append(extension)
+        return result
+
+    async def run_hooks(self, name: str, runtime: TaskRuntime, *args):
+        task = await self._get_task(runtime.task_id)
+        result = None
+        for extension in await self.selected_extensions(task.conversation_id):
+            callback = extension.hooks.get(name)
+            if callback:
+                value = await invoke(callback, *args, HookApi(runtime), runtime)
+                if value is not None:
+                    result = value
+                    if name in ("on_yield", "before_compact") or (isinstance(value, dict) and value.get("block")):
+                        break
+                    if name == "before_request":
+                        args = (value,)
+                    elif name == "before_tool" and "arguments" in value:
+                        args = ({**args[0], "arguments": value["arguments"]},)
+                    elif name == "after_tool":
+                        args = (args[0], value)
+        return result
+
+    async def resolved_tools(self, conversation_id: int) -> dict:
+        tools = dict(self.tools)
+        selected = await self.selected_extensions(conversation_id)
+        for extension in selected:
+            for tool in extension.tools:
+                if tool.name in tools:
+                    raise ValueError(f"Duplicate tool: {tool.name}")
+                tools[tool.name] = tool
+        for extension in selected:
+            for name, wrap in extension.wraps.items():
+                if name in tools:
+                    tools[name] = wrap(tools[name])
+        return tools
 
     def register_definition(self, definition: TaskDefinition) -> None:
         self.definitions[definition.name] = definition
@@ -194,13 +339,22 @@ class Harness:
 
         return await self.session.commit(change)
 
-    async def submit_input(self, conversation_id: int, text: str, request_id: Optional[str] = None) -> int:
+    async def submit_input(self, conversation_id: int, text: str, request_id: Optional[str] = None,
+                           mode: str = "steer") -> int:
         """Admit one user input durably: submission, entry, and its run task
         commit together before anything becomes visible."""
 
         async def change(tx):
             if await tx.conversation(conversation_id) is None:
                 raise StorageRejected(f"Unknown conversation: {conversation_id}")
+            if mode not in ("steer", "followUp"):
+                raise ValueError("input mode must be steer or followUp")
+            existing = await tx.submission_by_request(conversation_id, request_id) if request_id else None
+            tasks = await _scan_all(tx.scan_tasks, {"conversation_id": conversation_id})
+            if existing:
+                return next((task.id for task in tasks if existing.id in (task.input or {}).get("submission_ids", [(task.input or {}).get("submission_id")])), existing.id)
+            boundary = await prepare_boundary(tx, conversation_id, self.steering_mode, self.follow_up_mode)
+            busy = any(task.kind == "pi.generation" and task.state.status not in ("terminal", "completing") for task in tasks)
             submission = await tx.create_submission(
                 {
                     "conversation_id": conversation_id,
@@ -209,22 +363,14 @@ class Harness:
                     "request_id": request_id,
                 }
             )
-            entry = await tx.append_entry(
-                conversation_id,
-                {
-                    "kind": USER_ENTRY.kind,
-                    "model": [UserMessage(content=text, timestamp=int(time.time() * 1000))],
-                },
-            )
-            tx_place = tx.place_submission(submission.id, entry.id)
-            if hasattr(tx_place, "__await__"):
-                await tx_place
-            task = await tx.create_task(
-                self.definitions["pi.generation"],
-                {"submission_id": submission.id, "entry_id": entry.id},
-                {"ownership": {"kind": "conversation"}, "conversation_id": conversation_id},
-            )
-            return task.id
+            if busy:
+                boundary.inbox.value["items"].append({"id": submission.id, "mode": mode, "content": text})
+                boundary.inbox.dirty = True
+                return submission.id
+            boundary.inbox.value["items"].append({"id": submission.id, "mode": mode, "content": text})
+            boundary.inbox.dirty = True
+            placed = await apply_boundary(tx, boundary, "final")
+            return await self._schedule_placed(tx, conversation_id, placed["users"])
 
         return await self.session.commit(change, _scope_for_conversation(conversation_id))
 
@@ -240,6 +386,66 @@ class Harness:
             return items
 
         return await self.session.commit(change, _scope_for_conversation(conversation_id))
+
+    async def live(self, conversation_id: int) -> Dict[str, Any]:
+        """Committed live state: the generated partial and running tool slots."""
+
+        value = await self.session.snapshot(LiveDoc, conversation_id)
+        return value or {}
+
+    async def inbox(self, conversation_id: int) -> dict:
+        return await self.session.snapshot(InboxDoc, conversation_id) or {"items": []}
+
+    async def submit_write(self, conversation_id: int, entry: dict, request_id: Optional[str] = None) -> int:
+        async def change(tx):
+            if await tx.conversation(conversation_id) is None:
+                raise StorageRejected(f"Unknown conversation: {conversation_id}")
+            existing = await tx.submission_by_request(conversation_id, request_id) if request_id else None
+            if existing:
+                return existing.id
+            tasks = await _scan_all(tx.scan_tasks, {"conversation_id": conversation_id})
+            boundary = await prepare_boundary(tx, conversation_id, self.steering_mode, self.follow_up_mode)
+            submission = await tx.create_submission({"conversation_id": conversation_id, "type": "write", "request_id": request_id})
+            boundary.inbox.value["items"].append({"id": submission.id, "mode": "write", "entry": ai_to_json(entry)})
+            boundary.inbox.dirty = True
+            if not any(task.kind == "pi.generation" and task.state.status not in ("terminal", "completing") for task in tasks):
+                placed = await apply_boundary(tx, boundary, "final")
+                await self._schedule_placed(tx, conversation_id, placed["users"])
+            return submission.id
+        return await self.session.commit(change, _scope_for_conversation(conversation_id))
+
+    async def _schedule_placed(self, tx, conversation_id: int, users: list) -> Optional[int]:
+        if not users:
+            return None
+        task = await tx.create_task(self.definitions["pi.generation"],
+                                   {"submission_id": users[0]["id"], "entry_id": users[0]["entry"],
+                                    "submission_ids": [user["id"] for user in users]},
+                                   {"ownership": {"kind": "conversation"}, "conversation_id": conversation_id})
+        return task.id
+
+    async def submission(self, submission_id: int):
+        async def change(tx):
+            return await tx._latest_submission(submission_id)
+        return await self.session.commit(change)
+
+    async def withdraw_submission(self, submission_id: int) -> None:
+        async def change(tx):
+            submission = await tx._latest_submission(submission_id)
+            inbox = await tx.doc(InboxDoc, submission.conversation_id)
+            if submission.status != "queued":
+                return
+            inbox.value["items"] = [item for item in inbox.value["items"] if item["id"] != submission_id]
+            inbox.dirty = True
+            await tx.settle_submission(submission_id, {"status": "unanswered", "reason": "aborted"})
+        await self.session.commit(change)
+
+    async def abort_conversation(self, conversation_id: int) -> None:
+        async def change(tx):
+            tasks = await _scan_all(tx.scan_tasks, {"conversation_id": conversation_id})
+            await withdraw_queued_inputs(tx, conversation_id)
+            return [task.id for task in tasks if task.state.status not in ("completing", "terminal")]
+        for task_id in await self.session.commit(change):
+            await self.abort_task(task_id)
 
     async def submit_tool_task(self, conversation_id: int, tool: str, arguments: dict,
                                call_id: Optional[str] = None) -> int:
@@ -409,6 +615,10 @@ class Harness:
 
     async def _run_task(self, task: TaskRecord) -> None:
         definition = self.definitions.get(task.kind)
+        for extension in self.registry.installed():
+            for candidate in extension.tasks:
+                if candidate.name == task.kind:
+                    definition = candidate
         if definition is None:
             await self._fault_or_orphan(task, "orphaned", f"No definition registered for task kind {task.kind}")
             return
@@ -416,6 +626,7 @@ class Harness:
         signal = asyncio.Event()
         self._signals[task.id] = signal
         runtime = TaskRuntime(self, task.id, signal)
+        runtime.conversation_id = task.conversation_id
         try:
             # Reserve: pending -> running. On reopen, running resets to pending.
             # A task that cannot be reserved (for example a version migration)
@@ -649,9 +860,25 @@ class Harness:
                 outcome = TaskOutcome(status="orphaned", reason=detail)
             else:
                 outcome = TaskOutcome(status="faulted", error={"message": detail})
+            await _cleanup_live_for_terminal(tx, current)
             await _stage_terminal(tx, current, outcome)
 
         await self.session.commit(change, _scope_for(self, task.id))
+        self.settle_progress_waiters(task.id, RuntimeError(detail))
+
+
+async def _cleanup_live_for_terminal(tx, current: TaskRecord) -> None:
+    """Clear a task's live presentation before its terminal state is written."""
+
+    if current.kind == "pi.generation":
+        await _convert_generation_partial(tx, current)
+        return
+    if current.kind == "pi.tool":
+        live = await tx.doc(LiveDoc, current.conversation_id)
+        slot = tool_slot(live.value, current.id)
+        if slot is not None:
+            finish_slot(slot, None)
+            live.dirty = True
 
 
 async def _stage_terminal(tx, current: TaskRecord, outcome: TaskOutcome) -> None:
@@ -693,7 +920,7 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         entries = await harness.transcript(conversation_id)
         llm_messages: List[Any] = []
         for entry in entries:
-            if entry.kind in (USER_ENTRY.kind, ASSISTANT_ENTRY.kind, SYSTEM_ENTRY.kind, COMPACTION_ENTRY.kind) and entry.model:
+            if entry.kind in (USER_ENTRY.kind, ASSISTANT_ENTRY.kind, SYSTEM_ENTRY.kind, COMPACTION_ENTRY.kind, TOOL_RESULT_ENTRY.kind) and entry.model:
                 llm_messages.extend(entry.model)
         stored = [ai_to_json(m) for m in llm_messages]
         await runtime.commit(
@@ -705,8 +932,56 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
     async def stream(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
         checkpoint = task.state.checkpoint
         messages = [message_from_json(m) for m in (checkpoint.get("messages") or [])]
+        agent = await harness.session.snapshot(AgentDoc, task.conversation_id) or {}
+        sections = []
+        for extension in await harness.selected_extensions(task.conversation_id):
+            for render in extension.sections.values():
+                sections.append(str(await invoke(render, HookApi(runtime), runtime)))
+        if agent.get("instructions"):
+            sections.append(agent["instructions"])
+        if sections:
+            messages.insert(0, SystemMessage(content="\n\n".join(sections), timestamp=0))
+        replacement = await harness.run_hooks("before_request", runtime, {"messages": messages})
+        if replacement is not None:
+            messages = list(replacement["messages"])
         attempt = int(checkpoint.get("attempt") or 1)
-        response = await _stream_once(harness.model, messages, harness)
+        conversation_id = task.conversation_id
+        latest: Dict[str, Any] = {"message": None}
+
+        async def write_partial() -> int:
+            message = latest["message"]
+            if message is None:
+                return 0
+
+            async def change(tx, current):
+                live = await tx.doc(LiveDoc, conversation_id)
+                generation = live.value.setdefault("generation", {})
+                generation["attempt"] = attempt
+                generation["message"] = message
+                live.dirty = True
+                return None
+
+            await runtime.commit(change)
+            return utf8_byte_length(json.dumps(message, ensure_ascii=False))
+
+        progress = Progress(write_partial, lambda exc: harness.on_report(exc),
+                            harness.progress.partial_interval_ms)
+
+        def on_partial(partial: AssistantMessage) -> None:
+            if not partial.content:
+                return
+            # Copy synchronously: the provider keeps mutating its partial.
+            latest["message"] = ai_to_json([copy.deepcopy(partial)])[0]
+            progress.mark()
+
+        try:
+            tools = list((await harness.resolved_tools(conversation_id)).values())
+            response = await _call_stream_once(harness.model, messages, harness, on_partial, tools)
+            await harness.run_hooks("after_response", runtime, response)
+        finally:
+            # No stale partial lands after the outcome: wait for the in-flight
+            # commit, then the settle/retry commit clears or replaces it.
+            await progress.stop()
         # Transient failures retry with backoff before the response becomes
         # visible; an overflow is never retried (only compaction can fit it).
         if response.stop_reason == "error" and not is_context_overflow(response):
@@ -718,8 +993,12 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
                 and attempt <= policy.max_retries
             ):
                 until = int(time.time() * 1000) + retry_delay_ms(policy, attempt)
-                await runtime.commit(
-                    lambda tx, current: TaskState(
+
+                async def retry_change(tx, current):
+                    live = await tx.doc(LiveDoc, conversation_id)
+                    clear_generation(live.value)
+                    live.dirty = True
+                    return TaskState(
                         status="running",
                         checkpoint={
                             "phase": "retry",
@@ -728,14 +1007,20 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
                             "messages": checkpoint.get("messages") or [],
                         },
                     )
-                )
+
+                await runtime.commit(retry_change)
                 return
-        await runtime.commit(
-            lambda tx, current: TaskState(
+
+        async def settle_change(tx, current):
+            live = await tx.doc(LiveDoc, conversation_id)
+            clear_generation(live.value)
+            live.dirty = True
+            return TaskState(
                 status="running",
                 checkpoint={"phase": "settle", "response": ai_to_json([response])[0]},
             )
-        )
+
+        await runtime.commit(settle_change)
 
     async def retry(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
         await runtime.sleep(int(task.state.checkpoint["until"]))
@@ -751,7 +1036,16 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         )
 
     async def settle(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
+        response = message_from_json(task.state.checkpoint["response"])
+        continuation = None
+        calls = [block for block in response.content if isinstance(block, ToolCall)]
+        if response.stop_reason not in ("error", "aborted") and not calls:
+            continuation = await harness.run_hooks("on_yield", runtime, response)
         async def tx_change(tx, current):
+            live = await tx.doc(LiveDoc, current.conversation_id)
+            boundary = await prepare_boundary(tx, current.conversation_id, harness.steering_mode, harness.follow_up_mode)
+            clear_generation(live.value)
+            live.dirty = True
             response = message_from_json(current.state.checkpoint["response"])
             entry = await tx.append_entry(
                 current.conversation_id,
@@ -761,12 +1055,53 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
                     "data": {"stop_reason": response.stop_reason},
                 },
             )
-            await tx.settle_submission(current.input["submission_id"], {"status": "done", "answer": entry.id})
+            if calls and response.stop_reason not in ("error", "aborted"):
+                children = []
+                for call in calls:
+                    child = await tx.create_task(harness.definitions["pi.tool"],
+                        {"tool": call.name, "arguments": call.arguments, "call_id": call.id},
+                        {"ownership": {"kind": "conversation"}, "conversation_id": current.conversation_id})
+                    children.append(child.id)
+                return TaskState(status="waiting", on=children, policy="allSettled",
+                                 checkpoint={"phase": "after_tools", "assistant": entry.id, "tools": children})
+            if continuation is not None:
+                await tx.append_entry(current.conversation_id, {
+                    "kind": USER_ENTRY.kind, "model": [UserMessage(content=continuation["continue"], timestamp=int(time.time() * 1000))]})
+                return TaskState(status="running", checkpoint={"phase": "prepare"})
+            for submission_id in current.input.get("submission_ids", [current.input["submission_id"]]):
+                settlement = ({"status": "unanswered", "reason": response.stop_reason}
+                              if response.stop_reason in ("error", "aborted") else {"status": "done", "answer": entry.id})
+                await tx.settle_submission(submission_id, settlement)
+            if response.stop_reason not in ("error", "aborted"):
+                placed = await apply_boundary(tx, boundary, "final")
+                await harness._schedule_placed(tx, current.conversation_id, placed["users"])
             return TaskState(
                 status="terminal", outcome=TaskOutcome(status="completed", result={"entry_id": entry.id})
             )
 
         await runtime.commit(tx_change)
+
+    async def after_tools(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
+        children = [await harness._get_task(task_id) for task_id in task.state.checkpoint["tools"]]
+        results = [(child.state.outcome.result or {}).get("entry_id") for child in children
+                   if child is not None and child.state.outcome is not None]
+        if len(results) != len(children) or any(result is None for result in results):
+            raise RuntimeError("A tool round ended without a result entry")
+        await harness.run_hooks("after_tools", runtime, task.state.checkpoint["assistant"], results)
+        async def change(tx, current):
+            boundary = await prepare_boundary(tx, current.conversation_id, harness.steering_mode, harness.follow_up_mode)
+            placed = await apply_boundary(tx, boundary, "postTools")
+            ids = list(current.input.get("submission_ids", [current.input["submission_id"]]))
+            if placed["reset"]:
+                for submission_id in ids:
+                    await tx.settle_submission(submission_id, {"status": "unanswered", "reason": "reset"})
+                await harness._schedule_placed(tx, current.conversation_id, placed["users"])
+                return TaskState(status="terminal", outcome=TaskOutcome(status="completed", result={"reset": True}))
+            ids.extend(user["id"] for user in placed["users"])
+            current.input["submission_ids"] = ids
+            # Preserve updated run membership in the same durable checkpoint.
+            return TaskState(status="running", checkpoint={"phase": "prepare", "submission_ids": ids})
+        await runtime.commit(change)
 
     async def abort(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
         async def tx_change(tx, current):
@@ -779,21 +1114,53 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         name="pi.generation",
         version=1,
         initial=lambda input: {"phase": "prepare"},
-        phases={"prepare": prepare, "stream": stream, "retry": retry, "settle": settle},
+        phases={"prepare": prepare, "stream": stream, "retry": retry, "settle": settle, "after_tools": after_tools},
         abort=abort,
     )
 
 
 async def _abort_generation(tx, current: TaskRecord) -> None:
-    submission_id = (current.input or {}).get("submission_id")
-    if submission_id is not None:
+    await _convert_generation_partial(tx, current)
+    submission_ids = (current.input or {}).get("submission_ids", [(current.input or {}).get("submission_id")])
+    for submission_id in submission_ids:
+        if submission_id is None:
+            continue
         await tx.settle_submission(
             submission_id, {"status": "unanswered", "reason": "generation aborted"}
         )
     await _stage_terminal(tx, current, TaskOutcome(status="aborted", reason="aborted"))
 
 
-async def _stream_once(model: Model, messages: List[Any], harness: "Harness") -> AssistantMessage:
+async def _convert_generation_partial(tx, current: TaskRecord) -> None:
+    """Keep a committed partial as an aborted assistant entry and clear live state."""
+
+    if current.kind != "pi.generation":
+        return
+    live = await tx.doc(LiveDoc, current.conversation_id)
+    partial = (generation_state(live.value) or {}).get("message")
+    if partial is not None:
+        message = message_from_json(partial)
+        message.stop_reason = "aborted"
+        await tx.append_entry(
+            current.conversation_id,
+            {
+                "kind": ASSISTANT_ENTRY.kind,
+                "model": [message],
+                "data": {"stop_reason": "aborted", "partial": True},
+            },
+        )
+    clear_generation(live.value)
+    live.dirty = True
+
+
+async def _stream_once(model: Model, messages: List[Any], harness: "Harness",
+                       on_partial: Optional[Callable[[AssistantMessage], None]] = None,
+                       tools: Optional[List[Any]] = None
+                       ) -> AssistantMessage:
+    if tools is not None:
+        declarations = [Tool(name=tool.name, description=tool.description, parameters=tool.parameters)
+                        for tool in tools if tool.declared]
+        messages = [SystemMessage(content="", timestamp=0, tools_added=declarations), *messages]
     system, rest = normalize_context(TranscriptContext(messages=messages))
     if system is not None:
         rest = [system, *rest]
@@ -802,6 +1169,32 @@ async def _stream_once(model: Model, messages: List[Any], harness: "Harness") ->
     async for event in fn(model, TranscriptContext(messages=rest), None):
         if event.type in ("done", "error"):
             final = event.message if event.type == "done" else event.error
+            continue
+        partial = getattr(event, "partial", None)
+        if on_partial is not None and partial is not None and getattr(partial, "content", None):
+            on_partial(partial)
     if final is None:
         raise RuntimeError("Provider stream ended without a final message")
     return final
+
+
+async def _call_stream_once(model: Model, messages: List[Any], harness: "Harness",
+                            on_partial: Callable[[AssistantMessage], None],
+                            tools: Optional[List[Any]] = None) -> AssistantMessage:
+    """Call ``_stream_once`` with partials when the (possibly patched) function accepts them.
+
+    Existing tests and callers patch ``_stream_once(model, messages, harness)``;
+    they keep working without the optional callback.
+    """
+
+    try:
+        parameters = inspect.signature(_stream_once).parameters
+        accepts = "on_partial" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    except (TypeError, ValueError):
+        accepts = False
+        parameters = {}
+    kwargs = {"on_partial": on_partial} if accepts else {}
+    if "tools" in parameters or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        kwargs["tools"] = tools
+    return await _stream_once(model, messages, harness, **kwargs)

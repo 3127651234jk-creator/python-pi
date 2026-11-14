@@ -6,6 +6,7 @@ pi（TypeScript monorepo）的 Python 移植版。目标是 1:1 复刻整个 mon
 
 - 源仓库：[earendil-works/pi](https://github.com/earendil-works/pi)（TypeScript monorepo，13 个 package）。
 - 基线版本：`v1.0.3`（tag 提交 `d78dc83d6`，2026-10-05），全部 package 的 `package.json` 版本一致为 `1.0.3`。
+- v1.0.4 补全：按固定 tag `7c10bd4337495ee613f2224843ecdf349b80d1df` 补齐五项——MCP 关闭生命周期、MCP OAuth 自动发现/动态注册、隐藏工具提示词一致性、代码块 token 高亮、durable progress。未随 v1.0.4 全量重移植；剩余差异见文末「尚未移植」。
 - 移植基点：`analysis-notes` 分支提交 `293fb03cb`（2026-11-07），即 `v1.0.3` 之后 8 个仅更新 pi-python 子模块的提交，TS 源码与 `v1.0.3` 相同。
 - 路由协议版本：两侧一致为 `PROTOCOL_VERSION = 8`（`packages/protocol/src/protocol.ts` 与 `pi/protocol.py`）。
 - 后续同步：`main` 分支与更新的 release（当前最新为 `v1.5.0`，2026-11-02）不在本基线内；TS 侧版本推进时更新本节记录的 tag/提交。
@@ -21,7 +22,7 @@ pi（TypeScript monorepo）的 Python 移植版。目标是 1:1 复刻整个 mon
 | `pi.agent.agent_loop` | `packages/agent/src/agent-loop.ts` | 主循环：steering/follow-up 队列、顺序/并行工具执行、`beforeToolCall`/`afterToolCall` 钩子、截断消息失败、错误/中止处理 |
 | `pi.agent.agent` | `packages/agent/src/agent.ts` | 有状态 Agent：transcript、队列、事件订阅、prompt/abort |
 | `pi.coding_agent.tools` | `coding-agent/src/core/tools/*` | `read`（截断/offset/limit/图片）、`write`（父目录自动创建）、`edit`（唯一匹配 + 重叠校验 + CRLF/BOM 保留 + 模糊匹配）、`bash`（流式输出、尾截断、超时、进程树终止） |
-| `pi.coding_agent.system_prompt` | `coding-agent/src/core/system-prompt.ts` | 分节系统提示词 + AGENTS.md 项目上下文 |
+| `pi.coding_agent.system_prompt` | `coding-agent/src/core/system-prompt.ts` | 分节系统提示词 + AGENTS.md 项目上下文；隐藏工具（declared=False）不进入工具列表、规则与 Windows 提示 |
 | `pi.coding_agent.session` | `coding-agent/src/core/session-manager.ts` | JSONL 会话树、分支、切换、命名、导出、`--continue` 恢复 |
 | `pi.coding_agent.cli` | `coding-agent/src/cli` | 单次模式 + 交互 REPL + 斜杠命令 + Ctrl+C 中止 |
 | `pi.codemode` | `packages/codemode` | codemode 工具：模型编写的 Python 在隔离子进程中经 Agent 管线组合调用其他工具，含按 token 预算的延迟暴露 |
@@ -37,7 +38,8 @@ pi（TypeScript monorepo）的 Python 移植版。目标是 1:1 复刻整个 mon
 | `pi.telemetry` | `packages/telemetry` | 遥测契约：span/上下文类型、OTLP/HTTP(JSON) 导出、内存与空实现后端 |
 | `pi.protocol` / `pi.server` / `pi.client` | `packages/protocol`、`packages/server`、`packages/client` | Pi v8 路由封包传输：严格 JSON 信封与定长 CBOR 帧、握手与身份校验、并发关联请求、TCP/Unix 传输、连接作用域端点与会话路由（见 ROUTED_PROTOCOL.md） |
 | `pi.chord` | `packages/chord` | Chord 服务层：契约绑定、`$chord.service` 控制调用、delta wire 编解码（`pi.delta`）、provider/consumer、状态编解码注册表；与 TS 的互通由 `tests/test_chord_interop.py` 以 Node 直接加载 TS 源码验证（见 ROUTED_PROTOCOL.md） |
-| `pi.coding_agent.mcp` | `packages/mcp` | MCP 客户端：stdio / Streamable HTTP（JSON/SSE）传输、工具发现与注册 |
+| `pi.coding_agent.mcp` / `mcp_oauth` | `packages/mcp`、`coding-agent/src/extensions/mcp` | MCP 客户端：stdio / Streamable HTTP（JSON/SSE）传输、工具发现与注册、连接生命周期；OAuth 资源/授权服务器发现、动态客户端注册、PKCE 登录与 token 轮换 |
+| `pi.coding_agent.syntax_highlight` | `coding-agent/src/utils/syntax-highlight.ts` | 整块 Pygments 分词 + 按行 ANSI 样式；多行字符串/注释与字符串插值 |
 | `pi.coding_agent.tui` | `packages/tui` | 终端 UI：全屏对话布局、多行编辑、补全、选择器、主题、快捷键、ANSI Markdown、终端图片 |
 
 ## 安装
@@ -341,11 +343,36 @@ Python CLI 自动读取用户目录的 `mcp.json` 和项目 `.pi/mcp.json`。项
 
 支持 stdio 和 Streamable HTTP 的 JSON/SSE 响应；协议参考 [MCP transports](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports)。stdio 的 `command` 是可执行文件，`args` 是参数列表，不通过 shell 拼接。可设置 `env`、相对工作目录的 `cwd` 和请求超时 `timeout`。`env`、`headers` 支持环境变量插值，不执行凭据命令。
 
-服务工具以 `mcp__服务__工具_哈希` 名称直接注册给模型，支持工具列表分页、JSON Schema 参数、文本/图片、`structuredContent` 和 `isError`。配置或连接失败会输出诊断，其他服务仍可使用。`/mcp` 显示状态，`/mcp reconnect` 或 `/reload` 重连并重新发现工具；退出时关闭连接并终止本地进程树。工具调用不自动重试，避免重复副作用。
+服务工具以 `mcp__服务__工具_哈希` 名称直接注册给模型，支持工具列表分页、JSON Schema 参数、文本/图片、`structuredContent` 和 `isError`。配置或连接失败会输出诊断，其他服务仍可使用。`/mcp` 显示状态，`/mcp reconnect` 或 `/reload` 重连并重新发现工具；退出时关闭连接并终止本地进程树。工具调用不自动重试，避免重复副作用。关闭会先封锁旧代次的新连接，再关闭已注册和连接中的 client，并等待连接、推送监听与通知触发的刷新任务结束；reload 会建立新代次，迟到的连接结果不能注册回来。
+
+### MCP OAuth
+
+HTTP 服务没有显式 `Authorization` 头时使用 OAuth。首次 401 会读取 `WWW-Authenticate` 的 `resource_metadata`/`scope`，自动发现受保护资源与授权服务器元数据，并把服务保留为可登录状态；启动过程不会打开浏览器。用 `/mcp login <server>` 完成 PKCE 登录，`/mcp logout <server>` 删除凭据。
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "url": "https://example.com/mcp",
+      "oauth": {"scope": "tools.read", "callback_port": 1456}
+    }
+  }
+}
+```
+
+`oauth` 可省略或只填部分字段：`authorize_url`/`token_url` 必须成对配置，配置静态端点时还需要 `client_id`；否则自动发现。支持 `client_secret`、`callback_url`（loopback http）、`client_name`、`application_type`（`native`/`web`，默认按 redirect URI 推导：自定义 scheme 或 loopback 主机为 `native`）、`auth_server_metadata_url`（受信任的显式元数据文档）和 `scope`。动态注册会发送 `application_type`，client 注册信息、issuer、discovery 与 token 一起写入 `<agent-dir>/mcp-auth.json`，按服务名与 URL 隔离。
+
+刷新 token 在同一凭据上串行化，轮换后的 refresh token 原子落盘；401 后的并发请求共享一次刷新。退出登录会阻止迟到的刷新把凭据写回；关闭会等待已经返回的刷新结果完成保存。issuer 不匹配、resource origin/路径不匹配、损坏的元数据或注册失败都会报错，不会把凭据发送到错误的 token 端点。
 
 扩展可用 `registerMcpServer`、`unregisterMcpServer` 和 `getMcpServers` 动态管理同一运行时的服务；变更会重建连接并刷新 Agent 工具。文件配置优先于同名扩展注册。
 
 ## Codemode
+
+### 工具搜索与 MCP 延迟声明
+
+MCP server 配置可设置 `"exposure": "deferred"`：工具保持可执行，但初始不声明给模型，并自动启用 `tool_search`。`direct` 为默认；`codemode` 保留间接调用。也可用 `--tools read,tool_search` 显式启用搜索。`--no-tools` 和 `--exclude-tools` 仍优先。
+
+`tool_search({"query": "search issues", "limit": 8})` 用 BM25 检索名称、描述与参数元数据，激活匹配项供下一次模型调用直接使用。已加载工具不重复返回；激活记录保存为当前分支的 `tool_search.loaded` 会话条目，在 resume/tree/fork 与 MCP 刷新后恢复。`tool_search` 不进入 codemode 的脚本目录。
 
 `packages/codemode` 的移植版（`pi.codemode` 子包：`tool` 适配 Agent 工具、`host` 管理子进程、`worker_source` 内嵌 worker 程序）。settings 中配置后启用：
 
@@ -364,11 +391,15 @@ Python CLI 自动读取用户目录的 `mcp.json` 和项目 `.pi/mcp.json`。项
 
 延迟暴露（deferred exposure）：工具目录按 MCP 命名空间分组、按 token 预算截取（默认 3000 token，超出部分不内联列出）；未列出的工具经 `search_tools(query, {limit, namespace})`、`describe_tool(name)`、`describe_namespace(name)` 按需查找。输出超过 `max_output_tokens`（默认 10000）时保留首尾并截断，完整输出落盘到临时文件。
 
+隐藏工具（`AgentTool.declared = False`，MCP 的 `--tools` 过滤与扩展注册均可设置）不进入模型的直接声明和顶层系统提示词，但仍留在 codemode 的可调用集合中；codemode 的声明会连同工具的 `prompt_guidelines` 一起呈现。工具集合或指南在 `/reload`、MCP `tools/list_changed` 后变化时，codemode 描述会按当前工具重新生成，脚本执行时也读取当前集合。被 `--no-tools`/`--exclude-tools` 排除的工具不属于 active，codemode 不能绕过。
+
 嵌套调用记录：脚本内的每次工具调用都经统一入口执行，获得稳定 ID（顶层调用 A 的子调用为 A/1，更深为 A/1/1）和直接父 ID；`tool_execution_*` 事件带 `parent_tool_call_id`。顶层工具结果消息只保存一份结果，并附带 `nested_calls` 摘要（参数、状态、耗时）。每个顶层调用的记录上限为 256 条、单条参数 8 KiB（UTF-8 JSON 字节）、保留参数合计 32 KiB；超限时省略参数或丢弃调用并置 `complete=false`，不影响执行和用量累计。
 
 用量口径：`AgentToolResult.usage` 只表示该工具自身产生的用量，不包含子工具。顶层结果落盘前合并一次：`ToolResultMessage.usage = 顶层工具自身 usage + 全部嵌套工具自身 usage`；`take_record` 具有消费语义，不会在多个消息事件中重复合并。`/usage` 与 `session_stats` 只统计 assistant 消息、顶层工具结果消息和显式额外用量（如压缩摘要），不遍历 `nested_calls`；缺少模型归属的工具用量归入 `Tools/summaries` 桶。`tool_calls` 仍是顶层模型发起的调用数，`nested_tool_calls` 是已保留的子调用记录数，`nested_tool_calls_complete=false` 时该数是下界。
 
 ## Skills 与提示词模板
+
+技能阅读提示按声明工具选择：`read` 可见时提示用 read，`bash` 可见时用 bash；两者都隐藏但仍在 active 时提示“加载 SKILL.md”而不点名工具；两者都不可用时省略技能节。
 
 启动时自动扫描以下位置：
 
@@ -621,6 +652,14 @@ asyncio.run(main())
 
 ## 持久化运行时（pi.durable）
 
+扩展由 `pi.durable.extensions.Extension` 定义，以 `Harness(..., extensions=[...])` 默认选择，或安装到 `Registry` 后用 `harness.configure(cid, extensions=["name"], instructions="...")` 按会话选择。扩展包含 `tools`、`tasks`、`hooks`、`sections`、`wraps` 和会话 `documents`。`pi.agent` 保存选择，fork 按分叉条目复制；`pi.provider` 在新会话生成独立身份。创建钩子 `conversation_created(tx, record)` 也适用于原始事务创建/fork。
+
+钩子使用 Python 名称：`before_request`、`after_response`、`on_yield`、`after_tools`、`before_tool`、`after_tool`、`before_compact`。参数末尾为 `HookApi` 和当前 `TaskRuntime`；`api.memo(name, candidate)` 持久化首次值，重放时返回已提交的值。请求/参数/结果钩子按扩展选择顺序组合；`on_yield` 的首个 `{"continue": "..."}` 继续同一 run，`before_compact` 可返回 `{"decline": true}` 或 `{"summary": "..."}`。
+
+`submit_input(cid, text, request_id=None, mode="steer")` 在忙碌时排队，`mode="followUp"` 等待 final；`submit_write(cid, draft)` 排队被动写入。generation 工具轮次等待结果全部落盘，运行 `after_tools`，在 postTools 边界放置 steering 和写入；成功回答在 final 边界放置 follow-up。重置写入（`head="self"`）使 postTools 按 final 选择队列；早于活动 head 的写入以 stale 结算。`withdraw_submission(id)` 撤回排队项，`abort_conversation(cid)` 撤回用户输入、保留写入并中止任务。空闲输入仍返回 generation task ID，忙碌输入返回 submission ID；`submission(id)` 读取持久化提交状态。
+
+独立 daemon：安装 `PyInstaller==6.16.0` 后运行 `python scripts/build_daemon.py`，生成 `pi/env/bin/pi-env-<platform>-<arch>/` 的二进制与 SHA-256 manifest；wheel/sdist 会携带这些文件。SSH 默认选择目标平台二进制，先校验本地 manifest，再使用原有远端 hash/原子部署路径。`.github/workflows/daemon.yml` 在 Linux/macOS/Windows 的 x64/arm64 原生构建并合并到分发包。源码检出不含的目标需先构建或显式传 `binary=`。
+
 `pi/durable/` 是 `packages/durable` 核心的 Python 移植：会话/任务/文档先提交后可见（`pi.durable.session`、`pi.durable.harness`、`pi.durable.storage`）。此外还移植了三块：
 
 | Python 模块 | TS 源 | 内容 |
@@ -628,6 +667,11 @@ asyncio.run(main())
 | `pi.durable.env` | `packages/durable/src/env` | 可移植执行环境契约（`ExecutionEnv`：文件系统 + shell + watch，`Result` 化错误）与本地实现 `LocalExecutionEnv`（asyncio + os，Windows 打开文件带 FILE_SHARE_DELETE，支持打开期间改名）；流式 UTF-8 解码（BOM/非法序列与一次性解码一致）、有界内存行扫描 `LineScanner`、`LocalFileWatcher`（`env/node-watch.ts` 的移植：原生事件只触发防抖重扫，上报 = 快照 diff ∪ 事件路径，原生失败落轮询并报 `overflow`；后端为标准库 ctypes——Windows `ReadDirectoryChangesW`、Linux inotify、macOS FSEvents。与 TS 的偏离：Windows 默认 native，句柄只开在 target 的最近存在祖先目录上（TS 因句柄阻塞祖先改名而在 Windows 轮询），另配 2s 重扫定时器自愈覆盖；`watch_mode="auto"/"native"/"polling"` 可强制） |
 | `pi.durable.tools` | `packages/durable/src/tools` | 持久化编码工具 `read`/`write`/`edit`/`bash`：跑在 `ExecutionEnv` 上而非宿主进程；read 截断走诊断（内容只有文件文本）、edit 精确唯一匹配（模糊归一 + 未改动行保留 + BOM/CRLF 保留）、bash 流式输出 + 尾窗口（跳过计数精确）+ 溢出落盘 + 超时/中止进程树终结；同文件 `edit`/`write` 经变更队列串行化 |
 | `pi.durable.testing` | `packages/durable/src/testing` | 一致性套件：`create_storage_conformance`（23 个用例 × 任意后端）、`create_env_conformance`（21 个用例 × 任意 ExecutionEnv）、`createExpectAssertions` 对应的 `ConformanceAssertions`、存储基准（`seed_storage_benchmark`/`measure_*_benchmarks`）与 pytest 适配（`runner.py`）；套件与测试运行器无关，`tests/test_durable_*_conformance.py` 驱动 |
+| `pi.durable.live` / `pi.durable.output.Progress` | `harness/live.ts`、`harness/output.ts` | `pi.live` 文档：生成中的 partial 与工具运行输出/详情；`Progress` 自适应提交（首个变更立即提交、最多一个在途、按写入字节 100 KiB/s 拉长间隔） |
+
+进度与 live 状态：`ProgressPolicy` 的 `partial_interval_ms` 与 `output_interval_ms` 默认都是 100 ms；缺省/`None` 取默认，`0` 保留，负数、NaN/无穷、bool 和错误类型直接报错。生成流按 partial 节流提交到 `pi.live.generation`；工具通过 `on_update` 累积运行输出，按 `OutputBuffer` 窗口截断并记录丢弃字节/行数，提交到 `pi.live.tools`。提交成功后才对订阅者可见；写入失败通过 `Harness.on_report` 暴露并拒绝等待者。`Progress.stop()` 取消定时器、等待在途提交并返回待最终事务结算的 waiter；settle/abort/retry/关闭/异常都走收尾，终态之后不再产生进度写入。
+
+恢复边界：重开存储只恢复已提交的 partial 和任务 checkpoint；未提交的尾部不可见，也不会被当成完整回答。running 任务恢复为 pending 后重新执行 provider 请求，settle 只追加一条最终 assistant 条目；abort/fault/orphan 会把已提交 partial 转成 `stop_reason=aborted` 的 assistant 条目并清空 live，避免重复结算。
 
 移植偏差：文档内容按完整版本存储（base 或 delta）；delta 操作批次（chord `r/s/d/a/t/p/m`，见 `pi.durable.delta`）在物化时重放到基准上，与 TS 语义一致。读取一律返回脱离存储的副本（调用方改动不影响存储），ID 分配在 2^53-1 耗尽时报错。
 
@@ -648,12 +692,14 @@ result = __import__("asyncio").run(create_read_tool().execute({"path": "README.m
 
 ## 测试
 
+新增缺口补全回归入口：`test_tool_search.py`、`test_durable_inbox_extensions.py`、`test_daemon_distribution.py`。后二进制协议测试在没有本机预编译 daemon 时跳过，CI 在每个平台原生构建后运行。
+
 ```bash
 pip install pytest
 python -m pytest tests -q
 ```
 
-测试全部离线：provider 层用 canned SSE 通过 `httpx` mock 传输验证事件映射；agent loop 用 `faux` 脚本驱动；工具层直接操作临时目录。
+测试全部离线：provider 层用 canned SSE 通过 `httpx` mock 传输验证事件映射；agent loop 用 `faux` 脚本驱动；工具层直接操作临时目录。v1.0.4 补全的回归入口：`test_mcp_shutdown_parity.py`、`test_mcp_oauth_discovery.py`、`test_mcp_oauth_registration.py`、`test_mcp_oauth_lifecycle.py`、`test_hidden_tools_parity.py`、`test_syntax_highlight.py`、`test_durable_progress.py`、`test_durable_progress_recovery.py`。
 
 ## 项目信任、崩溃报告与诊断
 
@@ -687,3 +733,6 @@ Agent 和 CLI 默认启用自动上下文压缩：接近模型上下文窗口时
 - prompt cache 预热（TS CacheWarmer：按 TTL 以 1 token 输出重放请求）
 - 其余 provider 的专属认证流程；已实现 Claude、Codex、Copilot、Kimi、xAI、Radius 登录，OpenAI 的 Sign in with ChatGPT、OpenRouter PKCE 及可配置标准设备码 OAuth
 - models.dev 在线目录仅在显式触发（`--sync-models` / `/sync-models` / `sync_models`）时刷新，Radius 发现在启动或登录后刷新；TS 版每次启动都会刷新目录。未收录的模型 id 以默认参数运行
+- durable 的命名扩展、钩子与 `pi.inbox` 已实现；仍未提供 TS 完整 Conversation/Submission handle API，Python 使用 Harness 方法和整数 ID
+- 预编译 daemon 的原生构建、SHA-256 manifest、wheel 数据打包与六平台 CI 已补；当前工作区实际构建并验证 Windows x64。其他平台产物需运行 CI；Android 未提供冻结产物，可继续传入 `binary=`
+- 代码高亮使用 Pygments（`Pygments==2.21.0`）而非 highlight.js，token 分类与颜色映射不追求逐字节一致；未知语言回退为普通代码块
