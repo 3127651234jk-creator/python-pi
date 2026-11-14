@@ -441,10 +441,21 @@ class ExtensionManager:
             for base in default_bases:
                 if base.is_dir():
                     paths.extend(sorted(base.iterdir()))
+            # Package placement adds a namespace directory. Use its recorded
+            # manifest paths rather than recursively loading helper modules.
+            for package in read_json(self.config.agent_dir / "packages.json").values():
+                for raw in package.get("files", {}).get("extensions", []):
+                    installed = Path(raw)
+                    paths.append(installed)
+                    if installed.is_dir() and not any((installed / name).is_file() for name in
+                            ("__init__.py", "index.ts", "index.mts", "index.js", "index.mjs")):
+                        paths.extend(sorted(installed.iterdir()))
         result = []
         for path in paths:
             if path.is_dir():
-                path = path / "__init__.py"
+                path = next((path / name for name in
+                             ("__init__.py", "index.ts", "index.mts", "index.js", "index.mjs")
+                             if (path / name).is_file()), path)
             if path.suffix in (".py", ".ts", ".mts", ".js", ".mjs") and path.exists() \
                     and path.resolve() not in result:
                 result.append(path.resolve())
