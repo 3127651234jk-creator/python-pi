@@ -552,7 +552,10 @@ class Harness:
                         continue
                     terminal_tasks.append(other)
                 if record.state.policy == "failFast":
-                    failed = [t for t in terminal_tasks if t.state.outcome.status != "completed"]
+                    # Persisted malformed terminal states are failed dependencies,
+                    # never successful joins or a reason to stall every tick.
+                    failed = [t for t in terminal_tasks
+                              if t.state.outcome is None or t.state.outcome.status != "completed"]
                     if not failed and len(terminal_tasks) != len(ids):
                         continue
                     if failed:

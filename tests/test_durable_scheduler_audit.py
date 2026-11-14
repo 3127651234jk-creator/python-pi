@@ -36,6 +36,28 @@ def test_runtime_rejects_missing_outcome_atomically(status):
     asyncio.run(scenario())
 
 
+def test_fail_fast_handles_persisted_terminal_without_outcome():
+    async def scenario():
+        storage = MemoryStorage()
+        harness = Harness(create_session(storage), resolve_model("faux"))
+        await storage.commit([
+            write_task(task(2, TaskState(status="terminal"))),
+            write_task(task(3, TaskState(status="running", checkpoint={"phase": "run"}))),
+            write_task(task(4, TaskState(status="waiting", on=[2, 3], policy="failFast"))),
+            write_task(task(5, TaskState(status="waiting", on=[2], policy="allSettled",
+                                         checkpoint={"phase": "run"}))),
+        ])
+        assert await harness._resume_waiting_tasks()
+        joined = await storage.task(4)
+        assert joined.state.status == "terminal"
+        assert joined.state.outcome.status == "aborted"
+        assert joined.state.outcome.reason == "join failed: task 2"
+        assert (await storage.task(5)).state.status == "pending"
+        assert not await harness._resume_waiting_tasks()
+
+    asyncio.run(scenario())
+
+
 def test_transcript_and_task_listing_read_all_pages():
     async def scenario():
         storage = MemoryStorage()
