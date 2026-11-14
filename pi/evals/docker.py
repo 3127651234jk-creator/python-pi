@@ -149,8 +149,7 @@ def task_directory_name(task: EvalTask) -> str:
 def run_task(context: DockerContext, task: EvalTask) -> Optional[str]:
     """Run one planned arm; return the report path when one was produced."""
     output_directory = os.path.join(context.artifact_directory, "tasks", task_directory_name(task))
-    test_name = f"{task.eval_set} {task.case_id}"
-    exact_name = "^" + re.sub(r"[.*+?^${}()|[\]\\]", lambda match: "\\" + match.group(0), test_name) + "$"
+    exact_name = "^" + re.sub(r"[.*+?^${}()|[\]\\]", lambda match: "\\" + match.group(0), task.full_name) + "$"
     args = docker_args(context, task.variant, output_directory,
                        ["--project", "docs", task.file, "--testNamePattern", exact_name])
     _execute("docker", args)

@@ -11,7 +11,7 @@ from pi.evals.cli import (
     normalize_discovered_file,
     parse_eval_cli,
 )
-from pi.evals.docker import docker_args, require_eval_auth_file, task_directory_name
+from pi.evals.docker import docker_args, require_eval_auth_file, run_task, task_directory_name
 from pi.evals.plan import EvalTask, parse_discovered_cases
 
 
@@ -157,3 +157,23 @@ def test_task_directory_name_is_a_stable_digest():
                     variant="with_docs", model="fixture/model", run_number=1)
     assert task_directory_name(task) == task_directory_name(task)
     assert len(task_directory_name(task)) == 64
+
+
+def test_run_task_selects_the_canonical_full_name(tmp_path, monkeypatch):
+    from pi.evals.docker import DockerContext
+
+    context = DockerContext(
+        images={"without_docs": {"name": "image", "id": "id"}},
+        artifact_directory=str(tmp_path), auth_path="auth.json",
+        provider="fixture", model="model", runs_per_variant=1,
+    )
+    task = EvalTask(file="evals/x.docs.eval.py", full_name="Set > case (1)",
+                    eval_set="Set", case_id="case (1)", variant="without_docs",
+                    model="fixture/model", run_number=1)
+    commands = []
+    monkeypatch.setattr("pi.evals.docker._execute",
+                        lambda command, args, capture=False: (commands.append((command, args)) or (0, "")))
+
+    assert run_task(context, task) is None
+    pattern = commands[0][1][commands[0][1].index("--testNamePattern") + 1]
+    assert pattern == r"^Set > case \(1\)$"

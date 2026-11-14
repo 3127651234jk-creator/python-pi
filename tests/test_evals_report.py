@@ -41,7 +41,7 @@ def write_task_report(directory, assertion=None):
             "status": "passed",
             "assertionResults": [{
                 "ancestorTitles": [TASK.eval_set],
-                "fullName": f"{TASK.eval_set} {TASK.case_id}",
+                "fullName": TASK.full_name,
                 "status": status,
                 "title": TASK.case_id,
                 "failureMessages": [],

@@ -217,7 +217,7 @@ async def read_task_observation(task: EvalTask, report_path: str, artifact_direc
         raw_report = read_vitest_json_report_file(report_path)
     except Exception:  # noqa: BLE001 - unreadable reports are errored observations
         return _observation(identity, outcome="errored")
-    reported_full_name = f"{task.eval_set} {task.case_id}"
+    reported_full_name = task.full_name
     assertions = [assertion for result in raw_report["testResults"] for assertion in result["assertionResults"]]
     if len(assertions) != 1:
         return _observation(identity, outcome="errored")
