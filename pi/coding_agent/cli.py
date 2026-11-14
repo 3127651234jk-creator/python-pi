@@ -1308,6 +1308,11 @@ async def refresh_radius_models(registry: ModelRegistry) -> None:
 
 
 async def async_main(argv: Optional[List[str]] = None) -> int:
+    # Redirected Windows streams can default to a legacy code page. Configure
+    # text mode too, before startup diagnostics or model output are written.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     filtered_argv, extension_flag_values = split_extension_flags(raw_argv, build_parser())
     args = build_parser().parse_args(filtered_argv)
