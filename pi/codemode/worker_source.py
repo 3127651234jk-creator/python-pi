@@ -15,6 +15,7 @@ import textwrap
 
 WORKER_SOURCE = textwrap.dedent('''
     """Codemode worker: runs user code with a threaded tool-call bridge."""
+    import ast
     import builtins
     import concurrent.futures
     import json
@@ -42,12 +43,36 @@ WORKER_SOURCE = textwrap.dedent('''
     # code-evaluation entry point; the tool bridge is their only I/O.
     BLOCKED_BUILTINS = {
         "open", "input", "eval", "exec", "compile", "__import__", "breakpoint",
-        "help", "exit", "quit",
+        "help", "exit", "quit", "getattr", "setattr", "delattr", "globals", "locals", "vars",
+        "print", "license", "credits", "copyright",
     }
 
     def restricted_builtins():
         return {name: value for name, value in vars(builtins).items()
                 if name not in BLOCKED_BUILTINS}
+
+    def compile_script(source, filename):
+        tree = ast.parse(source, filename, "exec")
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute) and node.attr.startswith("_")
+                    and node.attr != "__name__"):
+                raise SyntaxError(f"attribute access is disabled: {node.attr}")
+        return compile(tree, filename, "exec")
+
+    class ScriptCallable:
+        __slots__ = ("_target",)
+
+        def __init__(self, target):
+            object.__setattr__(self, "_target", target)
+
+        def __call__(self, *args, **kwargs):
+            target = object.__getattribute__(self, "_target")
+            return target(*args, **kwargs)
+
+        def __getattribute__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return object.__getattribute__(self, name)
 
     class ScriptExit(Exception):
         def __init__(self, value):
@@ -420,30 +445,33 @@ WORKER_SOURCE = textwrap.dedent('''
         pi = Pi()
         pi.tools = ToolsNamespace(bridge, [m.get("js_name") or m["name"] for m in init.get("tools", [])])
         pi.ALL_TOOLS = all_tools
-        pi.text = text
-        pi.image = image
-        pi.exit = exit
-        pi.store = store
-        pi.load = load
-        pi.wait = wait
-        pi.wait_all = wait_all
-        pi.wait_any = wait_any
-        pi.search_tools = search_tools
-        pi.describe_tool = describe_tool
-        pi.describe_namespace = describe_namespace
+        pi.text = ScriptCallable(text)
+        pi.image = ScriptCallable(image)
+        pi.exit = ScriptCallable(exit)
+        pi.store = ScriptCallable(store)
+        pi.load = ScriptCallable(load)
+        pi.wait = ScriptCallable(wait)
+        pi.wait_all = ScriptCallable(wait_all)
+        pi.wait_any = ScriptCallable(wait_any)
+        pi.search_tools = ScriptCallable(search_tools)
+        pi.describe_tool = ScriptCallable(describe_tool)
+        pi.describe_namespace = ScriptCallable(describe_namespace)
         pi.console = console
 
         tools = pi.tools
-        environment = {"pi": pi, "tools": tools, "ALL_TOOLS": all_tools, "text": text, "image": image,
-                       "exit": exit, "store": store, "load": load, "wait": wait, "wait_all": wait_all,
-                       "wait_any": wait_any, "search_tools": search_tools, "describe_tool": describe_tool,
-                       "describe_namespace": describe_namespace, "console": console, "print": Console._log,
+        environment = {"pi": pi, "tools": tools, "ALL_TOOLS": all_tools,
+                       "text": pi.text, "image": pi.image, "exit": pi.exit,
+                       "store": pi.store, "load": pi.load, "wait": pi.wait,
+                       "wait_all": pi.wait_all, "wait_any": pi.wait_any,
+                       "search_tools": pi.search_tools, "describe_tool": pi.describe_tool,
+                       "describe_namespace": pi.describe_namespace, "console": console,
+                       "print": ScriptCallable(Console._log),
                        "__name__": "__codemode__", "__builtins__": restricted_builtins()}
         value = None
         try:
             with open(sys.argv[1], "r", encoding="utf-8") as handle:
                 source = handle.read()
-            exec(compile(source, sys.argv[1], "exec"), environment)
+            exec(compile_script(source, sys.argv[1]), environment)
             if environment.get("result") is not None:
                 value = environment["result"]
         except ScriptExit as stop:

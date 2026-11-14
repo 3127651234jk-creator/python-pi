@@ -22,7 +22,9 @@ from pi.codemode.worker_source import WORKER_SOURCE
 
 # Every module import inside the executed worker program; the set is exact on
 # purpose: new imports must be standard library and stay dependency-free.
-WORKER_IMPORTS = {"builtins", "concurrent.futures", "json", "math", "os", "re", "sys", "threading", "traceback"}
+WORKER_IMPORTS = {
+    "ast", "builtins", "concurrent.futures", "json", "math", "os", "re", "sys", "threading", "traceback",
+}
 
 PNG_1PX = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
            "AAAABJRU5ErkJggg==")
@@ -197,6 +199,20 @@ def test_worker_scripts_are_denied_file_import_and_eval_escapes(tmp_path):
         }
         assert run.value["sum"] == 10
         assert run.value["label"] == "{'a': 1}"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("code", [
+    "result = text.__globals__['builtins'].open('escaped.txt', 'w')",
+    "result = text.__class__.__call__.__globals__['builtins'].open('escaped.txt', 'w')",
+    "result = getattr(text, '__globals__')['builtins'].open('escaped.txt', 'w')",
+])
+def test_worker_scripts_cannot_reach_helper_globals(tmp_path, code):
+    async def scenario():
+        run = await run_script(tmp_path, code)
+        assert run.error is not None
+        assert not (tmp_path / "escaped.txt").exists()
 
     asyncio.run(scenario())
 
