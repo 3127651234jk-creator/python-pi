@@ -313,6 +313,11 @@ async def _resolve_eval_model(workspace: str, agent_dir: str, host_agent_dir: st
     except ModelError as error:
         raise RuntimeError(
             f"Eval model has no configured authentication: {selection.provider}/{selection.id}") from error
+
+    async def fixed_api_key(_provider: str) -> str:
+        return api_key
+
+    model.get_api_key = fixed_api_key
     return registry, model, api_key, stored_credential
 
 

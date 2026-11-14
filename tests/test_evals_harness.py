@@ -162,6 +162,29 @@ def test_run_pi_coding_agent_completes_against_the_faux_provider(tmp_path, monke
     assert json.loads(session_lines[0])["type"] == "message"
 
 
+def test_resolved_eval_model_keeps_credentials_after_isolated_auth_is_removed(tmp_path):
+    from pi.coding_agent.auth import AuthStore
+    from pi.evals.harness import _resolve_eval_model
+
+    workspace = tmp_path / "workspace"
+    agent_dir = tmp_path / "isolated-agent"
+    host_agent_dir = tmp_path / "host-agent"
+    workspace.mkdir()
+    agent_dir.mkdir()
+    host_agent_dir.mkdir()
+    AuthStore(host_agent_dir / "auth.json").set(
+        "openai", {"type": "api_key", "key": "staged-secret"})
+
+    _registry, model, key, _credential = asyncio.run(_resolve_eval_model(
+        str(workspace), str(agent_dir), str(host_agent_dir),
+        ModelSelection(provider="openai", id="gpt-4o-mini"),
+    ))
+    (agent_dir / "auth.json").unlink()
+
+    assert key == "staged-secret"
+    assert asyncio.run(model.get_api_key("openai")) == "staged-secret"
+
+
 def test_run_pi_coding_agent_preserves_partial_diagnostics_on_failure(monkeypatch):
     from pi.ai.providers.faux import reset_script_index
 

@@ -144,13 +144,17 @@ def main(argv: List[str]) -> int:
         assert_sandbox_cannot_read(path)
 
     agent_dir = Path("/tmp/pi-eval-host-agent")
-    agent_dir.mkdir(parents=True, exist_ok=True)
+    agent_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(agent_dir, 0o700)
     auth_source = Path("/run/pi-eval-secrets/auth.json")
     if auth_source.exists():
-        shutil.copyfile(auth_source, agent_dir / "auth.json")
+        auth_target = agent_dir / "auth.json"
+        shutil.copyfile(auth_source, auth_target)
+        os.chmod(auth_target, 0o600)
     sandbox_uid = parse_id("PI_EVAL_SANDBOX_UID")
     sandbox_gid = parse_id("PI_EVAL_SANDBOX_GID")
-    chown_tree(agent_dir, sandbox_uid, sandbox_gid)
+    if auth_source.exists():
+        assert_sandbox_cannot_read(agent_dir / "auth.json")
     chown_tree(ARTIFACTS, sandbox_uid, sandbox_gid)
     os.environ["HOME"] = "/tmp/pi-eval-bootstrap"
     os.environ["USERPROFILE"] = os.environ["HOME"]
