@@ -317,13 +317,18 @@ async def run_prompt(agent: Agent, text: str, renderer: CliRenderer, session: Op
     unsubscribe_render = agent.subscribe(renderer)
     task = asyncio.ensure_future(agent.prompt(text, images=images))
     try:
-        await task
-    except KeyboardInterrupt:
+        # asyncio.run translates Ctrl+C into cancellation of the main task.
+        # Keep the agent alive long enough to finish its cooperative abort and
+        # publish the partial message through the subscribed session recorder.
+        await asyncio.shield(task)
+    except (KeyboardInterrupt, asyncio.CancelledError):
         agent.abort()
         try:
             await task
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
+        if isinstance(renderer, JsonWriter):
+            raise RuntimeError("Request aborted") from None
         print("\n[aborted]", flush=True)
     finally:
         unsubscribe()
