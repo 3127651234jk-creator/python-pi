@@ -169,6 +169,20 @@ def test_anthropic_stream_mapping(monkeypatch):
     assert body["messages"] == [{"role": "user", "content": "hi"}]
 
 
+def test_anthropic_stream_accepts_message_delta_without_message_stop(monkeypatch):
+    from pi.ai.providers import anthropic
+
+    without_stop = ANTHROPIC_SSE.rsplit("event: message_stop", 1)[0]
+    collect = stream_with(monkeypatch, anthropic, without_stop)
+    events, _ = asyncio.run(collect())
+
+    done = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(done) == 1
+    assert done[0].reason == "toolUse"
+    assert done[0].message.content[1].text == "Hello"
+    assert done[0].message.content[2].arguments == {"path": "a.txt"}
+
+
 ANTHROPIC_REDACTED_SSE = """event: message_start
 data: {"type":"message_start","message":{"id":"msg_2","model":"claude-test","usage":{"input_tokens":1}}}
 

@@ -38,6 +38,20 @@ def test_anthropic_initial_tool_input_survives_stop():
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("reason,expected", [("end_turn", "stop"), ("tool_use", "toolUse"),
+                                               ("max_tokens", "length")])
+def test_anthropic_message_delta_marks_the_partial_complete_without_message_stop(reason, expected):
+    async def check():
+        current = state()
+        events = [event async for event in anthropic._convert_events(
+            None, {"type": "message_delta", "delta": {"stop_reason": reason}}, current)]
+        assert events == []
+        assert current.partial.raw_stop_reason == reason
+        assert current.partial.stop_reason == expected
+
+    asyncio.run(check())
+
+
 def test_duplicate_finish_preserves_tool_arguments():
     async def check():
         current = state()

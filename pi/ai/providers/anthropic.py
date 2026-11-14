@@ -332,6 +332,7 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         raw_reason = delta.get("stop_reason")
         if raw_reason:
             state.set_raw_stop_reason(raw_reason)
+            partial.stop_reason = _STOP_REASON_MAP.get(raw_reason, "error")
             state.set_end_turn(True)
         usage = data.get("usage", {}) or {}
         if usage:
