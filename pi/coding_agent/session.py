@@ -116,6 +116,7 @@ class SessionManager:
         self.entries: List[SessionEntry] = []
         self.leaf_id: Optional[str] = None
         self.name = ""
+        self._incomplete_tail_offset: Optional[int] = None
         os.makedirs(self.session_dir, exist_ok=True)
 
     def start_new(self) -> str:
@@ -131,6 +132,7 @@ class SessionManager:
         with open(path, "a", encoding="utf-8"):
             pass
         self.session_file = path
+        self._incomplete_tail_offset = None
         self.entries = []
         self.leaf_id = None
         self.name = ""
@@ -140,6 +142,16 @@ class SessionManager:
         if self.session_file is None:
             self.start_new()
         assert self.session_file is not None
+        if self._incomplete_tail_offset is not None:
+            with open(self.session_file, "r+b") as handle:
+                handle.truncate(self._incomplete_tail_offset)
+            self._incomplete_tail_offset = None
+        with open(self.session_file, "rb+") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.write(b"\n")
         with open(self.session_file, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -389,12 +401,23 @@ class SessionManager:
         entries = []
         leaf = None
         name = ""
-        with open(path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
+        incomplete_tail_offset = None
+        with open(path, "rb") as handle:
+            while True:
+                offset = handle.tell()
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                    record = json.loads(line) if line else None
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    if not raw_line.endswith(b"\n"):
+                        incomplete_tail_offset = offset
+                        break
+                    raise ValueError(f"Invalid session JSON in {path} at byte {offset}") from None
                 if not line:
                     continue
-                record = json.loads(line)
                 if not isinstance(record, dict):
                     raise ValueError("Session line must be a JSON object")
                 kind = record.get("type")
@@ -433,6 +456,7 @@ class SessionManager:
                     entries.append(SessionEntry(entry_id, parent, message, timestamp=record.get("timestamp", "")))
                     leaf = entry_id
         self.session_file = path
+        self._incomplete_tail_offset = incomplete_tail_offset
         self.entries = entries
         self.leaf_id = leaf
         self.name = name

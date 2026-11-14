@@ -44,7 +44,9 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from ..agent.types import AgentTool, AgentToolResult, BeforeToolCallResult
+from ..agent.types import AgentTool, AgentToolResult, BeforeToolCallResult, AfterToolCallResult
+from ..ai.providers.pi_messages import wire_message
+from ..ai.json_io import usage_from_json
 from ..ai.types import ImageContent, TextContent
 from ..ai.models import ModelError
 from .config import Configuration
@@ -730,12 +732,30 @@ class TsExtensionBridge:
 
     def _event_handler(self, handler_id: str, event_name: str):
         async def handler(event, context=None):
+            if event_name in ("tool_call", "tool_result") and not isinstance(event, dict):
+                wire_event = {"type": event_name, "toolCallId": event.tool_call_id,
+                              "toolName": event.tool_name, "input": to_jsonable(event.args)}
+                if event.parent_tool_call_id is not None:
+                    wire_event["parentToolCallId"] = event.parent_tool_call_id
+                if event_name == "tool_result":
+                    wire_event.update(wire_message(event.result))
+                    wire_event["isError"] = event.is_error
+            else:
+                wire_event = wire_message(event)
+                wire_event["type"] = event_name
             payload = await self._request("dispatchEvent", {
-                "handlerId": handler_id, "event": to_jsonable(event),
+                "handlerId": handler_id, "event": wire_event,
                 "context": self._context_payload()})
             if not isinstance(payload, dict) or payload.get("error"):
                 return None
-            result = payload.get("result")
+            result = payload
+            if event_name == "tool_result" and isinstance(result, dict):
+                converted = result_from_json(result)
+                return AfterToolCallResult(
+                    content=converted.content if "content" in result else None,
+                    details=converted.details, structured_content=converted.structured_content,
+                    is_error=result.get("isError"), terminate=result.get("terminate"),
+                    usage=usage_from_json(result["usage"]) if result.get("usage") is not None else None)
             if event_name == "tool_call":
                 if isinstance(result, dict) and result.get("block"):
                     return BeforeToolCallResult(block=True, reason=result.get("reason"))

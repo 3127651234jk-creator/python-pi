@@ -108,7 +108,13 @@ async def run_rg(cwd: str, args: List[str], limit: int, signal: Optional[AbortSi
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if include is not None and not include(text):
                 continue
-            is_match = not matches or re.match(r"^.*:\d+:", text) is not None
+            is_match = not matches
+            if matches:
+                for marker in re.finditer(r"(:\d+:|-\d+-)", text):
+                    filename = text[:marker.start()]
+                    if os.path.isfile(os.path.join(cwd, filename)):
+                        is_match = marker.group().startswith(":")
+                        break
             if is_match:
                 count += 1
                 if count > limit:

@@ -85,6 +85,8 @@ def token_record(data, provider, previous=None):
     if type(expires) not in (int, float) or not math.isfinite(expires) or expires <= 0:
         raise ValueError("Invalid OAuth token expiry")
     record = {"type": "oauth", "access": access, "refresh": refresh, "expires": time.time() + expires}
+    if provider == "radius":
+        record["expires"] -= RADIUS_TOKEN_SKEW_SECONDS
     if provider == "openai-codex":
         record["account_id"] = account_id(access)
     return record

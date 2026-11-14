@@ -55,7 +55,8 @@ async def stream_faux(
 ) -> AsyncIterator[Any]:
     options = options or SimpleStreamOptions()
     script = getattr(options, "script", None) or json.loads(os.environ.get("FAUX_SCRIPT", "[]")) or default_script()
-    turn = script[_next_index()]
+    script_index = _next_index()
+    turn = script[script_index] if script_index < len(script) else {"error": "Faux script exhausted"}
     timestamp = int(time.time() * 1000)
 
     partial = AssistantMessage(

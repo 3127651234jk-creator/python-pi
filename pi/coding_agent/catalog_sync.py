@@ -9,6 +9,7 @@ configuration in models.json still wins because it is applied afterwards).
 from __future__ import annotations
 
 import time
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -37,7 +38,11 @@ def cache_path(agent_dir: Path) -> Path:
 
 
 def load_cache(agent_dir: Path, max_age: float = CACHE_MAX_AGE) -> Optional[dict]:
-    data = read_json(cache_path(agent_dir))
+    try:
+        data = read_json(cache_path(agent_dir))
+    except ValueError as exc:
+        logging.getLogger(__name__).warning("%s", exc)
+        return None
     fetched = data.get("fetched_at")
     providers = data.get("providers")
     if not isinstance(fetched, (int, float)) or not isinstance(providers, dict):

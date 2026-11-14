@@ -100,7 +100,13 @@ class ModelRegistry:
             unknown = set(provider) - {"api", "base_url", "api_key", "api_key_env", "headers", "models", "oauth", "auth_required"}
             if unknown:
                 raise ModelError(f"Unknown provider settings: {', '.join(sorted(unknown))}")
-            merged[name] = {**merged.get(name, {}), **provider}
+            entry = merged.get(name, {})
+            if name == "radius" and isinstance(provider.get("models"), list):
+                user_ids = {model.get("id") for model in provider["models"] if isinstance(model, dict)}
+                discovered = [model for model in entry.get("models", []) if model.get("id") not in user_ids]
+                merged[name] = {**entry, **provider, "models": discovered + provider["models"]}
+            else:
+                merged[name] = {**entry, **provider}
         models = {}
         for identifier in list_catalog():
             provider, model_id = identifier.split("/", 1)

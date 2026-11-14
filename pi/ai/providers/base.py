@@ -203,9 +203,10 @@ async def run_provider_stream(
                 model, request_factory, endpoint_path, headers_factory, convert_events, options, timestamp,
                 on_response_error=on_response_error,
             ):
-                if event.type in ("start", "done", "error"):
+                event_type = event.get("type") if isinstance(event, dict) else event.type
+                if event_type in ("start", "done", "error"):
                     span.add_event(
-                        "stream.event", {"event.type": event.type, "stop.reason": getattr(event, "reason", None)}
+                        "stream.event", {"event.type": event_type, "stop.reason": getattr(event, "reason", None)}
                     )
                 queue.put_nowait(event)
         finally:

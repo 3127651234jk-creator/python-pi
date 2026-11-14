@@ -370,7 +370,7 @@ def create_bash_tool(
 
         structured_content = {
             "output": content,
-            "truncated": truncation.truncated,
+            "truncated": truncation.total_bytes > STRUCTURED_OUTPUT_MAX_BYTES,
             "exit_code": exit_code,
             "wall_time_seconds": wall_time_seconds,
         }

@@ -9,6 +9,7 @@ registry on reload; model ids the user configured in models.json still win.
 from __future__ import annotations
 
 import os
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -114,7 +115,11 @@ def save_cache(agent_dir: Path, gateway: str, config: Dict[str, Any]) -> None:
 
 
 def load_cache(agent_dir: Path, max_age: float = CACHE_MAX_AGE) -> Optional[dict]:
-    data = read_json(cache_path(agent_dir))
+    try:
+        data = read_json(cache_path(agent_dir))
+    except ValueError as exc:
+        logging.getLogger(__name__).warning("%s", exc)
+        return None
     fetched = data.get("fetched_at")
     if (not isinstance(fetched, (int, float)) or not isinstance(data.get("base_url"), str)
             or not isinstance(data.get("models"), list)):

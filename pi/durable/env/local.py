@@ -1056,7 +1056,7 @@ class _CommandRunner:
     # -- output ---------------------------------------------------------------
 
     def _emit(self, text: str, stream: str, skipped: Optional[ShellOutputSkip] = None) -> None:
-        if self._settled or text == "" or self._options.on_output is None or self._callback_error is not None:
+        if self._settled or (text == "" and skipped is None) or self._options.on_output is None or self._callback_error is not None:
             return
         self._last_stream = stream
         try:

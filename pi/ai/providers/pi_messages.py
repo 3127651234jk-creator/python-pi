@@ -20,6 +20,7 @@ WIRE_NAMES = {
     "thinking_level": "thinkingLevel", "error_message": "errorMessage", "raw_stop_reason": "rawStopReason",
     "end_turn": "endTurn", "cache_read": "cacheRead", "cache_write": "cacheWrite",
     "cache_write_1h": "cacheWrite1h",
+    "raw_item": "rawItem",
 }
 EVENTS = {cls.type: cls for cls in (
     types.TextStartEvent, types.TextDeltaEvent, types.TextEndEvent,
@@ -76,7 +77,7 @@ def wire_message(message):
         if not isinstance(value, dict):
             return value
         # nested_calls is a session record, not model context.
-        return {WIRE_NAMES.get(key, key): (item if key in ("arguments", "parameters", "details", "sections")
+        return {WIRE_NAMES.get(key, key): (item if key in ("arguments", "parameters", "details", "sections", "raw_item")
                                          else convert(item))
                 for key, item in value.items() if item is not None and key != "nested_calls"}
     return convert(data)

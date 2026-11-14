@@ -141,8 +141,6 @@ class Session:
         from .transaction import _LoadedDocument
 
         address_id = _address_key_id(address)
-        if address_id in self._document_cache:
-            return self._document_cache[address_id]
         record = await self.storage.find_document(address, "current")
         if record is None:
             self._document_cache[address_id] = None
@@ -150,6 +148,10 @@ class Session:
         stored = await self.storage.document(record.id, "current")
         if stored is None:
             raise StorageRejected(f"Current document {record.id} ({record.kind}) cannot be read")
+        cached = self._document_cache.get(address_id)
+        if (cached is not None and cached.record == stored.record
+                and cached.stored_version == stored.version and cached.value == stored.value):
+            return cached
         loaded = _LoadedDocument(record=stored.record, stored_version=stored.version, value=stored.value)
         self._document_cache[address_id] = loaded
         return loaded

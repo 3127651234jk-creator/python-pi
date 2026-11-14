@@ -180,15 +180,20 @@ class OTLPTelemetryContext(TelemetryContext):
             return
         body = {"resourceSpans": [{"resource": {"attributes": _attributes(self.resource_attributes)},
                                    "scopeSpans": [{"scope": {"name": "pi-python"}, "spans": spans}]}]}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(self.endpoint, json=body, headers=self.headers)
-        if response.status_code >= 400:
-            self.last_error = f"OTLP export failed (HTTP {response.status_code})"
-            raise RuntimeError(self.last_error)
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(self.endpoint, json=body, headers=self.headers)
+            if response.status_code >= 400:
+                self.last_error = f"OTLP export failed (HTTP {response.status_code})"
+                raise RuntimeError(self.last_error)
+        except BaseException:
+            self._records = [record for record in batch if record.settled] + self._records
+            raise
 
     async def close(self) -> None:
         if self._export_task is not None and not self._export_task.done():
             self._export_task.cancel()
+            await asyncio.gather(self._export_task, return_exceptions=True)
         try:
             await self.flush()
         except Exception as exc:  # noqa: BLE001

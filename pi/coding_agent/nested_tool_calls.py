@@ -289,6 +289,10 @@ class NestedToolCallRunner:
         scope = self._scope_for(caller_id)
         tool_call_id = f"{caller_id}/{scope.next_id}"
         scope.next_id += 1
+        reserved_ids = {block.id for block in getattr(call.assistant_message, "content", []) if isinstance(block, ToolCall)}
+        while tool_call_id in reserved_ids or tool_call_id in self._scopes:
+            tool_call_id = f"{caller_id}/{scope.next_id}"
+            scope.next_id += 1
         arguments = args if isinstance(args, dict) else {}
         record = scope.recorder.start(tool_call_id, caller_id, name, arguments)
 

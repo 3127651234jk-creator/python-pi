@@ -172,7 +172,7 @@ def test_custom_view_is_unavailable_without_a_host(tmp_path):
 def test_event_handler_result_mapping(tmp_path):
     async def check():
         bridge = make_bridge(tmp_path)
-        canned = {"value": {"result": {}}}
+        canned = {"value": {}}
 
         async def fake_request(method, params, timeout=None):
             return canned["value"]
@@ -186,21 +186,21 @@ def test_event_handler_result_mapping(tmp_path):
         input_ = bridge.api.handlers["input"][0]
         other = bridge.api.handlers["session_start"][0]
 
-        canned["value"] = {"result": {"block": True, "reason": "nope"}}
+        canned["value"] = {"block": True, "reason": "nope"}
         outcome = await tool_call({"tool_name": "write"}, None)
         assert isinstance(outcome, BeforeToolCallResult) and outcome.block and outcome.reason == "nope"
 
-        canned["value"] = {"result": None}
+        canned["value"] = None
         assert await tool_call({"tool_name": "read"}, None) is None
 
-        canned["value"] = {"result": {"action": "transform", "text": "new"}}
+        canned["value"] = {"action": "transform", "text": "new"}
         outcome = await input_({"text": "original"}, None)
         assert outcome is not None and outcome.text == "new"
 
         canned["value"] = {"error": "handler exploded"}
         assert await input_({"text": "x"}, None) is None
 
-        canned["value"] = {"result": {"custom": 1}}
+        canned["value"] = {"custom": 1}
         assert await other({"kind": "session_start"}, None) == {"custom": 1}
     asyncio.run(check())
 

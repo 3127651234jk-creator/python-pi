@@ -13,6 +13,7 @@ Python CLI.
 """
 
 import os
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -71,7 +72,11 @@ class TrustStore:
         self.path = Path(agent_dir) / "trust.json"
 
     def _read(self) -> Dict[str, Optional[bool]]:
-        data = read_json(self.path)
+        try:
+            data = read_json(self.path)
+        except ValueError as exc:
+            logging.getLogger(__name__).warning("%s", exc)
+            return {}
         return {key: value for key, value in data.items() if isinstance(value, bool)}
 
     def get(self, cwd: str) -> Optional[bool]:

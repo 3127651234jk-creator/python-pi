@@ -304,9 +304,8 @@ class McpClient:
                                 event = json.loads(payload)
                             except ValueError:
                                 continue
-                            if isinstance(event, dict):
-                                await self._dispatch(event)
-                                delay = 1.0
+                            await self._dispatch(event)
+                            delay = 1.0
                 logging.getLogger(__name__).warning("MCP %s push stream ended; reconnecting", self.name)
             except asyncio.CancelledError:
                 raise
@@ -318,6 +317,12 @@ class McpClient:
             delay = min(delay * 2, 30.0)
 
     async def _dispatch(self, message: dict) -> None:
+        if isinstance(message, list):
+            for item in message:
+                await self._dispatch(item)
+            return
+        if not isinstance(message, dict):
+            return
         method = message.get("method")
         if method is not None:
             if "id" in message:
@@ -429,11 +434,17 @@ class McpClient:
                 elif not line and data:
                     event = json.loads("\n".join(data))
                     data = []
-                    if event.get("id") == message["id"]:
-                        return event
-                    if "method" in event and "id" not in event:
-                        self._handle_notification(event)
-            raise RuntimeError("MCP stream ended without a response")
+                    reply = None
+                    for item in event if isinstance(event, list) else [event]:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("id") == message["id"] and "method" not in item:
+                            reply = item
+                        else:
+                            await self._dispatch(item)
+                    if reply is not None:
+                        return reply
+            raise ConnectionError("MCP stream disconnected before a response")
 
     def _reply_result(self, method: str, reply):
         if not isinstance(reply, dict):

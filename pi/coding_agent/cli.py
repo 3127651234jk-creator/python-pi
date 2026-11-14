@@ -448,6 +448,12 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                         registry.config.save("theme", selected)
                     if ui:
                         ui.set_theme(selected)
+                    print(f"theme: {selected}")
+                elif rest.strip():
+                    print(f"error: unknown theme: {rest.strip()}. Available: {', '.join(available)}")
+                elif not ui:
+                    current = registry.config.settings.get("theme", "dark") if registry else "dark"
+                    print(f"theme: {current}. Available: {', '.join(available)}")
                 continue
             if ui and not rest.strip():
                 if command == "/model" and registry:

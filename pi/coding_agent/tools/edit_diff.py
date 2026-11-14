@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -50,7 +51,7 @@ _DQUOTES = "\u201c\u201d\u201e\u201f"
 
 
 def normalize_for_fuzzy_match(text: str) -> str:
-    lines = [line.rstrip() for line in text.split("\n")]
+    lines = [line.rstrip() for line in unicodedata.normalize("NFKC", text).split("\n")]
     normalized = "\n".join(lines)
     for ch in _QUOTES:
         normalized = normalized.replace(ch, "'")
@@ -290,7 +291,7 @@ def generate_diff_string(old_content: str, new_content: str, context_lines: int 
         old_end = group[-1][2]
         new_start = group[0][3] + 1
         if len(hunks) == 0:
-            first_changed_line = new_start
+            first_changed_line = next(j1 + 1 for tag, i1, i2, j1, j2 in group if tag != "equal")
         hunk_lines = [f"@@ -{old_start},{old_end - old_start + 1} +{new_start},{group[-1][4] - new_start + 1} @@"]
         new_line = new_start
         for tag, i1, i2, j1, j2 in group:
