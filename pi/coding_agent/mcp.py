@@ -579,6 +579,12 @@ class McpManager:
                     raise ValueError("timeout must be between 0 and 86400 seconds")
                 if "command" in settings and (not isinstance(settings["command"], str) or not isinstance(settings.get("args", []), list) or not all(isinstance(arg, str) for arg in settings.get("args", []))):
                     raise ValueError("command must be an executable and args a string list")
+                if "command" in settings:
+                    # cmd.exe treats newlines as command boundaries even inside
+                    # the escaping used for Windows batch shims.
+                    if any("\r" in value or "\n" in value
+                           for value in [settings["command"], *settings.get("args", [])]):
+                        raise ValueError("stdio command and args must not contain CR or LF")
                 if "url" in settings:
                     validate_url(settings["url"])
                 oauth = settings.get("oauth")

@@ -9,6 +9,38 @@ from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.mcp import McpClient, McpManager
 
 
+@pytest.mark.parametrize("newline", ["\r", "\n", "\r\n"])
+@pytest.mark.parametrize("field", ["command", "args"])
+def test_reload_rejects_stdio_newlines_before_connect(tmp_path, monkeypatch, newline, field):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    bad = {"command": "server.cmd", "args": ["safe", "value"]}
+    if field == "command":
+        bad["command"] = "server.cmd" + newline + "other"
+    else:
+        bad["args"][1] = "line1" + newline + "line2"
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "bad": bad, "good": {"command": "server.cmd", "args": ["", "safe"]},
+    }})
+
+    async def scenario():
+        manager = McpManager(config)
+        connected = []
+
+        async def connect(client, namespace):
+            connected.append(client.name)
+
+        monkeypatch.setattr(manager, "_connect_client", connect)
+        try:
+            await manager.reload()
+            assert manager.errors == {"bad": "stdio command and args must not contain CR or LF"}
+            assert connected == ["good"]
+            assert list(manager.clients) == ["good"]
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_stdio_discovery_call_and_close(tmp_path):
     script = tmp_path / "server.py"
     script.write_text('''import sys,json
