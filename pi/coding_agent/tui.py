@@ -1096,12 +1096,29 @@ class TerminalUI:
                 task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
 
+    async def _run_dialog(self, create_dialog: Callable) -> Any:
+        """Give a modal dialog exclusive input while the steering reader waits."""
+        suspended = self.session.app.is_running
+        if suspended:
+            self._suspend_read = True
+            self._resume_event.clear()
+        try:
+            if suspended:
+                self.session.app.exit(result="")
+                while self.session.app.is_running:
+                    await asyncio.sleep(0.01)
+            with create_app_session(input=self.session.app.input, output=self.session.app.output):
+                return await create_dialog().run()
+        finally:
+            if suspended:
+                self._suspend_read = False
+                self._resume_event.set()
+
     async def choose(self, title: str, values: List[Tuple[str, str]],
                      default: Optional[str] = None) -> Optional[str]:
         if not values:
             return None
-        with create_app_session(input=self.session.app.input, output=self.session.app.output):
-            return await _ChoiceDialog(title, values, self.style, default).run()
+        return await self._run_dialog(lambda: _ChoiceDialog(title, values, self.style, default))
 
     async def input(self, title: str, default: str = "", password: bool = False,
                     validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
@@ -1109,8 +1126,7 @@ class TerminalUI:
         no history, so password entry never lands in an input history. With
         ``validate`` the dialog rejects an invalid value in place, keeps the
         text and shows the rule's error message."""
-        with create_app_session(input=self.session.app.input, output=self.session.app.output):
-            return await _TextDialog(title, default, password, self.style, validate).run()
+        return await self._run_dialog(lambda: _TextDialog(title, default, password, self.style, validate))
 
     async def custom_api_form(self, validate: ValidateForm,
                               save: SaveForm) -> Optional[CustomApiFormResult]:
