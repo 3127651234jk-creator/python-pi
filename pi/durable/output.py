@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
-from .env import ShellOutputSkip
+from .env import ShellOutputSkip, range_decoder
 from .truncate import utf8_byte_length
 
 NEWLINE = 0x0A
@@ -164,7 +164,10 @@ class OutputBuffer:
 
     def __init__(self, limits: OutputLimits) -> None:
         self._limits = limits
-        self._decoder = _StreamUtf8()
+        # Decoder of byte chunks: slices decode exactly, so only a byte-order mark at the very start of the
+        # output is dropped, never a U+FEFF later in it.
+        self._decoder = range_decoder()
+        self._started = False
         self._chunks: List[dict] = []
         self._stored_bytes = 0
         self._stored_newlines = 0
@@ -178,9 +181,18 @@ class OutputBuffer:
         return self._stored_bytes
 
     def push(self, chunk: Union[str, bytes], skipped: Optional[ShellOutputSkip] = None) -> bool:
-        """Accept a chunk; ``skipped`` is output omitted right before it (tail retention only)."""
+        """Accept a chunk; ``skipped`` is output omitted right before it (tail retention only).
+
+        A string chunk or a skip ends an incomplete character of earlier bytes (it becomes U+FFFD); the
+        next byte chunk then starts a new character."""
+        # Bytes of an incomplete character from an earlier byte chunk come first.
         pending = self._decoder.decode() if isinstance(chunk, str) or skipped is not None else ""
         text = chunk if isinstance(chunk, str) else self._decoder.decode(chunk)
+        first = not self._started and pending == "" and skipped is None
+        if pending != "" or text != "" or skipped is not None:
+            self._started = True
+        if first and not isinstance(chunk, str) and text.startswith("\ufeff"):
+            text = text[1:]
         if skipped is None:
             return self._accept(pending + text)
         if self._limits.retain != "tail":
@@ -254,34 +266,3 @@ class OutputBuffer:
             dropped_bytes=self._total_bytes - kept.bytes,
             dropped_lines=_lines(self._total_newlines, self._ends_with_newline) - kept_lines,
         )
-
-
-class _StreamUtf8:
-    """Incremental bytes-to-text decoder holding back incomplete sequences."""
-
-    def __init__(self) -> None:
-        self._pending = b""
-
-    def decode(self, data: Optional[bytes] = None) -> str:
-        if data is None:
-            text, self._pending = self._pending.decode("utf-8", "replace"), b""
-            return text
-        buffered = self._pending + data
-        consumed = _safe_length(buffered)
-        text = buffered[:consumed].decode("utf-8", "replace")
-        self._pending = buffered[consumed:]
-        return text
-
-
-def _safe_length(buffered: bytes) -> int:
-    n = len(buffered)
-    continuation = 0
-    while continuation < n and (buffered[n - 1 - continuation] & 0xC0) == 0x80:
-        continuation += 1
-    if continuation == n:
-        return n
-    lead = buffered[n - 1 - continuation]
-    needed = 2 if 0xC2 <= lead <= 0xDF else 3 if 0xE0 <= lead <= 0xEF else 4 if 0xF0 <= lead <= 0xF4 else 0
-    if needed == 0 or continuation + 1 >= needed:
-        return n
-    return n - 1 - continuation

@@ -52,8 +52,11 @@ CASE_NAMES = _case_names()
 @pytest.mark.parametrize("case_name", CASE_NAMES)
 def test_env_conformance(case_name, tmp_path):
     shell = _find_shell()
-    symlinks = os.name != "nt"  # Windows ``ln -s`` needs privileges; skip the symlink case there.
-    if case_name.startswith("binary reader follows symlinks") and os.name == "nt":
+    symlinks = os.name != "nt"  # Windows ``ln -s`` needs privileges; skip the symlink cases there.
+    if os.name == "nt" and (
+        case_name.startswith("binary reader follows symlinks")
+        or case_name.startswith("watch reports changes to the file a watched symbolic link")
+    ):
         pytest.skip("symbolic links need privileges on Windows")
 
     async def main():

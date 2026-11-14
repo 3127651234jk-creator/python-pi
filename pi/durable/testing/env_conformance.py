@@ -157,6 +157,11 @@ def create_env_conformance(options: EnvConformanceOptions) -> List[EnvConformanc
             "watch skips excluded entries and reports a rename out of them",
             _case_watch_excludes,
         ),
+        watch_case(
+            "watch keeps recursive coverage where a non-recursive target overlaps",
+            _case_watch_overlap,
+        ),
+        watch_case("watch follows a directory replaced at the same path", _case_watch_replaced_dir),
         watch_case("watch stops reporting once closed", _case_watch_closed),
         case("argv exec passes arguments to the program without shell parsing", _case_argv_exec),
         case("exec reports the stream of every chunk in both forms", _case_exec_streams),
@@ -170,6 +175,12 @@ def create_env_conformance(options: EnvConformanceOptions) -> List[EnvConformanc
             case(
                 "binary reader follows symlinks unless noFollow refuses the final one",
                 _case_symlinks,
+            )
+        )
+        cases.append(
+            watch_case(
+                "watch reports changes to the file a watched symbolic link points to",
+                _case_watch_linked_file,
             )
         )
     return cases
@@ -399,6 +410,36 @@ async def _case_watch_excludes(env: ExecutionEnv) -> None:
     await _watching(env, targets, run)
 
 
+async def _case_watch_overlap(env: ExecutionEnv) -> None:
+    get_or_throw(await env.write_file("skills/a/one.md", "one", context))
+    targets = [WatchTarget(path="skills"), WatchTarget(path="skills", recursive=True)]
+
+    async def run(helpers) -> None:
+        # The recursive target keeps covering subdirectories a non-recursive target already listed.
+        await helpers["expect_change"](
+            "skills/a/two.md", lambda: env.write_file("skills/a/two.md", "two", context)
+        )
+
+    await _watching(env, targets, run)
+
+
+async def _case_watch_replaced_dir(env: ExecutionEnv) -> None:
+    get_or_throw(await env.write_file("skills/a/x.md", "x", context))
+
+    async def run(helpers) -> None:
+        expect_change = helpers["expect_change"]
+
+        async def replace() -> None:
+            get_or_throw(await env.rename_file("skills/a", "skills-old", context))
+            get_or_throw(await env.create_dir("skills/a", None, context))
+
+        await expect_change("skills/a", replace)
+        await expect_change("skills/a/y.md", lambda: env.write_file("skills/a/y.md", "y", context))
+        await expect_change("skills/a/y.md", lambda: env.write_file("skills/a/y.md", "yy", context))
+
+    await _watching(env, [WatchTarget(path="skills", recursive=True)], run)
+
+
 async def _case_watch_closed(env: ExecutionEnv) -> None:
     changes: List[WatchChange] = []
     watcher = get_or_throw(await env.watch([WatchTarget(path="file.txt")], changes.append, context))
@@ -408,6 +449,20 @@ async def _case_watch_closed(env: ExecutionEnv) -> None:
     get_or_throw(await env.write_file("file.txt", "x", context))
     await asyncio.sleep(0.3)
     assert_obj.deep_equal(changes, [])
+
+
+async def _case_watch_linked_file(env: ExecutionEnv) -> None:
+    get_or_throw(await env.write_file("data/real.md", "one", context))
+    get_or_throw(await env.create_dir("config", None, context))
+    linked = await exec_collect(env, [*_SHELL, "ln -s ../data/real.md config/AGENTS.md"])
+    assert_obj.strict_equal(get_or_throw(linked["result"]).exit_code, 0)
+
+    async def run(helpers) -> None:
+        await helpers["expect_change"](
+            "config/AGENTS.md", lambda: env.write_file("data/real.md", "two!", context)
+        )
+
+    await _watching(env, [WatchTarget(path="config/AGENTS.md")], run)
 
 
 async def _case_argv_exec(env: ExecutionEnv) -> None:

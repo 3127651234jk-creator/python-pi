@@ -20,7 +20,10 @@ Porting deviations from the TS implementation:
   ancestor directory instead, and renaming the target or its parent keeps
   working. Renaming an ancestor above that is denied by Windows while watching.
   A two-second rescan (the contract's "within about two seconds") heals
-  coverage after such renames on every platform.
+  coverage after such renames on every platform. A target that is a symbolic
+  link to a file is watched directly on Linux and macOS; Windows cannot watch
+  a file handle (``ReadDirectoryChangesW`` reports ERROR_INVALID_PARAMETER),
+  so there the rescan reports changes to the linked file instead.
 - ``poll_interval_ms`` defaults to 250 (TS: 2000), matching the interval the
   Python port has always polled with.
 """
@@ -68,11 +71,23 @@ class BudgetExceeded(Exception):
     pass
 
 
+def _is_denied(error: BaseException) -> bool:
+    """Whether an ``OSError`` means permission was denied rather than "missing"."""
+    return isinstance(error, OSError) and error.errno in (errno.EACCES, errno.EPERM)
+
+
 class ResolvedTarget(NamedTuple):
     path: str
     recursive: bool
     hidden: bool
     names: FrozenSet[str]
+
+
+class _Installed(NamedTuple):
+    """What a native watch was installed on: a path replaced by another file needs a new one."""
+
+    dev: int
+    ino: int
 
 
 class _Entry(NamedTuple):
@@ -141,7 +156,11 @@ class LocalFileWatcher:
         self._dirty = False
         self._pending_events: Set[str] = set()
         self._snapshot: Dict[str, _Entry] = {}
-        self._watched: Dict[str, bool] = {}
+        self._linked_files: Set[str] = set()
+        self._watched: Dict[str, _Installed] = {}
+        # Watches that were installed on a file a target links to: their events name the
+        # target, unlike directory watches whose events name an entry below them.
+        self._linked_watched: Set[str] = set()
         self._backend = None
         self._flush_handle: Optional[asyncio.TimerHandle] = None
         self._poll_handle: Optional[asyncio.TimerHandle] = None
@@ -218,6 +237,7 @@ class LocalFileWatcher:
             self._backend.close()
             self._backend = None
         self._watched.clear()
+        self._linked_watched.clear()
 
     def _deliver(self, change: WatchChange) -> None:
         if self._closed:
@@ -310,7 +330,10 @@ class LocalFileWatcher:
                     break
                 await asyncio.sleep(0)
         except BaseException as exc:
-            error = exc if isinstance(exc, FileError) else FileError("invalid", str(exc))
+            if isinstance(exc, FileError):
+                error = exc
+            else:
+                error = FileError("permission_denied" if _is_denied(exc) else "invalid", str(exc))
             self._deliver({"error": error})
             self._stop()
         finally:
@@ -327,6 +350,10 @@ class LocalFileWatcher:
         """
         if directory is None:
             self._hop(self._record_event, None)
+            return
+        if directory in self._linked_watched:
+            # The file a target links to changed: report the target.
+            self._hop(self._record_event, directory)
             return
         path = os.path.join(directory, filename) if filename is not None else directory
         if not self._in_scope(path):
@@ -382,11 +409,15 @@ class LocalFileWatcher:
         for _round in range(10):
             if self._closed:
                 break
-            snapshot = self._scan()
+            snapshot, linked_files = self._scan()
+            # Closed during the scan: installing watchers now would leak them.
+            if self._closed:
+                break
+            self._linked_files = linked_files
             if report:
                 changed.update(self._diff(self._snapshot, snapshot))
             self._snapshot = snapshot
-            if self.mode == "polling" or not self._reconcile(snapshot):
+            if self.mode == "polling" or not self._reconcile(snapshot, linked_files):
                 break
             if DARWIN:
                 self._schedule_settle()
@@ -406,17 +437,26 @@ class LocalFileWatcher:
                 changed.append(self._reported(path))
         return changed
 
-    def _scan(self) -> Dict[str, _Entry]:
+    def _scan(self) -> "tuple[Dict[str, _Entry], Set[str]]":
+        """The snapshot of what is watched, and targets that are symbolic links to files, whose files need
+        their own watchers."""
         snapshot: Dict[str, _Entry] = {}
-        directories = 0
+        linked_files: Set[str] = set()
+        # Directories are counted once, but traversed once per target: overlapping targets differ in
+        # recursion and exclusions, and an entry recorded for one target must still be descended into
+        # for another.
+        counted: Set[str] = set()
+        traversed: Set["tuple[int, str]"] = set()
+        # Kinds of listed entries, not following links: a target that links to a directory is recorded by
+        # ``stat``, but symbolic links below a recursive target are not followed.
+        listed: Dict[str, str] = {}
 
-        def count_directory() -> None:
-            nonlocal directories
-            directories += 1
-            if directories > self._max_directories:
+        def count_directory(path: str) -> None:
+            counted.add(path)
+            if len(counted) > self._max_directories:
                 raise BudgetExceeded(f"Watched paths exceed {self._max_directories} directories")
 
-        for target in self._targets:
+        for index, target in enumerate(self._targets):
             for ancestor in ancestors_of(target.path):
                 if ancestor in snapshot:
                     continue
@@ -426,16 +466,29 @@ class LocalFileWatcher:
                     continue  # Missing ancestors contribute nothing until they exist.
                 # Identity only: an ancestor's own timestamps change with every unrelated sibling.
                 snapshot[ancestor] = _entry_of(stats)._replace(size=0, mtime_ns=0)
-            # The target itself may be a symbolic link to what is watched; follow it.
+            # The target itself may be a symbolic link to what is watched; follow it. A missing target is
+            # watched for its creation; one that cannot be reached for lack of permission fails.
             try:
                 stats = os.stat(target.path)
-            except OSError:
+            except OSError as exc:
+                if _is_denied(exc):
+                    raise
                 continue
             self._record(snapshot, target.path, stats)
+            try:
+                link_stats = os.lstat(target.path)
+            except OSError:
+                link_stats = None
+            if (
+                stat_module.S_ISREG(stats.st_mode)
+                and link_stats is not None
+                and stat_module.S_ISLNK(link_stats.st_mode)
+            ):
+                linked_files.add(target.path)
             if stat_module.S_ISDIR(stats.st_mode):
-                count_directory()
-                self._scan_directory(snapshot, target, target.path, count_directory)
-        return snapshot
+                count_directory(target.path)
+                self._scan_directory(index, snapshot, target, listed, traversed, target.path, count_directory)
+        return snapshot, linked_files
 
     def _record(self, snapshot: Dict[str, _Entry], path: str, stats: os.stat_result) -> None:
         content_hash: Optional[str] = None
@@ -452,39 +505,65 @@ class LocalFileWatcher:
 
     def _scan_directory(
         self,
+        index: int,
         snapshot: Dict[str, _Entry],
         target: ResolvedTarget,
+        listed: Dict[str, str],
+        traversed: Set["tuple[int, str]"],
         directory: str,
-        count_directory: Callable[[], None],
+        count_directory: Callable[[str], None],
     ) -> None:
+        key = (index, directory)
+        if key in traversed:
+            return
+        traversed.add(key)
         try:
             children = list(os.scandir(directory))
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
-            return  # Gone or unreadable since the parent listing: nothing to record.
+        except OSError as exc:
+            # The watched directory itself must be readable; below it, unreadable directories are skipped.
+            if directory == target.path and _is_denied(exc):
+                raise
+            if isinstance(exc, (FileNotFoundError, NotADirectoryError, PermissionError)):
+                return  # Gone or unreadable since the parent listing: nothing to record.
+            raise
         for child in children:
             if _excluded(target, child.name):
                 continue
             path = os.path.join(directory, child.name)
-            if path in snapshot:
-                continue
-            try:
-                stats = child.stat(follow_symlinks=False)
-            except OSError:
-                continue  # Removed between enumeration and stat: not part of the listing any more.
-            self._record(snapshot, path, stats)
-            if target.recursive and stat_module.S_ISDIR(stats.st_mode):
-                count_directory()
-                self._scan_directory(snapshot, target, path, count_directory)
+            kind = listed.get(path)
+            if kind is None:
+                try:
+                    # lstat, not the scandir entry's cached stat: on Windows that carries no
+                    # dev/ino, and identity is what tells a replaced path from the same one.
+                    stats = os.lstat(path)
+                except OSError:
+                    continue  # Removed between enumeration and stat: not part of the listing any more.
+                kind = _entry_of(stats).kind
+                listed[path] = kind
+                # A target's own entry (following links) wins over its listing by another target.
+                if path not in snapshot:
+                    self._record(snapshot, path, stats)
+            if target.recursive and kind == "directory":
+                count_directory(path)
+                self._scan_directory(index, snapshot, target, listed, traversed, path, count_directory)
 
     # -- native watchers ------------------------------------------------------
 
-    def _reconcile(self, snapshot: Dict[str, _Entry]) -> bool:
+    def _reconcile(self, snapshot: Dict[str, _Entry], linked_files: Set[str]) -> bool:
         """Watch what the snapshot needs; returns whether a watcher was added."""
-        wanted = self._wanted_dirs(snapshot)
-        for path in list(self._watched):
-            if path not in wanted:
+        wanted = self._wanted_dirs(snapshot, linked_files)
+        for path, installed in list(self._watched.items()):
+            entry = snapshot.get(path)
+            # Gone, or replaced: a watcher follows the directory it was installed on, not the path.
+            if (
+                path not in wanted
+                or entry is None
+                or entry.dev != installed.dev
+                or entry.ino != installed.ino
+            ):
                 self._backend.unwatch(path)
                 del self._watched[path]
+                self._linked_watched.discard(path)
         added = False
         try:
             if self._backend is None:
@@ -493,10 +572,13 @@ class LocalFileWatcher:
                     raise OSError(errno.ENOSYS, "No native watch backend on this platform")
                 self._backend = factory(self._on_backend_event)
             for path in wanted:
-                if path in self._watched:
+                entry = snapshot.get(path)
+                if path in self._watched or entry is None:
                     continue
                 self._backend.watch(path)
-                self._watched[path] = True
+                self._watched[path] = _Installed(dev=entry.dev, ino=entry.ino)
+                if path in linked_files:
+                    self._linked_watched.add(path)
                 added = True
             if added:
                 self._backend.commit()
@@ -509,10 +591,13 @@ class LocalFileWatcher:
             return False
         return added
 
-    def _wanted_dirs(self, snapshot: Dict[str, _Entry]) -> Dict[str, bool]:
+    def _wanted_dirs(self, snapshot: Dict[str, _Entry], linked_files: Set[str]) -> Dict[str, bool]:
         """Directories to hold native watches on. Windows never holds a handle on a
         target itself (that would block renaming its parent), so there the nearest
-        existing ancestor is watched recursively; elsewhere TS's shape applies."""
+        existing ancestor is watched recursively; elsewhere TS's shape applies. A
+        target that is a symbolic link to a file is watched directly on Linux and
+        macOS: changes to that file are not events of the link's directory. Windows
+        cannot watch a file handle, so there the rescan covers the linked file."""
         wanted: Dict[str, bool] = {}
         if WINDOWS:
             for target in self._targets:
@@ -526,6 +611,8 @@ class LocalFileWatcher:
                     if watched != candidate and _is_within(watched, candidate):
                         del wanted[watched]
             return wanted
+        for path in linked_files:
+            wanted[path] = False
         for target in self._targets:
             for ancestor in ancestors_of(target.path):
                 if _is_directory(snapshot, ancestor) and ancestor not in wanted:
@@ -557,6 +644,7 @@ class LocalFileWatcher:
             self._backend.close()
             self._backend = None
         self._watched.clear()
+        self._linked_watched.clear()
         self._deliver({"overflow": True})
         if self._resync_handle is not None:
             self._resync_handle.cancel()
