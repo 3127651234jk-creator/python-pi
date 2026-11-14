@@ -920,12 +920,12 @@ async def finalize_executed_tool_call(
             )
             if after_result is not None and isinstance(after_result, AfterToolCallResult):
                 structured = after_result.structured_content
-                if structured is None and after_result.content is not None:
-                    structured = None
+                if structured is None and after_result.content is None:
+                    structured = result.structured_content
                 result = AgentToolResult(
                     content=after_result.content if after_result.content is not None else result.content,
                     details=after_result.details if after_result.details is not None else result.details,
-                    structured_content=structured if structured is not None else result.structured_content,
+                    structured_content=structured,
                     usage=after_result.usage if after_result.usage is not None else result.usage,
                     is_error=result.is_error,
                     terminate=(

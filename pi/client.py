@@ -93,7 +93,7 @@ class Client:
         except (Exception, asyncio.CancelledError) as exc:
             for future in [self.handshake, *self.pending.values()]:
                 if not future.done():
-                    future.set_exception(ConnectionError(str(exc)))
+                    future.set_exception(exc if isinstance(exc, ServerError) else ConnectionError(str(exc)))
         finally:
             self.attachment = None
             if self.writer is not None:

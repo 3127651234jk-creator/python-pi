@@ -72,7 +72,7 @@ class Replica:
 
     def subscribe(self, listener: Callable[[Any], None]) -> Callable[[], None]:
         self._listeners.append(listener)
-        if self._value is not None:
+        if self._sequence is not None:
             listener(self._value)
 
         def remove() -> None:
@@ -97,7 +97,7 @@ class Replica:
         self._deliver()
 
     def update(self, sequence: int, ops: List[Any]) -> None:
-        if self._sequence is None or self._value is None:
+        if self._sequence is None:
             raise ValueError("Replicated state received an update before hydration")
         if sequence != self._sequence + 1:
             self.clear()
@@ -121,7 +121,7 @@ class Replica:
         return self._validator.validate(apply_ops(_copy.deepcopy(target), ops))
 
     def _deliver(self) -> None:
-        if self._value is None:
+        if self._sequence is None:
             return
         for listener in list(self._listeners):
             try:

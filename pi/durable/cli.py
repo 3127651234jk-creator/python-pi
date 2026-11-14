@@ -43,9 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     compact.add_argument("conversation_id", type=int)
     run = sub.add_parser("run", help="Run pending tasks to quiescence")
     run.add_argument("--tasks", type=int, default=None, help="Run only the first N tasks")
-    sub.add_parser("transcript", help="Print a conversation transcript")
-    transcript = sub.add_parser("tasks", help="List task records")
-    transcript.add_argument("--conversation", type=int, default=None)
+    transcript = sub.add_parser("transcript", help="Print a conversation transcript")
+    transcript.add_argument("conversation_id", type=int)
+    tasks = sub.add_parser("tasks", help="List task records")
+    tasks.add_argument("--conversation", type=int, default=None)
     abort = sub.add_parser("abort", help="Abort a task")
     abort.add_argument("task_id", type=int)
     return parser
