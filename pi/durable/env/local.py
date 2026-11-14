@@ -933,8 +933,38 @@ class _CommandRunner:
         self._last_emit = 0.0
         self._abort_task: Optional[asyncio.Task] = None
         self._timeout_handle = None
+        self._pump_tasks: List[asyncio.Task] = []
 
     async def run(self) -> Result:
+        try:
+            return await self._run()
+        except asyncio.CancelledError:
+            # Stop callbacks before awaiting process-tree termination.
+            self._done = True
+            for task in self._pump_tasks:
+                task.cancel()
+            if self._process is not None and self._process.pid:
+                await kill_process_tree(self._process.pid)
+                await self._process.wait()
+            raise
+        finally:
+            if self._timeout_handle is not None:
+                self._timeout_handle.cancel()
+            tasks = list(self._pump_tasks)
+            if self._abort_task is not None:
+                tasks.append(self._abort_task)
+            if self._spill_starting is not None:
+                tasks.append(self._spill_starting)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if self._spill_handle is not None:
+                self._spill_handle.close()
+            if self._process is not None and self._process.pid:
+                self._env._active_children.discard(self._process.pid)
+
+    async def _run(self) -> Result:
         options = self._options
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -968,6 +998,7 @@ class _CommandRunner:
 
         stdout_task = loop.create_task(self._pump("stdout", self._stdout_decoder))
         stderr_task = loop.create_task(self._pump("stderr", self._stderr_decoder))
+        self._pump_tasks = [stdout_task, stderr_task]
 
         exit_code = await self._process.wait()
         if self._timeout_handle is not None:
