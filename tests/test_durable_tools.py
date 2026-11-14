@@ -16,7 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from pi.durable.env import Context, LocalExecutionEnv
+from pi.durable.env import (
+    Context,
+    ExecutionError,
+    LocalExecutionEnv,
+    ShellExecResult,
+    ShellOutputInfo,
+    err,
+    ok,
+)
 from pi.durable.output import OutputBuffer, OutputLimits
 from pi.durable.tools import (
     ToolDiagnostic,
@@ -24,6 +32,7 @@ from pi.durable.tools import (
     ToolExecutionResult,
     create_bash_tool,
     create_edit_tool,
+    create_powershell_tool,
     create_read_tool,
     create_write_tool,
 )
@@ -275,6 +284,77 @@ def test_edit_prepare_arguments_repairs_shapes(env):
     assert repaired["edits"] == [{"oldText": "x", "newText": "y"}]
     repaired = prepare({"path": "a.txt", "oldText": "x", "newText": "y"})
     assert repaired["edits"] == [{"oldText": "x", "newText": "y"}]
+
+
+class ProgramsEnv(LocalExecutionEnv):
+    """An environment where only the listed programs exist; it records each command and prints ``output``."""
+
+    def __init__(self, cwd: str, installed, output: str, exit_code: int = 0) -> None:
+        super().__init__(cwd=cwd)
+        self.installed = set(installed)
+        self._output = output
+        self._exit_code = exit_code
+        self.commands: list = []
+
+    async def exec(self, command, options, context):
+        self.commands.append(command)
+        program = command if isinstance(command, str) else command[0]
+        if isinstance(command, str) or program not in self.installed:
+            return err(ExecutionError("spawn_error", f"spawn {program} ENOENT"))
+        if options is not None and options.on_output is not None:
+            options.on_output(self._output, context, ShellOutputInfo(stream="stdout"))
+        return ok(ShellExecResult(exit_code=self._exit_code))
+
+
+def test_powershell_runs_the_command_as_one_argument_forcing_utf8(tmp_path):
+    fake = ProgramsEnv(str(tmp_path), ["pwsh"], "héllo\n")
+    api = RecordingApi(fake)
+    run(create_powershell_tool().execute({"command": "Write-Output 'héllo'"}, api, Context()))
+    assert api.buffer.snapshot().text == "héllo\n"
+    assert fake.commands == [
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nWrite-Output 'héllo'",
+        ]
+    ]
+
+
+def test_powershell_falls_back_and_reports_the_last_start_failure(tmp_path):
+    windows_only = ProgramsEnv(str(tmp_path), ["powershell"], "ok")
+    api = RecordingApi(windows_only)
+    run(create_powershell_tool({"commandPrefix": "$x = 1"}).execute({"command": "$x"}, api, Context()))
+    assert api.buffer.snapshot().text == "ok"
+    assert [command[0] for command in windows_only.commands] == ["pwsh", "powershell"]
+    assert windows_only.commands[1][-1].endswith("\n$x = 1\n$x")
+
+    none = ProgramsEnv(str(tmp_path), [], "")
+    api_none = RecordingApi(none)
+    with pytest.raises(ExecutionError, match="spawn powershell ENOENT"):
+        run(create_powershell_tool().execute({"command": "1"}, api_none, Context()))
+
+
+def test_powershell_throws_on_a_nonzero_exit_after_streaming_the_output(tmp_path):
+    fake = ProgramsEnv(str(tmp_path), ["pwsh"], "partial", exit_code=3)
+    api = RecordingApi(fake)
+    with pytest.raises(RuntimeError, match="Command exited with code 3"):
+        run(create_powershell_tool().execute({"command": "exit 3"}, api, Context()))
+    assert api.buffer.snapshot().text == "partial"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell")
+def test_powershell_runs_real_powershell_with_utf8_output(env):
+    api = RecordingApi(env)
+    run(
+        create_powershell_tool().execute(
+            {"command": "Write-Output ('h' + [char]0xe9 + 'llo'); exit 0"}, api, Context()
+        )
+    )
+    assert api.buffer.snapshot().text.strip() == "héllo"
 
 
 def test_bash_exit_code_and_output(env):

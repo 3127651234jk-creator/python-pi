@@ -1,4 +1,4 @@
-"""Durable coding tools: ``read``, ``write``, ``edit``, and ``bash``.
+"""Durable coding tools: ``read``, ``write``, ``edit``, ``bash``, and ``powershell``.
 
 Python port of ``packages/durable/src/tools``. These tools run against the
 portable ``ExecutionEnv`` (local host, container, or remote), not the host
@@ -16,7 +16,13 @@ from .base import (
     define_tool,
     require_env,
 )
-from .bash import BASH_DESCRIPTION, DEFAULT_OUTPUT_LIMITS, create_bash_tool
+from .bash import (
+    BASH_DESCRIPTION,
+    DEFAULT_OUTPUT_LIMITS,
+    POWERSHELL_DESCRIPTION,
+    create_bash_tool,
+    create_powershell_tool,
+)
 from .edit import EDIT_DESCRIPTION, create_edit_tool, prepare_edit_arguments
 from .edit_diff import (
     Edit,
@@ -40,6 +46,7 @@ __all__ = [
     "DEFAULT_OUTPUT_LIMITS",
     "EDIT_DESCRIPTION",
     "Edit",
+    "POWERSHELL_DESCRIPTION",
     "READ_DESCRIPTION",
     "ToolDiagnostic",
     "ToolExecutionApi",
@@ -50,6 +57,7 @@ __all__ = [
     "coding_tools",
     "create_bash_tool",
     "create_edit_tool",
+    "create_powershell_tool",
     "create_read_tool",
     "create_write_tool",
     "define_tool",
@@ -71,5 +79,6 @@ __all__ = [
 
 
 def coding_tools() -> list:
-    """The four coding tools as a list; a host picks them up explicitly (parity with ``CodingTools``)."""
+    """The four coding tools as a list; a host picks them up explicitly (parity with ``CodingTools``).
+    ``create_powershell_tool()`` adds ``powershell``."""
     return [create_read_tool(), create_write_tool(), create_edit_tool(), create_bash_tool()]
