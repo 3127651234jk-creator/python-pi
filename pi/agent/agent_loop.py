@@ -333,9 +333,11 @@ def declare_tool_changes(context: AgentContext, pending_messages: List[Any]) -> 
 
     declared = get_current_tools([*context.messages, *baseline])
     # Rebuild declaration-only tools (dropping execute callables), preserving
-    # hosted tool payloads so they re-declare with their provider shape.
+    # hosted tool payloads so they re-declare with their provider shape. Tools
+    # marked undeclared stay executable for codemode but never reach the model.
     executable = [AgentTool(name=t.name, description=t.description, parameters=t.parameters,
-                            hosted=getattr(t, "hosted", None)) for t in (context.tools or [])]
+                            hosted=getattr(t, "hosted", None))
+                  for t in (context.tools or []) if t.declared]
     changes = get_tool_state_changes(declared, executable)
     unchanged = not changes.tools_added and not changes.tools_removed
 
@@ -796,6 +798,10 @@ async def prepare_tool_call(
 ) -> Dict[str, Any]:
     tools = tools if tools is not None else (current_context.tools or [])
     tool = next((t for t in tools if t.name == tool_call.name), None)
+    if tool is not None and not tool.declared and parent_tool_call_id is None:
+        # Undeclared tools (MCP tools kept by --tools without naming them) are
+        # reachable only through a running tool such as codemode.
+        tool = None
     if tool is None:
         return {
             "kind": "immediate",

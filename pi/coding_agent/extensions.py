@@ -353,6 +353,11 @@ class ExtensionManager:
                 known[tool.name] = tool
         self.agent.tools[:] = list(known.values())
         self.context.tool_catalog.update(known)
+        # Lazy import: cli imports this module at load time. A run's --tools selection
+        # also bounds tools registered after setup.
+        from .cli import apply_tool_selection
+
+        apply_tool_selection(self.agent)
 
     def sync_providers(self) -> None:
         if self.context.registry is not None:

@@ -523,3 +523,39 @@ def test_settings_inline_budget_changes_the_catalog():
     wide = create_codemode_tool([leaf("mcp__dev__query", "Query.")],
                                 settings={"inline_budget": None})
     assert "(tools not listed)" not in wide.description
+
+
+# -- v1.0.4 port: codemode read calls on images resolve to image blocks (021eae60a)
+
+
+def test_describe_output_renders_read_union_schema():
+    from pi.coding_agent.tools.read import READ_OUTPUT_SCHEMA
+
+    rendered = codemode_tool._describe_output(READ_OUTPUT_SCHEMA)
+    assert rendered == "str | {type: 'image', data: str, mimeType: str, note: str}"
+    # The read declaration carries the schema, so scripts see what a call resolves to.
+    from pi.coding_agent.tools.read import create_read_tool
+
+    read = create_read_tool(".")
+    assert "data: str" in render_tool_sample("read", "", read.parameters, read.output_schema)
+
+
+def test_codemode_read_image_feeds_image_helper(tmp_path):
+    """A script reads an image file and hands the structured block to image() directly."""
+    from pi.coding_agent.tools.read import create_read_tool
+
+    (tmp_path / "picture.png").write_bytes(base64.b64decode(PNG_1PX))
+    read = create_read_tool(str(tmp_path), image_settings=lambda: {"auto_resize": False})
+
+    async def scenario():
+        tool = create_codemode_tool([read])
+        code = ("block = tools.read({'path': 'picture.png'})\n"
+                "text(block['note'])\n"
+                "image(block)\n")
+        result = await tool.execute("c", {"code": code}, None, None)
+        texts = texts_of(result)
+        assert "Read image file [image/png]" in texts
+        assert isinstance(result.content[-1], ImageContent)
+        assert result.content[-1].data == PNG_1PX
+
+    asyncio.run(scenario())

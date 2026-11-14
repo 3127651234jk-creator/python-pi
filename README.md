@@ -111,6 +111,8 @@ python -m pi --provider anthropic "解释 pyproject.toml"
 
 常用参数：`--provider <id>`、`--model <id>`、`--base-url`、`--api-key`、`--thinking off|minimal|low|medium|high|xhigh|max`、`-c` 继续上次会话、`--no-session` 不落盘、`--sync-models` 同步在线模型目录。
 
+工具选择参数：`--tools <列表>`（逗号分隔的允许名单，支持 `*` 通配，如 `--tools read,codemode,'mcp__radius__*'`；名单不含 `mcp__` 开头的条目时保留 MCP 工具但只供 codemode 调用、不声明给模型，点名 `mcp__` 条目时匹配的 MCP 工具正常声明）、`--exclude-tools <列表>`（排除名单，含 MCP 工具，同样支持 `*`）、`--no-tools` 移除全部工具（含 MCP）、`--no-mcp` 单次运行禁用内置 MCP 支持（不连接服务器、无 MCP 工具）。
+
 CLI 还内置 `openai`、`anthropic`、`openrouter`、`google`、`openai-responses`、`google-vertex`、`azure-openai`、`azure-openai-responses`、`amazon-bedrock`、`openai-codex`、`github-copilot`、`kimi-coding`、`xai`、`radius`、`faux`，并可从 `models.json` 注册其他兼容 provider。
 
 环境变量也可用 `PI_PY_PROVIDER` / `PI_PY_MODEL` / `PI_PY_API_KEY` / `PI_PY_BASE_URL`。

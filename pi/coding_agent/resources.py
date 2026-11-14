@@ -204,11 +204,24 @@ class ResourceCatalog:
                 paths.append(Path(directory) / "SKILL.md")
         return paths
 
-    def system_prompt(self) -> str:
+    def system_prompt(self, file_read_tool: Optional[str] = "read") -> str:
+        """The <available_skills> section.
+
+        ``file_read_tool`` names the declared tool that loads skill files: ``read`` or
+        ``bash`` names it, ``indirect`` hints at loading without naming a tool (a reader
+        reachable only through another tool), and None leaves out the section entirely.
+        """
+
         skills = [skill for skill in self.skills.values() if not skill.disable_model_invocation]
-        if not skills:
+        if not skills or file_read_tool is None:
             return ""
-        rows = ["When a task matches a skill description, use read to load its SKILL.md before following it. Resolve supporting files relative to that skill's directory."]
+        if file_read_tool == "read":
+            load_hint = "use read to load its SKILL.md before following it"
+        elif file_read_tool == "bash":
+            load_hint = "use bash to load its SKILL.md before following it"
+        else:
+            load_hint = "load its SKILL.md before following it"
+        rows = [f"When a task matches a skill description, {load_hint}. Resolve supporting files relative to that skill's directory."]
         for skill in skills:
             rows.append(f'<skill name="{escape(skill.name, quote=True)}" path="{escape(str(skill.path), quote=True)}">{escape(skill.description)}</skill>')
         return "<available_skills>\n" + "\n".join(rows) + "\n</available_skills>"

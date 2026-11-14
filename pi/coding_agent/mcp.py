@@ -25,7 +25,7 @@ import signal as process_signal
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -39,6 +39,28 @@ from .model_registry import expand, validate_url
 RESOURCE_TOOLS = ("list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource")
 
 JSON_RPC_METHOD_NOT_FOUND = -32601
+
+
+def tool_pattern_reg_exp(pattern: str) -> re.Pattern:
+    """Regular expression for a tool name pattern where ``*`` matches any characters,
+    as ``--tools`` and ``--exclude-tools`` accept them."""
+
+    source = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.compile("^" + source + "$")
+
+
+def create_tool_name_matcher(entries: Sequence[str]) -> Callable[[str], bool]:
+    """Whether a tool name matches any of the entries, each an exact name or a pattern."""
+
+    names = {entry for entry in entries if "*" not in entry}
+    patterns = [tool_pattern_reg_exp(entry) for entry in entries if "*" in entry]
+    return lambda name: name in names or any(pattern.match(name) for pattern in patterns)
+
+
+def is_mcp_tool_name(name: str) -> bool:
+    """Whether a tool comes from MCP: a server tool (``mcp__<server>__<tool>``) or a resource tool."""
+
+    return name.startswith("mcp__") or name in RESOURCE_TOOLS
 
 
 def _windows_batch_command(command: str, args: List[str]) -> str:
@@ -189,6 +211,13 @@ class McpClient:
         self.on_tools_changed = None  # sync/async callback, set by the manager
         self.on_log_message = None  # callback(server, params) for notifications/message
         self.lazy = bool(config.get("lazy", False))
+        # Set by close(); a connect in progress checks it between stages and aborts
+        # before doing any I/O on a transport the shutdown already closed.
+        self.shutdown = asyncio.Event()
+
+    @property
+    def closed(self) -> bool:
+        return self.shutdown.is_set()
 
     def bearer(self) -> str:
         oauth = self.config.get("oauth")
@@ -197,6 +226,8 @@ class McpClient:
         return self.credential.get("access", "") if getattr(self, "credential", None) else ""
 
     async def connect(self, auth_header: str = ""):
+        if self.closed:
+            raise RuntimeError(f"MCP server {self.name} is closed")
         if "command" in self.config:
             env = {**os.environ, **{k: expand(v) for k, v in self.config.get("env", {}).items()}}
             command = os.path.expanduser(self.config["command"])
@@ -216,6 +247,11 @@ class McpClient:
                     _windows_batch_command(command, args), executable=env.get("COMSPEC", "cmd.exe"), **options)
             else:
                 self.process = await asyncio.create_subprocess_exec(command, *args, **options)
+            if self.closed:
+                # close() ran while the process was being spawned; tear it down
+                # instead of leaving a live server nobody will talk to.
+                await self._teardown_transports()
+                raise RuntimeError(f"MCP server {self.name} is closed")
             self.pump_task = asyncio.create_task(self._stdio_pump())
             async def drain():
                 while await self.process.stderr.read(4096):
@@ -227,11 +263,16 @@ class McpClient:
             if auth_header:
                 headers["Authorization"] = "Bearer " + auth_header
             self.http = httpx.AsyncClient(timeout=self.config.get("timeout", 60), headers=headers)
+            if self.closed:
+                await self._teardown_transports()
+                raise RuntimeError(f"MCP server {self.name} is closed")
         try:
             result = await self.request("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
                 "clientInfo": {"name": "pi-python", "version": "0.1.0"}})
         except BaseException:
-            await self._stop_pump()
+            # A failed or cancelled connect must not leave the transport open:
+            # cancelling the pump alone keeps a spawned stdio server running.
+            await self._teardown_transports()
             raise
         self.version = result.get("protocolVersion", "2025-03-26")
         capabilities = result.get("capabilities", {}) or {}
@@ -412,6 +453,8 @@ class McpClient:
             self.process.stdin.write((json.dumps(message) + "\n").encode())
             await self.process.stdin.drain()
             return None
+        if self.http is None:
+            raise RuntimeError(f"MCP server {self.name} is closed")
         headers = {"MCP-Protocol-Version": getattr(self, "version", "2025-03-26")}
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
@@ -479,27 +522,41 @@ class McpClient:
         return self._reply_result(method, reply)
 
     async def close(self):
+        """Close the transport; resolves once nothing of this server is open, including a
+        transport that was still connecting: an in-flight initialize fails against the
+        closed transport and the connect aborts."""
+
+        self.shutdown.set()
+        await self._teardown_transports()
+
+    async def _teardown_transports(self) -> None:
+        """Stop the pump and close the HTTP client or stdio process. Idempotent: a connect
+        that fails or is cancelled tears the same transports down after a concurrent close."""
+
         await self._stop_pump()
         if self.http:
-            await self.http.aclose()
-            self.http = None
+            http, self.http = self.http, None
+            try:
+                await http.aclose()
+            except Exception:  # noqa: BLE001 - closing never fails the shutdown
+                pass
         if self.process:
-            if self.process.returncode is None:
+            process, self.process = self.process, None
+            if process.returncode is None:
                 if sys.platform == "win32":
-                    killer = await asyncio.create_subprocess_exec("taskkill", "/F", "/T", "/PID", str(self.process.pid),
+                    killer = await asyncio.create_subprocess_exec("taskkill", "/F", "/T", "/PID", str(process.pid),
                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                     await killer.wait()
                 else:
                     try:
-                        os.killpg(self.process.pid, process_signal.SIGTERM)
+                        os.killpg(process.pid, process_signal.SIGTERM)
                     except ProcessLookupError:
                         pass
                 try:
-                    await asyncio.wait_for(self.process.wait(), 3)
+                    await asyncio.wait_for(process.wait(), 3)
                 except asyncio.TimeoutError:
-                    self.process.kill()
-                    await self.process.wait()
-            self.process = None
+                    process.kill()
+                    await process.wait()
             if self.stderr_task:
                 self.stderr_task.cancel()
                 self.stderr_task = None
@@ -613,6 +670,11 @@ class McpManager:
                     # A list_changed notification raced the connect; list again now that
                     # the client is registered.
                     await self.ensure_tools(name)
+            except asyncio.CancelledError:
+                # A cancelled reload must not leave the half-opened transport running.
+                if client:
+                    await client.close()
+                raise
             except Exception as exc:  # noqa: BLE001 - one invalid server must not abort reload
                 self.errors[name] = str(exc) or type(exc).__name__
                 if client:
@@ -936,6 +998,9 @@ class McpManager:
             client.credential = None
 
     async def close(self):
+        # Connects run inline inside reload()/reconnect(), so by the time close()
+        # runs from the same task every connect has settled; each client's close()
+        # still aborts one that another task started mid-flight.
         for client in self.clients.values():
             await client.close()
         self.clients = {}

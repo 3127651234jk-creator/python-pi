@@ -101,9 +101,14 @@ def _schema_type(schema: Any) -> str:
 
 
 def _describe_output(output_schema: Optional[dict]) -> str:
-    """What a script call resolves to: a string, or the object's field names."""
+    """What a script call resolves to: a string, the object's field names, or the
+    rendered type for anything else such as a union."""
 
-    if not isinstance(output_schema, dict) or output_schema.get("type") != "object":
+    if not isinstance(output_schema, dict):
+        return "str"
+    if isinstance(output_schema.get("anyOf"), list):
+        return _schema_type(output_schema)
+    if output_schema.get("type") != "object":
         return "str"
     properties = output_schema.get("properties")
     if not isinstance(properties, dict) or not properties:

@@ -67,7 +67,7 @@ from .subscription_auth import get_or_create_device_id, login_claude, login_code
 from ..agent.compaction import CompactionSettings
 from . import timings
 from .resources import ResourceCatalog
-from .mcp import McpManager
+from .mcp import McpManager, create_tool_name_matcher, is_mcp_tool_name
 from .rpc import JsonWriter, RpcServer
 from .extensions import ExtensionManager
 from .ts_extension import to_jsonable as to_json_value
@@ -109,6 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Do not trust the project folder for this run")
     parser.add_argument("--sync-models", action="store_true", help="Refresh the cached online model catalog")
     parser.add_argument("--evals", metavar="FILE", help="Run eval cases from a JSON file and exit")
+    parser.add_argument("--no-tools", "-nt", action="store_true",
+                        help="Disable all tools by default (built-in, extension and MCP)")
+    parser.add_argument("--tools", "-t", metavar="TOOLS",
+                        help="Comma-separated allowlist of tool names or patterns (*) to enable. "
+                             "Keeps MCP tools unless an entry starts with mcp__")
+    parser.add_argument("--exclude-tools", "-xt", metavar="TOOLS",
+                        help="Comma-separated denylist of tool names or patterns (*) to disable. "
+                             "Applies to all tools, MCP tools included")
+    parser.add_argument("--no-mcp", action="store_true",
+                        help="Disable built-in MCP support: no servers connect and no MCP tools")
     return parser
 
 
@@ -140,6 +150,80 @@ def split_extension_flags(argv: List[str], parser: argparse.ArgumentParser):
     return filtered, values
 
 
+class ToolSelection:
+    """The parsed ``--tools`` / ``--exclude-tools`` / ``--no-tools`` selection.
+
+    ``--tools`` keeps MCP tools unless the allowlist is empty (``--no-tools``) or an entry
+    starts with ``mcp__`` (only matching MCP tools are kept). ``--exclude-tools`` applies to
+    everything, MCP tools included.
+
+    MCP tools the allowlist keeps without naming them stay registered for codemode scripts
+    but are not declared to the model, matching the TS session that keeps them out of the
+    declared loadout. pi-python has no tool_search, so codemode is the only way to reach
+    them.
+    """
+
+    def __init__(self, allowed: Optional[List[str]], excluded: List[str]) -> None:
+        self.allowed = create_tool_name_matcher(allowed) if allowed is not None else None
+        self.allowlist_filters_mcp = allowed is not None and (
+            len(allowed) == 0 or any(entry.startswith("mcp__") for entry in allowed))
+        self.excluded = create_tool_name_matcher(excluded) if excluded else None
+
+    def keeps(self, name: str) -> bool:
+        """Whether a tool stays registered under this selection."""
+        if self.excluded is not None and self.excluded(name):
+            return False
+        if self.allowed is None or self.allowed(name):
+            return True
+        return not self.allowlist_filters_mcp and is_mcp_tool_name(name)
+
+    def declares(self, name: str) -> bool:
+        """Whether requests declare the tool to the model under this selection."""
+        if self.excluded is not None and self.excluded(name):
+            return False
+        if self.allowed is None or self.allowed(name) or self.allowlist_filters_mcp:
+            return True
+        return not is_mcp_tool_name(name)
+
+
+def split_tool_entries(value: str) -> List[str]:
+    """Comma-separated ``--tools`` / ``--exclude-tools`` entries; blanks dropped."""
+    return [entry.strip() for entry in value.split(",") if entry.strip()]
+
+
+def tool_selection_from_args(args: argparse.Namespace) -> Optional[ToolSelection]:
+    """The selection for one run, or None when no tool flag was given."""
+    if args.tools is None and not args.no_tools and not args.exclude_tools:
+        return None
+    allowed = split_tool_entries(args.tools) if args.tools is not None else ([] if args.no_tools else None)
+    excluded = split_tool_entries(args.exclude_tools) if args.exclude_tools else []
+    return ToolSelection(allowed, excluded)
+
+
+def apply_tool_selection(agent: Agent) -> None:
+    """Re-apply the run's tool selection to the agent's current tool set."""
+    selection = getattr(agent, "_tool_selection", None)
+    if selection is None:
+        return
+    agent.tools[:] = [tool for tool in agent.tools if selection.keeps(tool.name)]
+    # Kept MCP tools stay executable for codemode but are not declared to the
+    # model when the allowlist did not name them.
+    for tool in agent.tools:
+        tool.declared = selection.declares(tool.name)
+
+
+def skill_file_read_tool(agent: Agent) -> Optional[str]:
+    """The declared tool that loads skill files: read, bash, or None when neither is
+    declared and the skills hint names no tool at all."""
+
+    declared = {tool.name for tool in agent.tools}
+    if "read" in declared:
+        return "read"
+    if "bash" in declared:
+        return "bash"
+    return None
+
+
 def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegistry] = None,
                resources: Optional[ResourceCatalog] = None) -> Agent:
     registry = registry or ModelRegistry(Configuration(cwd, args.agent_dir or ""))
@@ -157,6 +241,12 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
         get_model=lambda: current_agent.get("agent"),
         image_settings=lambda: registry.config.settings.get("images", {}),
     )
+    # The tool list and rules follow the selected tools, so the selection applies
+    # before the system prompt is built. MCP and extension tools are filtered by
+    # apply_tool_selection as they are added.
+    selection = tool_selection_from_args(args)
+    if selection is not None:
+        tools = [tool for tool in tools if selection.keeps(tool.name)]
     snippets, guidelines = tool_prompt_contributions(tools)
     options = SystemPromptOptions(cwd=cwd, selected_tools=[tool.name for tool in tools], tool_snippets=snippets, tool_guidelines=guidelines)
     system_prompt = build_system_prompt(options)
@@ -167,9 +257,11 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
                  block_images=bool(image_settings.get("block_images", False)),
                  retry=RetryPolicy(**settings.get("retry", {})))
     apply_attribution(model, settings)
+    # Kept on the agent so every later tool change re-applies the same selection.
+    agent._tool_selection = selection
     current_agent["agent"] = agent
     resources = resources or ResourceCatalog(registry.config)
-    agent.messages[0].sections = {"skills": resources.system_prompt() or None}
+    agent.messages[0].sections = {"skills": resources.system_prompt(file_read_tool=skill_file_read_tool(agent)) or None}
     return agent
 
 
@@ -691,10 +783,6 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             resources.reload()
                             for diagnostic in resources.diagnostics:
                                 print(f"warning: {diagnostic}", file=sys.stderr)
-                            update = SystemMessage(content="", timestamp=0, sections={"skills": resources.system_prompt() or None})
-                            agent.messages.append(update)
-                            if session:
-                                session.append(update)
                         print("configuration reloaded")
                         if mcp:
                             await mcp.reload()
@@ -704,6 +792,15 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             if ui and ui.full_screen:
                                 extensions.set_ui_sink(ui.ui_request)
                             registry.register_extension_providers(extensions.all_providers())
+                        apply_tool_selection(agent)
+                        if resources:
+                            # The skills hint follows the tools that are declared now.
+                            update = SystemMessage(content="", timestamp=0,
+                                                   sections={"skills": resources.system_prompt(
+                                                       file_read_tool=skill_file_read_tool(agent)) or None})
+                            agent.messages.append(update)
+                            if session:
+                                session.append(update)
                 except (OSError, ValueError, ModelError, asyncio.TimeoutError, httpx.HTTPError) as exc:
                     print(f"error: {exc}")
                 continue
@@ -1292,11 +1389,15 @@ def restore_session_settings(agent: Agent, session: SessionManager, registry: Mo
     restore_compaction(agent.compactor, agent.messages, session.latest_custom("compaction"))
 
 
-def sync_mcp_tools(agent: Agent, mcp: McpManager) -> None:
-    """Replace the agent's MCP tools with the manager's current set."""
+def sync_mcp_tools(agent: Agent, mcp: Optional[McpManager]) -> None:
+    """Replace the agent's MCP tools with the manager's current set, honoring the
+    run's --tools / --exclude-tools selection."""
+    if mcp is None:
+        return
     for tool in mcp.tools:
         tool._mcp_managed = True
     agent.tools[:] = [tool for tool in agent.tools if not getattr(tool, "_mcp_managed", False)] + list(mcp.tools)
+    apply_tool_selection(agent)
 
 
 def describe_error(exc: BaseException) -> str:
@@ -1465,7 +1566,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             session.rename(args.name)
         if args.session or args.continue_session:
             restore_session_settings(agent, session, registry)
-            update = SystemMessage(content="", timestamp=0, sections={"skills": resources.system_prompt() or None})
+            update = SystemMessage(content="", timestamp=0,
+                                   sections={"skills": resources.system_prompt(file_read_tool=skill_file_read_tool(agent)) or None})
             agent.messages.append(update)
             session.append(update)
 
@@ -1480,26 +1582,34 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 
     renderer = CliRenderer(settings=registry.config.settings)
 
-    mcp = McpManager(registry.config)
+    # --no-mcp disables built-in MCP support: no servers connect, no MCP tools,
+    # and extensions see no MCP manager to register servers on.
+    mcp = None if args.no_mcp else McpManager(registry.config)
     extensions = ExtensionManager(registry.config, agent, session, registry=registry, mcp=mcp,
                                   flag_values=extension_flag_values)
     renderer.extensions = extensions
     try:
-        await mcp.reload()
-        sync_mcp_tools(agent, mcp)
-        mcp.on_tools_changed = lambda server: sync_mcp_tools(agent, mcp)
+        if mcp is not None:
+            await mcp.reload()
+            sync_mcp_tools(agent, mcp)
+            mcp.on_tools_changed = lambda server: sync_mcp_tools(agent, mcp)
         try:
             await extensions.reload()
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         registry.register_extension_providers(extensions.all_providers())
-        if registry.config.settings.get("codemode", {}).get("enabled"):
+        apply_tool_selection(agent)
+        # Codemode runs through the selection like any other tool: --tools without a
+        # codemode entry and --no-tools / --exclude-tools codemode all leave it out.
+        codemode_settings = registry.config.settings.get("codemode", {})
+        selection = getattr(agent, "_tool_selection", None)
+        if codemode_settings.get("enabled") and (selection is None or selection.keeps("codemode")):
             agent.tools.append(create_codemode_tool(
-                agent.tools, session, registry.config.settings.get("codemode", {}),
+                agent.tools, session, codemode_settings,
                 execute_tool=execute_nested_tool))
         timings.time("extensions")
-        for name, error in mcp.errors.items():
+        for name, error in (mcp.errors.items() if mcp is not None else []):
             print(f"MCP {name}: {error}", file=sys.stderr)
         if args.evals:
             passed = await run_evals_file(agent, renderer, session, args.evals, mcp)
@@ -1549,7 +1659,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         return 0
     finally:
         await extensions.close()
-        await mcp.close()
+        if mcp is not None:
+            await mcp.close()
 
 
 def _route_durable_command(argv: List[str]) -> Optional[int]:

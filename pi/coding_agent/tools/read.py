@@ -29,6 +29,20 @@ READ_SCHEMA = {
     "required": ["path"],
 }
 
+# Result for programmatic callers such as codemode scripts: the text for text files, and
+# an image block for images that codemode's image() accepts. `note` is the text that goes
+# with the image, such as resize hints. Property descriptions are left out so the type
+# stays on one line in tool descriptions.
+READ_OUTPUT_SCHEMA = {
+    "anyOf": [
+        {"type": "string"},
+        {"type": "object",
+         "properties": {"type": {"enum": ["image"]}, "data": {"type": "string"},
+                        "mimeType": {"type": "string"}, "note": {"type": "string"}},
+         "required": ["type", "data", "mimeType", "note"]},
+    ],
+}
+
 READ_DESCRIPTION = (
     f"Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). "
     f"Images are sent as attachments. For text files, output is truncated to {DEFAULT_MAX_LINES} lines "
@@ -51,6 +65,17 @@ def _model_resize_options(model: Any):
     limits = getattr(model, "input_limits", None) if model is not None else None
     profile = limits.images.resize if limits is not None and limits.images is not None else None
     return resize_options_from_profile(profile) if profile is not None else None
+
+
+def to_read_output(content: List[Union[TextContent, ImageContent]]) -> Union[str, dict]:
+    """The image block and its note, or the text for text files and images that could not
+    be processed."""
+
+    text = next((block.text for block in content if isinstance(block, TextContent)), "")
+    image = next((block for block in content if isinstance(block, ImageContent)), None)
+    if image is not None:
+        return {"type": "image", "data": image.data, "mimeType": image.mime_type, "note": text}
+    return text
 
 
 def create_read_tool(
@@ -114,7 +139,7 @@ def create_read_tool(
                     TextContent(text=text),
                     ImageContent(data=processed.data, mime_type=processed.mime_type),
                 ]
-            return AgentToolResult(content=content)
+            return AgentToolResult(content=content, structured_content=to_read_output(content))
 
         with open(absolute_path, "r", encoding="utf-8", errors="replace") as handle:
             text_content = handle.read()
@@ -166,13 +191,15 @@ def create_read_tool(
             output_text = truncation.content
             details = None
 
-        return AgentToolResult(content=[TextContent(text=output_text)], details=details)
+        return AgentToolResult(content=[TextContent(text=output_text)], details=details,
+                               structured_content=output_text)
 
     return AgentTool(
         name="read",
         label="read",
         description=READ_DESCRIPTION,
         parameters=READ_SCHEMA,
+        output_schema=READ_OUTPUT_SCHEMA,
         execute=execute,
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import subprocess
 import sys
@@ -14,7 +15,12 @@ import pytest
 from pi.coding_agent.tools import create_default_tools
 from pi.coding_agent.tools import bash as bash_module
 from pi.coding_agent.tools.edit import prepare_edit_arguments
+from pi.coding_agent.tools.read import create_read_tool
 from pi.coding_agent.tools.truncate import truncate_head, truncate_tail
+
+# A valid 1x1 PNG, shared with the codemode worker tests.
+PNG_1PX = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
+           "AAAABJRU5ErkJggg==")
 
 
 @pytest.fixture()
@@ -36,6 +42,38 @@ def test_write_then_read(tmp_path):
         await write.execute("t1", {"path": "sub/dir/hello.txt", "content": "line1\nline2\n"})
         result = await read.execute("t2", {"path": "sub/dir/hello.txt"})
         assert result.content[0].text == "line1\nline2\n"
+
+    asyncio.run(scenario())
+
+
+# -- v1.0.4 port: read declares an output schema for codemode scripts (021eae60a)
+
+
+def test_read_structured_output_is_text_for_text_files(tmp_path):
+    (tmp_path / "file.txt").write_text("hello", encoding="utf-8")
+
+    async def scenario():
+        read = get_tool(str(tmp_path), "read")
+        result = await read.execute("t1", {"path": "file.txt"})
+        assert result.structured_content == "hello"
+        assert read.output_schema["anyOf"][0]["type"] == "string"
+
+    asyncio.run(scenario())
+
+
+def test_read_structured_output_is_image_block_for_images(tmp_path):
+    png_bytes = base64.b64decode(PNG_1PX)
+    (tmp_path / "picture.png").write_bytes(png_bytes)
+
+    async def scenario():
+        read = create_read_tool(str(tmp_path), image_settings=lambda: {"auto_resize": False})
+        result = await read.execute("t1", {"path": "picture.png"})
+        structured = result.structured_content
+        assert structured["type"] == "image"
+        assert structured["mimeType"] == "image/png"
+        assert base64.b64decode(structured["data"]) == png_bytes
+        assert structured["note"].startswith("Read image file")
+        assert result.content[0].text == structured["note"]
 
     asyncio.run(scenario())
 

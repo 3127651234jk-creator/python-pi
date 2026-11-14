@@ -13,6 +13,7 @@ import pytest
 
 from pi.agent.agent import Agent
 from pi.agent.agent_loop import (
+    declare_tool_changes,
     default_convert_to_llm,
     execute_tool_calls_parallel,
     execute_tool_calls_sequential,
@@ -41,6 +42,7 @@ from pi.ai.types import (
     StreamStartEvent,
     SystemMessage,
     TextContent,
+    Tool,
     ToolCall,
     ToolResultMessage,
     Usage,
@@ -115,6 +117,107 @@ def test_tool_call_roundtrip():
         assert "ToolExecutionStartEvent" in event_types
         assert "ToolExecutionEndEvent" in event_types
         assert event_types[-1] == "AgentEndEvent"
+
+    asyncio.run(scenario())
+
+
+def test_undeclared_tool_is_not_declared_to_the_model():
+    """--tools keeps MCP tools registered without declaring them (04b97ef00)."""
+
+    hidden = make_tool("mcp__dev__echo")
+    hidden.declared = False
+    messages = declare_tool_changes(
+        AgentContext(messages=[], tools=[make_tool("read"), hidden]),
+        [UserMessage(content="go", timestamp=0)],
+    )
+    system = next(message for message in messages if getattr(message, "role", None) == "system")
+    assert [tool.name for tool in (system.tools_added or [])] == ["read"]
+
+
+def test_undeclared_tool_is_removed_from_a_resumed_transcript():
+    """A declaration restored from a session is removed when the tool is now undeclared."""
+
+    hidden = make_tool("mcp__dev__echo")
+    hidden.declared = False
+    visible = make_tool("read")
+    declared = [Tool(name="read", description=visible.description, parameters=visible.parameters),
+                Tool(name="mcp__dev__echo", description=hidden.description,
+                     parameters=hidden.parameters)]
+    messages = declare_tool_changes(
+        AgentContext(messages=[SystemMessage(content="", timestamp=0, tools_added=declared)],
+                     tools=[visible, hidden]),
+        [UserMessage(content="go", timestamp=0)],
+    )
+    removed = [ref.name for message in messages
+               for ref in (getattr(message, "tools_removed", None) or [])]
+    assert removed == ["mcp__dev__echo"]
+
+
+def test_undeclared_tool_rejects_top_level_calls():
+    async def scenario():
+        use_script([
+            {"text": "", "toolCalls": [{"id": "t1", "name": "mcp__dev__echo",
+                                       "arguments": {"text": "hi"}}]},
+            {"text": "done"},
+        ])
+        hidden = make_tool("mcp__dev__echo")
+        hidden.declared = False
+
+        async def stream_fn(model, context, options=None):
+            async for event in faux.stream_faux(model, context, options):
+                yield event
+
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[hidden]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+        result = next(message for message in messages if isinstance(message, ToolResultMessage))
+        assert result.is_error and "not found" in result.content[0].text
+
+    asyncio.run(scenario())
+
+
+def test_undeclared_tool_is_reachable_from_a_running_tool():
+    """Codemode-style nested calls reach the tools the model cannot see."""
+
+    from pi.coding_agent.nested_tool_calls import execute_tool
+
+    async def scenario():
+        use_script([
+            {"text": "", "toolCalls": [{"id": "t1", "name": "outer", "arguments": {"text": "hi"}}]},
+            {"text": "done"},
+        ])
+        hidden = make_tool("mcp__dev__echo")
+        hidden.declared = False
+
+        async def execute(tool_call_id, params, signal=None, on_update=None):
+            outcome = await execute_tool("mcp__dev__echo", {"text": params["text"]}, signal)
+            text = "\n".join(block.text for block in outcome.result.content
+                             if isinstance(block, TextContent))
+            return AgentToolResult(content=[TextContent(text=text)])
+
+        outer = AgentTool(name="outer", description="outer", parameters={
+            "type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            execute=execute)
+
+        async def stream_fn(model, context, options=None):
+            async for event in faux.stream_faux(model, context, options):
+                yield event
+
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[outer, hidden]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+        result = next(message for message in messages if isinstance(message, ToolResultMessage))
+        assert not result.is_error and result.content[0].text == "hi"
 
     asyncio.run(scenario())
 

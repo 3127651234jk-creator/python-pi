@@ -30,7 +30,9 @@ class AgentToolResult:
 
     content: List[Union[TextContent, ImageContent]]
     details: Any = None
-    structured_content: Optional[Dict[str, Any]] = None
+    # A tool's declared outputSchema resolution, for programmatic callers such as
+    # codemode scripts: an object, or a plain string for text-only results.
+    structured_content: Optional[Union[str, Dict[str, Any]]] = None
     usage: Optional[Usage] = None
     is_error: bool = False
     terminate: bool = False
@@ -49,6 +51,10 @@ class AgentTool(Tool):
     prepare_arguments: Optional[Callable[[Any], Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
     execution_mode: Optional[Literal["sequential", "parallel"]] = None
+    # Whether requests declare the tool to the model. False keeps the tool
+    # registered for codemode scripts and nested calls only: the model never
+    # receives its declaration and a top-level call to it is rejected.
+    declared: bool = True
 
     def __post_init__(self) -> None:
         if not self.label:

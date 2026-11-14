@@ -163,3 +163,45 @@ def test_resume_refreshes_skill_catalog(resources, monkeypatch):
     system, _ = normalize_context(TranscriptContext(session.load(session.latest_session_file())))
     assert "After" in system.sections["skills"]
     assert "Before" not in system.sections["skills"]
+
+
+# -- v1.0.4 port: the skills hint follows the declared file reader (c30840c2e)
+
+
+def test_skills_prompt_names_the_declared_file_reader(resources):
+    write(resources.cwd / ".pi/skills/demo/SKILL.md", "---\nname: demo\ndescription: Demo skill\n---\nBody")
+    catalog = ResourceCatalog(resources)
+    read_prompt = catalog.system_prompt(file_read_tool="read")
+    assert "use read to load its SKILL.md" in read_prompt
+    assert "use bash to load its SKILL.md" in catalog.system_prompt(file_read_tool="bash")
+    indirect = catalog.system_prompt(file_read_tool="indirect")
+    assert "load its SKILL.md" in indirect
+    assert "use read" not in indirect and "use bash" not in indirect
+    assert catalog.system_prompt(file_read_tool=None) == ""
+
+
+def test_make_agent_tools_flag_shapes_tools_and_system_prompt(resources):
+    registry = ModelRegistry(resources)
+    agent = make_agent(build_parser().parse_args(["--provider", "faux", "--tools", "read,grep"]),
+                       str(resources.cwd), registry)
+    assert [tool.name for tool in agent.tools] == ["read", "grep"]
+    system = agent.messages[0].content
+    assert "- read: Read file contents" in system
+    assert "- bash:" not in system
+
+
+def test_make_agent_no_tools_leaves_no_tool_section(resources):
+    registry = ModelRegistry(resources)
+    agent = make_agent(build_parser().parse_args(["--provider", "faux", "--no-tools"]),
+                       str(resources.cwd), registry)
+    assert agent.tools == []
+    assert "(none)" in agent.messages[0].content
+
+
+def test_make_agent_exclude_tools_flag(resources):
+    registry = ModelRegistry(resources)
+    agent = make_agent(build_parser().parse_args(["--provider", "faux", "--exclude-tools", "bash,edit"]),
+                       str(resources.cwd), registry)
+    names = {tool.name for tool in agent.tools}
+    assert "bash" not in names and "edit" not in names
+    assert "read" in names and "write" in names

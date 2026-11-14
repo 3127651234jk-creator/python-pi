@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from pi.coding_agent.config import Configuration, write_json
-from pi.coding_agent.mcp import McpClient, McpManager
+from pi.coding_agent.mcp import McpClient, McpManager, create_tool_name_matcher, is_mcp_tool_name
 
 
 @pytest.mark.parametrize("newline", ["\r", "\n", "\r\n"])
@@ -238,4 +238,111 @@ def test_concurrent_reconnects_share_replacement(tmp_path, monkeypatch):
             await manager.close()
 
     asyncio.run(check())
+
+
+# -- v1.0.4 port: tool name matching (04b97ef00) and closing in-flight connects (8c911797c)
+
+
+def test_tool_name_matcher_exact_names_and_star_patterns():
+    matcher = create_tool_name_matcher(["read", "mcp__radius__*"])
+    assert matcher("read")
+    assert not matcher("write")
+    assert matcher("mcp__radius__search")
+    assert matcher("mcp__radius__deep__nested")
+    assert not matcher("mcp__other__search")
+
+    pattern_only = create_tool_name_matcher(["*_search"])
+    assert pattern_only("mcp__radius__search")
+    assert not pattern_only("mcp__radius__index")
+
+
+def test_is_mcp_tool_name_covers_server_and_resource_tools():
+    assert is_mcp_tool_name("mcp__dev__echo")
+    assert is_mcp_tool_name("list_mcp_resources")
+    assert is_mcp_tool_name("list_mcp_resource_templates")
+    assert is_mcp_tool_name("read_mcp_resource")
+    assert not is_mcp_tool_name("read")
+    assert not is_mcp_tool_name("codemode")
+
+
+def write_slow_initialize_server(tmp_path):
+    """Stdio MCP server that accepts the initialize request but never answers it."""
+    script = tmp_path / "slow_server.py"
+    script.write_text(
+        "import sys,json,time\n"
+        "line = sys.stdin.readline()\n"
+        "req = json.loads(line)\n"
+        "time.sleep(60)\n"
+        'print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":"2025-03-26"}}),flush=True)\n',
+        encoding="utf-8")
+    return {"command": sys.executable, "args": [str(script)], "timeout": 30}
+
+
+def test_close_aborts_connect_in_progress(tmp_path):
+    config = write_slow_initialize_server(tmp_path)
+
+    async def scenario():
+        client = McpClient("slow", config, tmp_path)
+        task = asyncio.create_task(client.connect())
+        while client.process is None and not task.done():
+            await asyncio.sleep(0.02)
+        process = client.process
+        assert process is not None
+        # close() while initialize is in flight: the connect settles with an error
+        # and the spawned server is gone instead of running until its timeout.
+        await client.close()
+        with pytest.raises(RuntimeError):
+            await task
+        assert client.closed
+        assert client.http is None and client.process is None
+        assert process.returncode is not None
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_reload_closes_half_open_client(tmp_path, monkeypatch):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json",
+               {"mcpServers": {"slow": write_slow_initialize_server(tmp_path)}})
+
+    created = []
+
+    class RecordingClient(McpClient):
+        def __init__(self, name, client_config, cwd):
+            super().__init__(name, client_config, cwd)
+            created.append(self)
+
+    monkeypatch.setattr("pi.coding_agent.mcp.McpClient", RecordingClient)
+
+    async def scenario():
+        manager = McpManager(config)
+        task = asyncio.create_task(manager.reload())
+        while not created and not task.done():
+            await asyncio.sleep(0.02)
+        while created[0].process is None and not task.done():
+            await asyncio.sleep(0.02)
+        process = created[0].process
+        assert process is not None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The reload's cleanup closed the client it had half opened.
+        assert created[0].closed
+        assert created[0].process is None
+        assert process.returncode is not None
+        assert manager.clients == {}
+
+    asyncio.run(scenario())
+
+
+def test_close_is_idempotent_after_failed_connect(tmp_path):
+    async def scenario():
+        client = McpClient("bad", {"command": "definitely-nonexistent-mcp-executable"}, tmp_path)
+        with pytest.raises(Exception):
+            await client.connect()
+        await client.close()
+        await client.close()
+        assert client.closed
+
+    asyncio.run(scenario())
 
