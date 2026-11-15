@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from typing import Optional
 
 try:
     import boto3
@@ -15,7 +16,7 @@ except ImportError:
 from ..types import TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, ToolCall, ToolResultMessage, StreamStartEvent, StreamErrorEvent, get_system_message_text
 from ..utils import normalize_context, normalize_tool_call_id
 from ...util import AbortError
-from .base import ProviderState, SimpleStreamOptions, usage_from_counts, thinking_budget
+from .base import ProviderState, SimpleStreamOptions, usage_from_counts, thinking_budget, resolve_max_tokens
 from .blocks import BlockEvents
 
 # Converse top-level keys the adapter always builds itself.
@@ -27,7 +28,7 @@ def _is_nova(model_id: str) -> bool:
     return lowered.startswith("amazon.") and "nova" in lowered
 
 
-def _apply_model_params(body: dict, model, options) -> None:
+def _apply_model_params(body: dict, model, options, max_tokens: Optional[int] = None) -> None:
     """Merge ``Model.params`` into the Converse request.
 
     Top-level keys pass through verbatim (``inferenceConfig``,
@@ -36,7 +37,8 @@ def _apply_model_params(body: dict, model, options) -> None:
     ``top_k`` shorthand routes to the family-specific field: Nova nests it as
     ``additionalModelRequestFields.inferenceConfig.topK``, everything else takes
     the flat ``additionalModelRequestFields.top_k``. Options the caller set
-    explicitly (temperature, max tokens, reasoning) win over params.
+    explicitly (temperature, max tokens, reasoning) win over params; the caller
+    passes the already-clamped output budget so params cannot override it.
     """
     params = model.params or {}
     for key, value in params.items():
@@ -49,8 +51,8 @@ def _apply_model_params(body: dict, model, options) -> None:
         # Explicit caller options keep precedence over params.
         if options.temperature is not None:
             config["temperature"] = options.temperature
-        if options.max_tokens:
-            config["maxTokens"] = options.max_tokens
+        if max_tokens:
+            config["maxTokens"] = max_tokens
     top_k = params.get("top_k")
     if top_k is not None:
         fields = body.setdefault("additionalModelRequestFields", {})
@@ -97,10 +99,12 @@ def build_request(model, context, options):
                 output[-1]["content"].extend(content)
             else:
                 output.append({"role": role, "content": content})
-    body = {"modelId": model.id, "messages": output, "inferenceConfig": {"maxTokens": options.max_tokens or model.max_tokens}}
+    max_tokens = resolve_max_tokens(model, context, options)
+    body = {"modelId": model.id, "messages": output, "inferenceConfig": {"maxTokens": max_tokens}}
     if options.temperature is not None:
         body["inferenceConfig"]["temperature"] = options.temperature
-    _apply_model_params(body, model, options)
+    _apply_model_params(body, model, options,
+                        max_tokens=max_tokens if options and options.max_tokens else None)
     if model.reasoning and "anthropic." in model.id and options.reasoning not in (None, "off"):
         budget = min(thinking_budget(options.reasoning), body["inferenceConfig"]["maxTokens"] - 1024)
         if budget < 1024:

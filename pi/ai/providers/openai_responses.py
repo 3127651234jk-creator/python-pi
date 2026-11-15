@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, get_system_message_text, get_message_text
 from ..utils import normalize_context
-from .base import SimpleStreamOptions, apply_model_params, run_provider_stream, usage_from_counts
+from .base import SimpleStreamOptions, apply_model_params, resolve_max_tokens, run_provider_stream, usage_from_counts
 from .blocks import BlockEvents
 from .copilot import copilot_headers
 
@@ -66,7 +66,7 @@ def build_request(model, context, options):
                       else {"type": "input_text", "text": b.text} for b in message.content]
             items.append({"type": "function_call_output", "call_id": message.tool_call_id, "output": output or "(empty result)"})
     body = {"model": model.id, "input": items, "stream": True, "store": False,
-            "max_output_tokens": options.max_tokens or model.max_tokens, "include": ["reasoning.encrypted_content"]}
+            "max_output_tokens": resolve_max_tokens(model, context, options), "include": ["reasoning.encrypted_content"]}
     if system:
         body["instructions"] = get_system_message_text(system)
         if system.tools_added:

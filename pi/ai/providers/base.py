@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from ..estimate import estimate_context_tokens
 from ..models import Model
 from ..types import (
     AssistantMessage,
@@ -70,6 +71,33 @@ class SimpleStreamOptions:
 
 
 StreamFn = Callable[[Model, TranscriptContext, Optional[SimpleStreamOptions]], AsyncIterator[Any]]
+
+# Output-limit clamp (port of packages/ai/src/api/simple-options.ts): tokens
+# always left between the estimated input and the context window, and the
+# smallest output budget a clamped request may keep.
+CONTEXT_SAFETY_TOKENS = 4096
+MIN_MAX_TOKENS = 1
+
+
+def clamp_max_tokens_to_context(model: Model, context: TranscriptContext, max_tokens: int) -> int:
+    """Cap the requested output so input + output fits the model's context window.
+
+    ``contextWindow − estimateContextTokens − 4096`` floored at one token; a
+    non-positive context window keeps the requested cap. Prevents the
+    "input + output exceeds the window" 400 on long contexts (#10497).
+    """
+    max_tokens = max(MIN_MAX_TOKENS, max_tokens)
+    if model.context_window <= 0:
+        return max_tokens
+    available = model.context_window - estimate_context_tokens(context).tokens - CONTEXT_SAFETY_TOKENS
+    return min(max_tokens, max(MIN_MAX_TOKENS, available))
+
+
+def resolve_max_tokens(model: Model, context: TranscriptContext, options: Optional[SimpleStreamOptions]) -> int:
+    """Effective output budget: the explicit option or the model cap, clamped to the window."""
+    requested = options.max_tokens if options and options.max_tokens else model.max_tokens
+    return clamp_max_tokens_to_context(model, context, requested or MIN_MAX_TOKENS)
+
 
 _THINKING_BUDGETS: Dict[str, int] = {
     "minimal": 1024,

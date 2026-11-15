@@ -5,12 +5,13 @@ import hashlib
 import json
 from typing import Any, Callable, List, Optional, Tuple
 
+from ..ai.estimate import CHARS_PER_TOKEN, estimate_message_tokens
 from ..ai.models import Model
 from ..ai.providers import SimpleStreamOptions
 from ..ai.retry import RetryPolicy, retry_assistant_call
 from ..ai.types import (
-    AssistantMessage, AudioContent, DoneEvent, ImageContent, Message, StreamErrorEvent, SystemMessage,
-    TextContent, ToolCall, TranscriptContext, Usage, UserMessage, VideoContent, combine_usage,
+    AssistantMessage, DoneEvent, Message, StreamErrorEvent, SystemMessage,
+    TextContent, ToolCall, TranscriptContext, Usage, UserMessage, combine_usage,
 )
 from ..ai.utils import normalize_context
 
@@ -46,17 +47,6 @@ TURN_PREFIX_SUMMARIZATION_PROMPT = (
 )
 
 
-def estimate_tokens(message: Message) -> int:
-    data = asdict(message)
-    # Media blocks have a fixed estimate; never count their base64 as text.
-    if isinstance(message.content, list):
-        data["content"] = [
-            {"media_tokens": "x" * 4800} if isinstance(b, (ImageContent, AudioContent, VideoContent)) else asdict(b)
-            for b in message.content
-        ]
-    return (len(json.dumps(data, ensure_ascii=False).encode("utf-8")) + 3) // 4
-
-
 def is_context_overflow(message) -> bool:
     text = (message.error_message or "").lower()
     return message.stop_reason == "error" and any(marker in text for marker in (
@@ -73,7 +63,7 @@ def clamp_message(message: Message, max_tokens: int) -> Message:
     transcript keeps the original; only the projection is clamped.
     """
 
-    max_chars = max(256, max_tokens * 4 - 1024)
+    max_chars = max(256, int(max_tokens * CHARS_PER_TOKEN) - 1024)
     marker = "\n[... truncated {} characters ...]\n"
     if isinstance(message.content, str):
         if len(message.content) <= max_chars:
@@ -123,8 +113,8 @@ class ContextCompactor:
         if tail:
             summary_user = UserMessage(content="Previous conversation summary:\n" + self.summary, timestamp=0) if self.summary else None
             per_message = model.context_window - min(self.settings.reserve_tokens, max(1, model.context_window // 4))
-            per_message -= estimate_tokens(summary_user) if summary_user else 0
-            if estimate_tokens(tail[-1]) > per_message:
+            per_message -= estimate_message_tokens(summary_user) if summary_user else 0
+            if estimate_message_tokens(tail[-1]) > per_message:
                 tail = tail[:-1] + [clamp_message(tail[-1], per_message)]
         projected = ([system] if system else []) + (
             [UserMessage(content="Previous conversation summary:\n" + self.summary, timestamp=0)]
@@ -132,17 +122,17 @@ class ContextCompactor:
         ) + tail
         reserve = min(self.settings.reserve_tokens, max(1, model.context_window // 4))
         budget = model.context_window - reserve
-        if not force and sum(estimate_tokens(m) for m in projected) <= budget:
+        if not force and sum(estimate_message_tokens(m) for m in projected) <= budget:
             return projected
         # Cut before a user or assistant, never between a tool call and its results.
         keep = max(1, min(self.settings.keep_recent_tokens, max(1, budget // 2)))
         cut = len(tail)
         tokens = 0
         while cut > 0 and tokens < keep:
-            if cut < len(tail) and tokens + estimate_tokens(tail[cut - 1]) > keep:
+            if cut < len(tail) and tokens + estimate_message_tokens(tail[cut - 1]) > keep:
                 break
             cut -= 1
-            tokens += estimate_tokens(tail[cut])
+            tokens += estimate_message_tokens(tail[cut])
         while cut > 0 and tail[cut].role == "toolResult":
             cut -= 1
         # Keep at least the last message (and its tool-call group).
@@ -190,7 +180,7 @@ class ContextCompactor:
         result = ([system] if system else []) + [
             UserMessage(content="Previous conversation summary:\n" + summary, timestamp=0)
         ] + tail[cut:]
-        if sum(estimate_tokens(m) for m in result) >= sum(estimate_tokens(m) for m in projected):
+        if sum(estimate_message_tokens(m) for m in result) >= sum(estimate_message_tokens(m) for m in projected):
             raise RuntimeError("Context compaction could not reduce context; shorten the latest input or tool output")
         self.summary = summary
         self.prefix = rest[:len(self.prefix) + cut]
@@ -279,9 +269,9 @@ class ContextCompactor:
 
     async def compact_now(self, messages, model: Model, options, stream):
         """Force an immediate projection; returns (projected, before, after) token estimates."""
-        before = sum(estimate_tokens(m) for m in messages)
+        before = sum(estimate_message_tokens(m) for m in messages)
         projected = await self.project(messages, model, options, stream, force=True)
-        return projected, before, sum(estimate_tokens(m) for m in projected)
+        return projected, before, sum(estimate_message_tokens(m) for m in projected)
 
     async def stream(self, model, context, options, stream):
         if not self.settings.enabled:

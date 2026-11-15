@@ -40,9 +40,12 @@ from ..types import (
 from ..utils import normalize_context, normalize_tool_call_id
 from .copilot import copilot_headers
 from .base import (
+    MIN_MAX_TOKENS,
     ProviderState,
     SimpleStreamOptions,
     apply_model_params,
+    clamp_max_tokens_to_context,
+    resolve_max_tokens,
     run_provider_stream,
     thinking_budget,
     usage_from_counts,
@@ -65,7 +68,7 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
     cache_control = _cache_control(options.cache_retention if options else None)
     body: Dict[str, Any] = {
         "model": model.id,
-        "max_tokens": (options.max_tokens if options and options.max_tokens else model.max_tokens),
+        "max_tokens": resolve_max_tokens(model, context, options),
         "stream": True,
         "messages": convert_messages(messages),
     }
@@ -93,10 +96,20 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
     reasoning: Optional[ThinkingLevel] = options.reasoning if options else None
     budget = thinking_budget(reasoning) if model.reasoning else None
     if budget is not None:
-        body["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        body["max_tokens"] = max(body["max_tokens"], budget + 4096)
+        # The bump is clamped to the context window like the TS adapter clamps
+        # after adjustMaxTokensForThinking; the budget shrinks to keep the
+        # required answer room under a tight ceiling.
+        body["max_tokens"] = clamp_max_tokens_to_context(
+            model, context, max(body["max_tokens"], budget + 4096)
+        )
+        thinking_tokens = min(budget, max(MIN_MAX_TOKENS, body["max_tokens"] - 1024))
+        # Anthropic rejects budgets below 1024. When the clamped ceiling cannot
+        # host a valid budget, answer without thinking instead of sending an
+        # invalid request (the TS adapter sends budget 0 here, which also 400s).
+        if thinking_tokens >= 1024:
+            body["thinking"] = {"type": "enabled", "budget_tokens": thinking_tokens}
 
-    if options and options.temperature is not None and budget is None:
+    if options and options.temperature is not None and "thinking" not in body:
         body["temperature"] = options.temperature
     apply_model_params(body, model, options)
     return body

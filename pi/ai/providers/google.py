@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from ..types import TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, ToolCall, ToolResultMessage, get_system_message_text
 from ..utils import normalize_context
-from .base import SimpleStreamOptions, run_provider_stream, usage_from_counts, thinking_budget, apply_model_params
+from .base import SimpleStreamOptions, run_provider_stream, usage_from_counts, thinking_budget, apply_model_params, resolve_max_tokens
 from .blocks import BlockEvents
 
 
@@ -45,7 +45,7 @@ def build_request(model, context, options):
                 contents[-1]["parts"].extend(parts)
             else:
                 contents.append({"role": role, "parts": parts})
-    body = {"contents": contents, "generationConfig": {"maxOutputTokens": options.max_tokens or model.max_tokens}}
+    body = {"contents": contents, "generationConfig": {"maxOutputTokens": resolve_max_tokens(model, context, options)}}
     if options.temperature is not None:
         body["generationConfig"]["temperature"] = options.temperature
     if model.reasoning and options.reasoning and options.reasoning != "off":

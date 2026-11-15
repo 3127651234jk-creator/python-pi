@@ -17,7 +17,8 @@ from ..ai.json_io import message_from_json, to_json as ai_to_json
 from ..ai.retry import is_retryable_assistant_error, retry_delay_ms
 from ..ai.types import ImageContent, SystemMessage, TextContent, ToolResultMessage, Usage, UserMessage
 from ..agent.types import AgentToolResult
-from ..agent.compaction import estimate_tokens, is_context_overflow
+from ..agent.compaction import is_context_overflow
+from ..ai.estimate import estimate_message_tokens
 from .entries import COMPACTION_ENTRY, TOOL_RESULT_ENTRY
 from .harness import Harness, TaskRuntime, _stream_once
 from .live import LiveDoc, ensure_tool_slot, finish_slot, tool_slot
@@ -231,7 +232,7 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
             for item in entry_messages(entry, edits.get(entry.id)):
                 messages.append(item if not isinstance(item, dict) else message_from_json(item))
             spans.append((entry.id, start, len(messages)))
-        total = sum(estimate_tokens(m) for m in messages)
+        total = sum(estimate_message_tokens(m) for m in messages)
         budget = harness.model.context_window - reserve_tokens
         if total <= budget or not spans:
             await runtime.commit(lambda tx, current: TaskState(status="terminal",
@@ -242,7 +243,7 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
         acc = 0
         while cut > 0 and acc < keep:
             cut -= 1
-            acc += estimate_tokens(messages[cut])
+            acc += estimate_message_tokens(messages[cut])
         while cut > 0 and getattr(messages[cut], "role", "") == "toolResult":
             cut -= 1
         # The head marker can only start at an entry, so a cut inside a

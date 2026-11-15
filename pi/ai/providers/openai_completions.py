@@ -44,6 +44,7 @@ from .base import (
     ProviderState,
     SimpleStreamOptions,
     apply_model_params,
+    resolve_max_tokens,
     run_provider_stream,
     usage_from_counts,
 )
@@ -85,10 +86,7 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
         if not body["tools"]:
             del body["tools"]
             del body["tool_choice"]
-    if options and options.max_tokens:
-        body[token_field] = options.max_tokens
-    else:
-        body[token_field] = model.max_tokens
+    body[token_field] = resolve_max_tokens(model, context, options)
     if options and options.temperature is not None:
         body["temperature"] = options.temperature
     reasoning = options.reasoning if options else None
