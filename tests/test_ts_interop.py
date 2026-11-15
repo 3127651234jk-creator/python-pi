@@ -62,7 +62,9 @@ def test_read_ts_fixture(tmp_path):
     parsed = read_ts_file(write_fixture(tmp_path))
     assert parsed["name"] == "my session"
     records = parsed["records"]
-    assert [r["id"] for r in records] == [f"e{i}" for i in range(1, 10)]
+    assert [r["id"] for r in records] == ["i1", *[f"e{i}" for i in range(1, 10)]]
+    assert records[0]["custom"]["kind"] == "ts_session_info"
+    records = records[1:]
     assert [r["parent_id"] for r in records] == [None, "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"]
 
     user, assistant, result = records[0]["message"], records[1]["message"], records[2]["message"]
@@ -98,6 +100,42 @@ def test_read_ts_tolerates_bom_and_missing_ids(tmp_path):
     assert len(parsed["records"]) == 1
     assert parsed["records"][0]["message"].content == "no id"
     assert parsed["records"][0]["id"]  # generated when the fixture has none
+
+
+def test_session_info_in_active_chain_remains_loadable(tmp_path):
+    lines = [
+        FIXTURE_LINES[0],
+        {"type": "message", "id": "m1", "parentId": None, "timestamp": 1,
+         "message": {"role": "user", "content": "before", "timestamp": 1}},
+        {"type": "session_info", "id": "n1", "parentId": "m1", "timestamp": 2,
+         "name": "renamed"},
+        {"type": "message", "id": "m2", "parentId": "n1", "timestamp": 3,
+         "message": {"role": "user", "content": "after", "timestamp": 3}},
+    ]
+    path = write_fixture(tmp_path, "".join(json.dumps(line) + "\n" for line in lines))
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+
+    assert [message.content for message in manager.load(path)] == ["before", "after"]
+    assert manager.name == "renamed"
+    assert manager.custom_entries("ts_session_info")[0].id == "n1"
+
+
+def test_context_edits_project_active_messages(tmp_path):
+    lines = [
+        FIXTURE_LINES[0],
+        {"type": "message", "id": "m1", "parentId": None, "timestamp": 1,
+         "message": {"role": "user", "content": "remove", "timestamp": 1}},
+        {"type": "message", "id": "m2", "parentId": "m1", "timestamp": 2,
+         "message": {"role": "user", "content": "old", "timestamp": 2}},
+        {"type": "context_edit", "id": "x1", "parentId": "m2", "timestamp": 3,
+         "targetId": "m1", "replacement": None},
+        {"type": "context_edit", "id": "x2", "parentId": "x1", "timestamp": 4,
+         "targetId": "m2", "replacement": {"content": "new"}},
+    ]
+    path = write_fixture(tmp_path, "".join(json.dumps(line) + "\n" for line in lines))
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+
+    assert [message.content for message in manager.load(path)] == ["new"]
 
 
 def test_session_roundtrip_through_ts_format(tmp_path):
@@ -169,7 +207,7 @@ def test_compaction_usage_roundtrip(tmp_path):
 def test_custom_message_export_after_native_reload(tmp_path, content):
     manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
     path = manager.start_new()
-    manager.append_custom_message("note", content, display=False)
+    manager.append_custom_message("note", content, display=False, details={"source": "test"})
     loaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
     loaded.load(path)
     exported = loaded.export_ts(str(tmp_path / "custom.jsonl"))
@@ -177,10 +215,12 @@ def test_custom_message_export_after_native_reload(tmp_path, content):
     custom = next(record for record in records if record["type"] == "custom_message")
     assert custom["customType"] == "note"
     assert custom["display"] is False
+    assert custom["details"] == {"source": "test"}
     if isinstance(content, list) and len(content) > 1:
         assert custom["content"][1]["mimeType"] == "image/png"
     restored = read_ts_file(exported)["records"][0]
     assert restored["message"].content == content
+    assert restored["custom"]["data"]["details"] == {"source": "test"}
 
 
 def test_export_refuses_non_jsonl_and_overwrite(tmp_path):

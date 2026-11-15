@@ -7,11 +7,12 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 from ..ai.json_io import message_from_json, nested_calls_from_json, usage_from_json
 from ..ai.types import Message, get_message_text
+from .ts_interop import our_message_to_ts, ts_message_to_ours
 
 from ..ai.types import (
     AssistantMessage,
@@ -179,7 +180,26 @@ class SessionManager:
         return entry.id
 
     def messages(self) -> List[Message]:
-        return [entry.message for entry in self.get_branch() if entry.message is not None]
+        branch = self.get_branch()
+        original = {entry.id: entry.message for entry in branch if entry.message is not None}
+        projected = dict(original)
+        for entry in branch:
+            if entry.custom is None or entry.custom["kind"] != "ts_context_edit":
+                continue
+            data = entry.custom["data"]
+            target_id = data.get("targetId")
+            if target_id not in original or "replacement" not in data:
+                continue
+            replacement = data["replacement"]
+            if replacement is None:
+                projected[target_id] = None
+            elif isinstance(replacement, dict) and "content" in replacement:
+                message = original[target_id]
+                encoded = our_message_to_ts(message)
+                encoded["content"] = replacement["content"]
+                projected[target_id] = replace(message, content=ts_message_to_ours(encoded).content)
+        return [projected[entry.id] for entry in branch
+                if entry.id in projected and projected[entry.id] is not None]
 
     def get_branch(self, entry_id: Optional[str] = None) -> List[SessionEntry]:
         index = {entry.id: entry for entry in self.entries}

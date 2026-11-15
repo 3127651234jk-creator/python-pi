@@ -340,6 +340,12 @@ def test_models_scope_limits_registry_cycle(agent_env):
     assert registry.scoped_models() == list(registry.models.values())
 
 
+def test_models_scope_rejects_empty_patterns(agent_env, capsys):
+    assert run_cli("--provider", "faux", "--no-mcp", "--no-session", "--offline",
+                   "--models", ",,,", "hi") == 2
+    assert "--models requires at least one provider/model pattern" in capsys.readouterr().err
+
+
 # -- session internals ------------------------------------------------------
 
 def test_start_new_with_session_id(tmp_path):

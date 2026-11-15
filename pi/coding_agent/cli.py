@@ -1721,7 +1721,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         if args.models:
             registry.model_scope = [entry.strip() for entry in args.models.split(",") if entry.strip()]
             if not registry.model_scope:
-                raise ValueError("--models requires at least one provider/model pattern")
+                raise ModelError("--models requires at least one provider/model pattern")
         try:
             themes = load_themes(registry.config.agent_dir,
                                  extra_paths=[Path(path).expanduser() for path in args.theme or []],

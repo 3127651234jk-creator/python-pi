@@ -278,14 +278,16 @@ def read_ts_file(path: str) -> dict:
                 continue  # header
             if kind == "session_info":
                 name = record.get("name", name)
-                continue
             entry = {"id": record.get("id") or uuid.uuid4().hex, "parent_id": record.get("parentId"),
                      "timestamp": record.get("timestamp", "")}
             if kind == "message":
                 entry["message"] = ts_message_to_ours(record.get("message", {}))
             elif kind == "custom_message":
                 entry["message"] = ts_message_to_ours({"role": "user", "content": record.get("content", ""), "timestamp": record.get("timestamp", 0)})
-                entry["custom"] = {"kind": record.get("customType", "custom_message"), "data": {"display": record.get("display", True)}}
+                data = {"display": record.get("display", True)}
+                if "details" in record:
+                    data["details"] = record["details"]
+                entry["custom"] = {"kind": record.get("customType", "custom_message"), "data": data}
             elif kind == "custom":
                 entry["custom"] = {"kind": record.get("customType", ""), "data": record.get("data", {})}
             elif kind in _TS_TO_CUSTOM_KIND:
@@ -304,19 +306,24 @@ def write_ts_file(path: str, session) -> str:
     header = {"type": "session", "version": TS_VERSION, "id": str(uuid.uuid4()),
               "timestamp": int(time.time() * 1000), "cwd": session.cwd}
     lines = [json.dumps(header, ensure_ascii=False)]
-    if session.name:
+    branch = session.get_branch()
+    if session.name and not any(entry.custom is not None and entry.custom["kind"] == "ts_session_info"
+                                for entry in branch):
         lines.append(json.dumps({"type": "session_info", "id": uuid.uuid4().hex, "parentId": None,
                                  "timestamp": int(time.time() * 1000), "name": session.name}, ensure_ascii=False))
-    for entry in session.get_branch():
+    for entry in branch:
         common = {"id": entry.id, "parentId": entry.parent_id}
         if entry.message is not None and entry.custom is None:
             lines.append(json.dumps({**common, "type": "message", "timestamp": entry.message.timestamp,
                                      "message": our_message_to_ts(entry.message)}, ensure_ascii=False))
         elif entry.message is not None and entry.custom is not None:
-            lines.append(json.dumps({**common, "type": "custom_message", "customType": entry.custom["kind"],
-                                     "display": entry.custom["data"].get("display", True),
-                                     "timestamp": entry.message.timestamp,
-                                     "content": our_message_to_ts(entry.message)["content"]}, ensure_ascii=False))
+            record = {**common, "type": "custom_message", "customType": entry.custom["kind"],
+                      "display": entry.custom["data"].get("display", True),
+                      "timestamp": entry.message.timestamp,
+                      "content": our_message_to_ts(entry.message)["content"]}
+            if "details" in entry.custom["data"]:
+                record["details"] = entry.custom["data"]["details"]
+            lines.append(json.dumps(record, ensure_ascii=False))
         elif entry.custom is not None:
             mapped = custom_to_ts_entry(entry.custom["kind"], entry.custom["data"])
             if mapped is not None:
