@@ -15,7 +15,7 @@ from pi.ai.providers import faux
 from pi.ai.retry import RetryPolicy
 from pi.ai.types import AssistantMessage, TextContent, Usage, UserMessage
 from pi.agent.types import AgentToolResult
-from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
+from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
 from pi.durable.harness import Harness, TaskRuntime
 from pi.durable.session import create_session
 from pi.durable.storage import JsonlStorage
@@ -60,7 +60,7 @@ def test_overlapping_schedulers_do_not_repeat_generation(tmp_path, monkeypatch):
             counts = await asyncio.gather(running, overlapping)
         assert counts == [1, 0]
         assert calls == 1
-        assert [entry.kind for entry in await first.transcript(cid)] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        assert [entry.kind for entry in await first.transcript(cid)] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
         await session.close()
 
     asyncio.run(scenario())
@@ -84,8 +84,8 @@ def test_durable_conversation_end_to_end(tmp_path):
 
             transcript = await harness.transcript(cid)
             kinds = [e.kind for e in transcript]
-            assert kinds == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-            answer = transcript[1].model[0]
+            assert kinds == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+            answer = transcript[2].model[0]
             assert answer.content[0].text == "the answer"
 
             # The submission settled against the answer entry.
@@ -98,7 +98,7 @@ def test_durable_conversation_end_to_end(tmp_path):
             reopened = create_session(JsonlStorage(path))
             reopened_harness = Harness(reopened, make_model())
             transcript = await reopened_harness.transcript(cid)
-            assert [e.kind for e in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
+            assert [e.kind for e in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
             executed = await reopened_harness.run_pending_tasks()
             assert executed == 0
             await reopened.close()
@@ -149,8 +149,8 @@ def test_durable_generation_survives_crash_before_stream(tmp_path):
 
             transcript = await harness2.transcript(cid)
             kinds = [e.kind for e in transcript]
-            assert kinds == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-            assert transcript[1].model[0].content[0].text == "recovered answer"
+            assert kinds == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+            assert transcript[2].model[0].content[0].text == "recovered answer"
             await reopened.close()
         finally:
             os.environ.pop("FAUX_SCRIPT", None)
@@ -296,13 +296,43 @@ def test_durable_generation_retries_transient_stream_error(tmp_path):
 
             transcript = await harness.transcript(cid)
             # The failed attempt never becomes a visible entry.
-            assert [e.kind for e in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-            answer = transcript[1].model[0]
+            assert [e.kind for e in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+            answer = transcript[2].model[0]
             assert answer.content[0].text == "recovered answer"
             await session.close()
         finally:
             os.environ.pop("FAUX_SCRIPT", None)
             faux.reset_script_index()
+
+    asyncio.run(scenario())
+
+
+def test_durable_generation_gives_up_after_max_retries(tmp_path, monkeypatch):
+    """The attempt counter survives re-preparing, so retries stay bounded."""
+
+    attempts = {"count": 0}
+
+    async def stream(model, messages, harness, **kwargs):
+        attempts["count"] += 1
+        message = AssistantMessage(content=[TextContent(text="partial")], api="faux", provider="faux",
+                                   model="faux", usage=Usage(), stop_reason="error", timestamp=0)
+        message.error_message = "503 overloaded"
+        return message
+
+    monkeypatch.setattr("pi.durable.harness._stream_once", stream)
+
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
+        harness = Harness(session, make_model(), retry=RetryPolicy(max_retries=1, base_delay_ms=0))
+        cid = await harness.create_conversation()
+        await harness.submit_input(cid, "hello")
+        await harness.run_pending_tasks()
+
+        assert attempts["count"] == 2  # initial attempt plus one retry, then give up
+        transcript = await harness.transcript(cid)
+        assert [e.kind for e in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        assert transcript[-1].model[0].stop_reason == "error"
+        await session.close()
 
     asyncio.run(scenario())
 
@@ -404,7 +434,7 @@ def test_durable_generation_does_not_retry_quota_error(tmp_path):
             await harness.run_pending_tasks()
 
             transcript = await harness.transcript(cid)
-            answer = transcript[1].model[0]
+            answer = transcript[2].model[0]
             assert answer.stop_reason == "error"
             assert answer.error_message == "insufficient_quota"
             await session.close()

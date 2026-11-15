@@ -276,7 +276,7 @@ def record_to_dict(record: Any) -> Dict[str, Any]:
     return out
 
 
-def _context_edit_from_json(data: Dict[str, Any]) -> ContextEdit:
+def context_edit_from_json(data: Dict[str, Any]) -> ContextEdit:
     return ContextEdit(
         target=data["target"],
         action=data["action"],
@@ -337,7 +337,7 @@ def record_from_dict(data: Dict[str, Any]) -> Any:
             model=messages_from_json(model) if model is not None else None,
             data=data.get("data"),
             head=data.get("head"),
-            edits=[_context_edit_from_json(e) for e in (data.get("edits") or [])] or None,
+            edits=[context_edit_from_json(e) for e in (data.get("edits") or [])] or None,
             by_task_id=data.get("by_task_id"),
         )
     if "type" in data and data["type"] in ("input", "write"):

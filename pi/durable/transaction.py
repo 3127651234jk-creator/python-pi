@@ -31,6 +31,7 @@ from .types import (
     TaskDefinition,
     TaskRecord,
     TaskState,
+    context_edit_from_json,
     write_conversation,
     write_document_change,
     write_document_create,
@@ -184,6 +185,12 @@ class Transaction:
         # would be a read-after-write for the common create-then-append pattern.
         eid = await self._host.storage.mint_id()
         head = draft.get("head")
+        # A draft from a JSON client carries edits as plain payloads; normalize
+        # them so the in-memory record matches what a storage reload decodes.
+        edits = draft.get("edits")
+        if edits is not None:
+            edits = [edit if isinstance(edit, ContextEdit) else context_edit_from_json(edit)
+                     for edit in edits]
         entry = EntryRecord(
             id=eid,
             conversation_id=cid,
@@ -191,7 +198,7 @@ class Transaction:
             model=draft.get("model"),
             data=draft.get("data"),
             head=eid if head == "self" else head,
-            edits=draft.get("edits"),
+            edits=edits,
             by_task_id=self._scope.task_id,
         )
         self._writes.append(write_entry(entry))

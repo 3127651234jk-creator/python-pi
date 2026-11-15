@@ -22,6 +22,7 @@ from .entries import COMPACTION_ENTRY, TOOL_RESULT_ENTRY
 from .harness import Harness, TaskRuntime, _stream_once
 from .live import LiveDoc, ensure_tool_slot, finish_slot, tool_slot
 from .output import OutputLimits, Progress, bound_output
+from .prompt import context_edits, entry_messages
 from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, utf8_byte_length
 from .types import TaskDefinition, TaskOutcome, TaskState, define_task
 
@@ -218,12 +219,16 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
 
     async def prepare(task, runtime: TaskRuntime, harness: Harness) -> None:
         entries = await harness.transcript(task.conversation_id)
+        # Derive the model context exactly as generation prepare does: context
+        # edits (omit/replace) decide what an entry contributes, so a stale
+        # baseline a rebaseline suppressed never inflates the token estimate or
+        # reaches the summarizer.
+        edits = context_edits(entries)
         messages: List[Any] = []
         spans = []  # (entry_id, first message index, last message index + 1)
         for entry in entries:
-            raw = entry.model or []
             start = len(messages)
-            for item in raw:
+            for item in entry_messages(entry, edits.get(entry.id)):
                 messages.append(item if not isinstance(item, dict) else message_from_json(item))
             spans.append((entry.id, start, len(messages)))
         total = sum(estimate_tokens(m) for m in messages)
@@ -249,6 +254,8 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
             return
         head_entry = spans[head_index][0]
         cut = spans[head_index][1]
+        # A cut may land on a pi.system entry: the next generation re-baselines
+        # behind the compaction marker and omits it, so it needs no special case.
         if cut <= 0:
             await runtime.commit(lambda tx, current: TaskState(status="terminal",
                 outcome=TaskOutcome(status="completed", result={"compacted": False, "tokens": total})))
@@ -272,9 +279,10 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
 
     async def summarize(task, runtime: TaskRuntime, harness: Harness) -> None:
         entries = await harness.transcript(task.conversation_id)
+        edits = context_edits(entries)
         messages: List[Any] = []
         for entry in entries:
-            for item in (entry.model or []):
+            for item in entry_messages(entry, edits.get(entry.id)):
                 messages.append(item if not isinstance(item, dict) else message_from_json(item))
         cut = task.state.checkpoint["cut"]
         digest = "\n".join(f"{getattr(m, 'role', 'message')}: {ai_to_json(m)}" for m in messages[:cut])

@@ -112,7 +112,12 @@ def normalize_context(context: TranscriptContext) -> Tuple[Optional[SystemMessag
                     prompt_parts.append(text)
             if message.sections:
                 for name, section in message.sections.items():
-                    sections[name] = section
+                    # A None section deletes the key (TS replay semantics), so
+                    # a later pi.system entry can remove an earlier section.
+                    if section is None:
+                        sections.pop(name, None)
+                    else:
+                        sections[name] = section
             for ref in message.tools_removed or []:
                 removed.add(ref.name)
                 tools = [t for t in tools if t.name != ref.name]
@@ -158,7 +163,10 @@ def _replay_system(messages: List[Message]) -> Tuple[List[str], Dict[str, Option
                 prompt_parts.append(text)
         if message.sections:
             for name, section in message.sections.items():
-                sections[name] = section
+                if section is None:
+                    sections.pop(name, None)
+                else:
+                    sections[name] = section
         for ref in message.tools_removed or []:
             removed.add(ref.name)
             tools = [t for t in tools if t.name != ref.name]

@@ -28,12 +28,13 @@ from ..ai.types import AssistantMessage, SystemMessage, Tool, ToolCall, Transcri
 from ..ai.providers import get_default_stream_fn
 from ..ai.utils import normalize_context
 from ..agent.compaction import is_context_overflow
-from .entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
+from .entries import ASSISTANT_ENTRY, USER_ENTRY
 from .errors import StorageRejected, error_message
 from .extensions import AgentDoc, ProviderDoc, Extension, HookApi, Registry, invoke
 from .inbox import InboxDoc, apply_boundary, prepare_boundary, withdraw_queued_inputs
 from .live import LiveDoc, clear_generation, finish_slot, generation_state, tool_slot
 from .output import Progress
+from .prompt import INSTRUCTIONS_KEY, plan_system_entries
 from .session import Session
 from .truncate import utf8_byte_length
 from .types import (
@@ -917,30 +918,39 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
     async def prepare(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
         input_value = task.input
         conversation_id = task.conversation_id
+        attempt = int((task.state.checkpoint or {}).get("attempt") or 1)
         entries = await harness.transcript(conversation_id)
-        llm_messages: List[Any] = []
-        for entry in entries:
-            if entry.kind in (USER_ENTRY.kind, ASSISTANT_ENTRY.kind, SYSTEM_ENTRY.kind, COMPACTION_ENTRY.kind, TOOL_RESULT_ENTRY.kind) and entry.model:
-                llm_messages.extend(entry.model)
-        stored = [ai_to_json(m) for m in llm_messages]
-        await runtime.commit(
-            lambda tx, current: TaskState(
-                status="running", checkpoint={"phase": "stream", "messages": stored, "attempt": 1}
+        # Desired prompt state: extension sections + the instructions pseudo
+        # section, and the declared tools. Planned as positional pi.system
+        # entries so the prompt lives in the transcript (fork/audit visible).
+        agent = await harness.session.snapshot(AgentDoc, conversation_id) or {}
+        section_map: Dict[str, str] = {}
+        for extension in await harness.selected_extensions(conversation_id):
+            for name, render in extension.sections.items():
+                text = await invoke(render, HookApi(runtime), runtime)
+                # None omits the section (TS renderSections); "" still emits nothing.
+                if text is not None:
+                    section_map[name] = str(text)
+        if agent.get("instructions"):
+            section_map[INSTRUCTIONS_KEY] = agent["instructions"]
+        declared = [Tool(name=t.name, description=t.description, parameters=t.parameters,
+                         hosted=getattr(t, "hosted", None))
+                    for t in (await harness.resolved_tools(conversation_id)).values() if t.declared]
+        drafts, messages = plan_system_entries(entries, section_map, declared)
+        stored = [ai_to_json(m) for m in messages]
+
+        async def change(tx, current):
+            for draft in drafts:
+                await tx.append_entry(conversation_id, draft)
+            return TaskState(
+                status="running", checkpoint={"phase": "stream", "messages": stored, "attempt": attempt}
             )
-        )
+
+        await runtime.commit(change)
 
     async def stream(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
         checkpoint = task.state.checkpoint
         messages = [message_from_json(m) for m in (checkpoint.get("messages") or [])]
-        agent = await harness.session.snapshot(AgentDoc, task.conversation_id) or {}
-        sections = []
-        for extension in await harness.selected_extensions(task.conversation_id):
-            for render in extension.sections.values():
-                sections.append(str(await invoke(render, HookApi(runtime), runtime)))
-        if agent.get("instructions"):
-            sections.append(agent["instructions"])
-        if sections:
-            messages.insert(0, SystemMessage(content="\n\n".join(sections), timestamp=0))
         replacement = await harness.run_hooks("before_request", runtime, {"messages": messages})
         if replacement is not None:
             messages = list(replacement["messages"])
@@ -975,8 +985,9 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
             progress.mark()
 
         try:
-            tools = list((await harness.resolved_tools(conversation_id)).values())
-            response = await _call_stream_once(harness.model, messages, harness, on_partial, tools)
+            # Tool declarations ride in the pi.system entries' tools_added and
+            # are folded into the leading system message by normalize_context.
+            response = await _call_stream_once(harness.model, messages, harness, on_partial)
             await harness.run_hooks("after_response", runtime, response)
         finally:
             # No stale partial lands after the outcome: wait for the in-flight
@@ -1024,13 +1035,14 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
 
     async def retry(task: TaskRecord, runtime: TaskRuntime, harness: "Harness") -> None:
         await runtime.sleep(int(task.state.checkpoint["until"]))
+        # Re-prepare, like TS: sections and the tool loadout are rendered for the
+        # retried request, and a changed prompt becomes a new pi.system entry.
         await runtime.commit(
             lambda tx, current: TaskState(
                 status="running",
                 checkpoint={
-                    "phase": "stream",
+                    "phase": "prepare",
                     "attempt": int(current.state.checkpoint["attempt"]) + 1,
-                    "messages": current.state.checkpoint.get("messages") or [],
                 },
             )
         )
@@ -1158,7 +1170,8 @@ async def _stream_once(model: Model, messages: List[Any], harness: "Harness",
                        tools: Optional[List[Any]] = None
                        ) -> AssistantMessage:
     if tools is not None:
-        declarations = [Tool(name=tool.name, description=tool.description, parameters=tool.parameters)
+        declarations = [Tool(name=tool.name, description=tool.description, parameters=tool.parameters,
+                             hosted=getattr(tool, "hosted", None))
                         for tool in tools if tool.declared]
         messages = [SystemMessage(content="", timestamp=0, tools_added=declarations), *messages]
     system, rest = normalize_context(TranscriptContext(messages=messages))

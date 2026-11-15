@@ -20,7 +20,7 @@ from pi.ai.types import (
     TextDeltaEvent,
     Usage,
 )
-from pi.durable.entries import ASSISTANT_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
+from pi.durable.entries import ASSISTANT_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
 from pi.durable.errors import StorageRejected
 from pi.durable.harness import Harness
 from pi.durable.session import create_session
@@ -83,8 +83,8 @@ def test_p08_generation_partial_is_visible_then_replaced_by_the_answer(tmp_path,
         await running
 
         transcript = await harness.transcript(cid)
-        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-        assert transcript[1].model[0].content[0].text == "Hello world"
+        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        assert transcript[2].model[0].content[0].text == "Hello world"
         assert "generation" not in await harness.live(cid)
         await session.close()
 
@@ -181,13 +181,13 @@ def test_p09_disk_reopen_restores_only_committed_partial_and_completes_once(tmp_
         live = await harness2.live(cid)
         assert "committed-partial" in json.dumps(live, ensure_ascii=False)
         assert "uncommitted-tail" not in json.dumps(live, ensure_ascii=False)
-        assert [entry.kind for entry in await harness2.transcript(cid)] == [USER_ENTRY.kind]
+        assert [entry.kind for entry in await harness2.transcript(cid)] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind]
 
         install_stream(monkeypatch, chunk_stream(["final answer"], delay=0))
         await harness2.run_pending_tasks()
         transcript = await harness2.transcript(cid)
-        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-        assert transcript[1].model[0].content[0].text == "final answer"
+        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        assert transcript[2].model[0].content[0].text == "final answer"
         assert "generation" not in await harness2.live(cid)
         assert await harness2.run_pending_tasks() == 0
         await reopened.close()
@@ -216,13 +216,13 @@ def test_p09_abort_after_reopen_converts_the_partial_once(tmp_path, monkeypatch)
         await harness2.abort_task(task_id)
         await harness2.run_pending_tasks()
         transcript = await harness2.transcript(cid)
-        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-        assert transcript[1].model[0].content[0].text == "committed-partial"
-        assert transcript[1].model[0].stop_reason == "aborted"
-        assert transcript[1].data.get("partial") is True
+        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        assert transcript[2].model[0].content[0].text == "committed-partial"
+        assert transcript[2].model[0].stop_reason == "aborted"
+        assert transcript[2].data.get("partial") is True
         assert "generation" not in await harness2.live(cid)
         assert await harness2.run_pending_tasks() == 0
-        assert len(await harness2.transcript(cid)) == 2
+        assert len(await harness2.transcript(cid)) == 3
         await reopened.close()
 
     asyncio.run(scenario())
@@ -253,8 +253,8 @@ def test_p10_concurrent_conversations_keep_separate_live_state(tmp_path, monkeyp
         await running
         for cid in (first, second):
             transcript = await harness.transcript(cid)
-            assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-            assert transcript[1].model[0].content[0].text == "abcd"
+            assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+            assert transcript[2].model[0].content[0].text == "abcd"
             assert "generation" not in await harness.live(cid)
         await session.close()
 
@@ -291,8 +291,8 @@ def test_p10_retry_discards_the_failed_partial(tmp_path, monkeypatch):
         await harness.run_pending_tasks()
         assert attempts["count"] == 2
         transcript = await harness.transcript(cid)
-        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, ASSISTANT_ENTRY.kind]
-        assert transcript[1].model[0].content[0].text == "partial-2"
+        assert [entry.kind for entry in transcript] == [USER_ENTRY.kind, SYSTEM_ENTRY.kind, ASSISTANT_ENTRY.kind]
+        assert transcript[2].model[0].content[0].text == "partial-2"
         assert "generation" not in await harness.live(cid)
         await session.close()
 

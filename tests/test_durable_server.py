@@ -79,11 +79,12 @@ def test_session_lifecycle_and_generation(tmp_path):
             assert client.attachment["sessionId"] == session_id
 
             await client.request(client.attachment, controller("prompt", {"text": "hello"}), timeout=20)
-            entries = await wait_for_transcript(client, 2)
+            entries = await wait_for_transcript(client, 3)
             assert entries[0]["kind"] == "pi.user"
             assert entries[0]["messages"][0]["content"] == "hello"
-            assert entries[1]["kind"] == "pi.assistant"
-            assert entries[1]["messages"][0]["content"][0]["text"] == "worker answer"
+            assert entries[1]["kind"] == "pi.system"
+            assert entries[2]["kind"] == "pi.assistant"
+            assert entries[2]["messages"][0]["content"][0]["text"] == "worker answer"
 
             # The tasks member reports the generation task; its terminal outcome is durable.
             tasks = await client.request(client.attachment, controller("tasks"), timeout=10)
@@ -133,7 +134,7 @@ def test_worker_exit_monitoring_and_recovery(tmp_path):
             await client.connect_tcp(*address[:2])
             session_id = await _create_and_attach(server.server_id, client, str(tmp_path))
             await client.request(client.attachment, controller("prompt", {"text": "hello"}), timeout=20)
-            await wait_for_transcript(client, 2)
+            await wait_for_transcript(client, 3)
 
             # Killing the worker is the failure signal: attachments are released.
             handle = manager.workers[session_id]
@@ -146,8 +147,8 @@ def test_worker_exit_monitoring_and_recovery(tmp_path):
             await client.request({"serverId": server.server_id},
                                  management("attach", {"sessionId": session_id}), timeout=20)
             entries = await client.request(client.attachment, controller("transcript"), timeout=10)
-            assert [entry["kind"] for entry in entries["entries"]] == ["pi.user", "pi.assistant"]
-            assert entries["entries"][1]["messages"][0]["content"][0]["text"] == "persisted answer"
+            assert [entry["kind"] for entry in entries["entries"]] == ["pi.user", "pi.system", "pi.assistant"]
+            assert entries["entries"][2]["messages"][0]["content"][0]["text"] == "persisted answer"
         finally:
             os.environ.pop("FAUX_SCRIPT", None)
             await client.close()

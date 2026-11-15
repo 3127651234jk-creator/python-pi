@@ -38,7 +38,9 @@ def test_queued_input_survives_reopen_and_drains(tmp_path, monkeypatch):
         await harness.run_pending_tasks()
         assert (await harness.submission(queued)).status == "done"
         assert (await harness.inbox(cid))["items"] == []
-        assert len(await harness.transcript(cid)) == 4
+        # Turn 1: user, pi.system baseline, assistant. Turn 2 plans no diff,
+        # so only user + assistant are appended.
+        assert len(await harness.transcript(cid)) == 5
         await session.close()
     asyncio.run(scenario())
 
