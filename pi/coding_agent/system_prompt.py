@@ -134,30 +134,31 @@ def build_system_prompt(options: SystemPromptOptions) -> str:
     if options.context_files is None:
         options.context_files = load_context_files(options.cwd)
 
+    sections: List[str] = []
+
     if options.custom_prompt:
-        preamble = options.custom_prompt
+        # A custom system prompt replaces the default preamble, tool list, rules
+        # and documentation sections (the TS buildSystemPromptSections behavior).
+        sections.append(options.custom_prompt)
     else:
-        preamble = (
+        sections.append(
             "You are an expert coding assistant operating inside pi, a coding agent harness. "
             "You help users by reading files, executing commands, editing code, and writing new files."
         )
+        declared = declared_tool_names(options)
+        visible_tools = [name for name in declared if name in options.tool_snippets]
+        tools_text = "\n".join(f"- {name}: {options.tool_snippets[name]}" for name in visible_tools) or "(none)"
+        sections.append(
+            f"<tools>\n{tools_text}\n\n"
+            "In addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>"
+        )
+        sections.append(f"<rules>\n{build_rules(options)}\n</rules>")
 
-    sections: List[str] = [preamble]
-
-    declared = declared_tool_names(options)
-    visible_tools = [name for name in declared if name in options.tool_snippets]
-    tools_text = "\n".join(f"- {name}: {options.tool_snippets[name]}" for name in visible_tools) or "(none)"
-    sections.append(
-        f"<tools>\n{tools_text}\n\n"
-        "In addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>"
-    )
-    sections.append(f"<rules>\n{build_rules(options)}\n</rules>")
-
-    include_docs = options.include_pi_documentation
-    if include_docs is None:
-        include_docs = documentation_available()
-    if include_docs:
-        sections.append(f"<docs>\n{build_documentation_section()}\n</docs>")
+        include_docs = options.include_pi_documentation
+        if include_docs is None:
+            include_docs = documentation_available()
+        if include_docs:
+            sections.append(f"<docs>\n{build_documentation_section()}\n</docs>")
 
     if options.append_system_prompt:
         sections.append(f"<addendum>\n{options.append_system_prompt}\n</addendum>")

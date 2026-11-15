@@ -46,6 +46,9 @@ PROMPT_SNIPPETS = {
     "powershell": POWERSHELL_PROMPT_SNIPPET,
 }
 
+# The tools create_default_tools() builds; --no-builtin-tools excludes exactly these.
+BUILTIN_TOOL_NAMES = tuple(PROMPT_SNIPPETS)
+
 PROMPT_GUIDELINES = {
     "read": list(READ_PROMPT_GUIDELINES),
     "edit": list(EDIT_PROMPT_GUIDELINES),

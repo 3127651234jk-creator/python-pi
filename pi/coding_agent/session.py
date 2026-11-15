@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
-import html
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, List, Optional
@@ -107,6 +107,10 @@ class SessionEntry:
     timestamp: str = ""  # UTC ISO timestamp (TS session files always carry one)
 
 
+# Session IDs the CLI accepts for --session-id / --fork; same shape as TS assertValidSessionId.
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
 class SessionManager:
     """Append transcript messages to a JSONL session file."""
 
@@ -120,15 +124,23 @@ class SessionManager:
         self._incomplete_tail_offset: Optional[int] = None
         os.makedirs(self.session_dir, exist_ok=True)
 
-    def start_new(self) -> str:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        candidate = os.path.join(self.session_dir, f"{stamp}-{os.getpid()}")
-        suffix = 0
-        while True:
-            path = f"{candidate}{f'-{suffix}' if suffix else ''}.jsonl"
-            if not os.path.exists(path):
-                break
-            suffix += 1
+    def start_new(self, session_id: Optional[str] = None) -> str:
+        if session_id is not None:
+            if not SESSION_ID_PATTERN.fullmatch(session_id):
+                raise ValueError("Session ID must start and end with a letter or digit and may "
+                                 "contain letters, digits, dots, dashes and underscores")
+            path = os.path.join(self.session_dir, f"{session_id}.jsonl")
+            if os.path.exists(path):
+                raise ValueError(f"Session ID is already in use: {session_id}")
+        else:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            candidate = os.path.join(self.session_dir, f"{stamp}-{os.getpid()}")
+            suffix = 0
+            while True:
+                path = f"{candidate}{f'-{suffix}' if suffix else ''}.jsonl"
+                if not os.path.exists(path):
+                    break
+                suffix += 1
         # Touch the file so session pickers can find it before the first append.
         with open(path, "a", encoding="utf-8"):
             pass
@@ -333,6 +345,22 @@ class SessionManager:
             raise ValueError("Session ID is unknown or ambiguous")
         return self.load(matches[0]["path"])
 
+    def _write_session_entry(self, entry: SessionEntry) -> None:
+        """Append one entry record, preserving its id and parent link."""
+        if entry.message is not None and entry.custom is not None:
+            self._write({"type": "custom_message", "id": entry.id, "parent_id": entry.parent_id,
+                         "timestamp": entry.timestamp, "customType": entry.custom["kind"],
+                         "display": entry.custom["data"].get("display", True),
+                         "details": entry.custom["data"].get("details"),
+                         "message": _to_dict(entry.message)})
+        elif entry.message is not None:
+            self._write({"type": "message", "id": entry.id, "parent_id": entry.parent_id,
+                         "timestamp": entry.timestamp, "message": _to_dict(entry.message)})
+        else:
+            self._write({"type": "custom", "id": entry.id, "parent_id": entry.parent_id,
+                         "timestamp": entry.timestamp, "customType": (entry.custom or {}).get("kind", ""),
+                         "data": (entry.custom or {}).get("data", {})})
+
     def fork(self, entry_id: Optional[str] = None) -> List[Message]:
         if entry_id:
             matches = [entry.id for entry in self.entries if entry.id.startswith(entry_id)]
@@ -347,17 +375,35 @@ class SessionManager:
             if entry.message is not None and entry.custom is not None:
                 copied = SessionEntry(uuid.uuid4().hex, self.leaf_id, entry.message, entry.custom,
                                       timestamp=entry.timestamp)
-                self._write({"type": "custom_message", "id": copied.id, "parent_id": copied.parent_id,
-                             "timestamp": copied.timestamp, "customType": copied.custom["kind"],
-                             "display": copied.custom["data"].get("display", True),
-                             "details": copied.custom["data"].get("details"),
-                             "message": _to_dict(copied.message)})
+                self._write_session_entry(copied)
                 self.entries.append(copied)
                 self.leaf_id = copied.id
             elif entry.message is not None:
                 self.append(entry.message)
             elif entry.custom is not None:
                 self.append_custom(entry.custom["kind"], entry.custom["data"])
+        return self.messages()
+
+    def fork_from(self, source_path: str, session_id: Optional[str] = None) -> List[Message]:
+        """Copy another session file into a new session in this directory.
+
+        All entries are copied with their ids and tree links preserved (the TS
+        ``SessionManager.forkFrom`` semantics); the source file is not touched.
+        """
+        reader = SessionManager(self.session_dir, self.cwd)
+        reader.load(source_path)
+        if not reader.entries:
+            raise ValueError(f"Cannot fork: source session file is empty or invalid: {source_path}")
+        self.start_new(session_id)
+        if reader.name:
+            self._write({"type": "name", "name": reader.name})
+            self.name = reader.name
+        for entry in reader.entries:
+            self._write_session_entry(entry)
+            self.entries.append(entry)
+        self.leaf_id = reader.leaf_id
+        if reader.leaf_id is not None:
+            self._write({"type": "leaf", "id": reader.leaf_id})
         return self.messages()
 
     def branch_jsonl(self) -> str:
@@ -378,21 +424,25 @@ class SessionManager:
                                 "message": _to_dict(entry.message)})
         return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
 
+    def _export_content(self, path: str) -> str:
+        """Render the active branch for the given export extension."""
+        extension = os.path.splitext(path)[1].lower()
+        if extension not in (".jsonl", ".html", ".md"):
+            raise ValueError("Export extension must be .jsonl, .html or .md")
+        if extension == ".jsonl":
+            return self.branch_jsonl()
+        branch = self.get_branch()
+        if extension == ".md":
+            return "\n\n".join(f"## {e.message.role}\n\n{get_message_text(e.message.content)}"
+                               for e in branch if e.message is not None)
+        from .export_html import generate_session_html
+        return generate_session_html(self)
+
     def export(self, path: str) -> str:
         path = os.path.abspath(path)
         if self.session_file and os.path.normcase(path) == os.path.normcase(os.path.abspath(self.session_file)):
             raise ValueError("Cannot export over the active session")
-        extension = os.path.splitext(path)[1].lower()
-        if extension not in (".jsonl", ".html", ".md"):
-            raise ValueError("Export extension must be .jsonl, .html or .md")
-        branch = self.get_branch()
-        if extension == ".jsonl":
-            content = self.branch_jsonl()
-        else:
-            text = "\n\n".join(f"## {e.message.role}\n\n{get_message_text(e.message.content)}"
-                               for e in branch if e.message is not None)
-            content = ("<!doctype html><meta charset='utf-8'><title>Pi session</title><pre>"
-                       + html.escape(text) + "</pre>") if extension == ".html" else text
+        content = self._export_content(path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "x", encoding="utf-8") as handle:
             handle.write(content)
@@ -504,6 +554,35 @@ class SessionManager:
         if not candidates:
             return None
         return max(candidates, key=os.path.getmtime)
+
+
+def export_session_file(input_path: str, output_path: Optional[str] = None) -> str:
+    """Export a session file without a running agent (the CLI ``--export`` path).
+
+    ``output_path`` defaults to the input path with a ``.html`` suffix. A
+    ``.jsonl`` output is written in the TypeScript pi session format; ``.html``
+    uses the single-file HTML template and ``.md`` renders branch messages.
+    """
+    input_path = os.path.abspath(input_path)
+    if not os.path.isfile(input_path):
+        raise OSError(f"File not found: {input_path}")
+    if output_path is None:
+        # The TS CLI default: pi-session-<name>.html in the working directory.
+        stem = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(os.getcwd(), f"pi-session-{stem}.html")
+    output_path = os.path.abspath(output_path)
+    if os.path.normcase(output_path) == os.path.normcase(input_path):
+        raise ValueError("Cannot export over the source session")
+    reader = SessionManager(os.path.dirname(input_path), os.getcwd())
+    if not reader.load(input_path) and not reader.entries:
+        raise ValueError(f"Cannot export: source session file is empty or invalid: {input_path}")
+    if os.path.splitext(output_path)[1].lower() == ".jsonl":
+        return reader.export_ts(output_path)
+    content = reader._export_content(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "x", encoding="utf-8") as handle:
+        handle.write(content)
+    return output_path
 
 
 def _now_ms() -> int:

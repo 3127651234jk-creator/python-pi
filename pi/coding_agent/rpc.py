@@ -347,7 +347,8 @@ class RpcServer:
         elif kind == "cycle_model":
             registry = self._require_registry()
             self._require_idle()
-            models = list(registry.models.values())
+            # --models limits the cycle; a current model outside the scope starts at 0.
+            models = registry.scoped_models()
             if not models:
                 response["data"] = None
             else:
@@ -356,7 +357,8 @@ class RpcServer:
                               if (model.provider, model.id) == current), -1)
                 self.agent.model = models[(index + 1) % len(models)]
                 response["data"] = {"model": model_to_ts(self.agent.model),
-                                    "thinkingLevel": self.agent.thinking_level, "isScoped": False}
+                                    "thinkingLevel": self.agent.thinking_level,
+                                    "isScoped": bool(registry.model_scope)}
         elif kind == "compact":
             self._require_registry()
             if self.busy():

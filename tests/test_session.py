@@ -131,7 +131,8 @@ def test_fork_export_and_session_switch(tmp_path):
     reader = SessionManager(str(tmp_path / "sessions"))
     assert len(reader.load(exported)) == 2
     manager.export(str(tmp_path / "export.html"))
-    assert "<script>" not in (tmp_path / "export.html").read_text(encoding="utf-8")
+    # The single-file template embeds scripts, but user content must not appear raw.
+    assert "<script>alert(1)</script>" not in (tmp_path / "export.html").read_text(encoding="utf-8")
     with pytest.raises(FileExistsError):
         manager.export(str(tmp_path / "export.html"))
     with pytest.raises(ValueError):

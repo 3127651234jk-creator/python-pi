@@ -121,18 +121,38 @@ def _theme_styles(theme: dict) -> dict:
     return {**DIALOG_STYLES, **theme}
 
 
-def load_themes(agent_dir) -> dict:
-    """Built-in themes plus user themes from <agent_dir>/themes/*.json."""
+def _load_theme_file(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not (isinstance(data, dict) and data and all(isinstance(k, str) and isinstance(v, str) for k, v in data.items())):
+        raise ValueError(f"Theme file must be a JSON object of style strings: {path}")
+    return data
+
+
+def load_themes(agent_dir, extra_paths=None, no_themes: bool = False) -> dict:
+    """Built-in themes plus user themes from <agent_dir>/themes/*.json.
+
+    ``extra_paths`` are CLI ``--theme`` files or directories of theme JSON
+    files; ``no_themes`` skips the user themes directory (built-ins remain).
+    """
     themes = dict(THEMES)
-    themes_dir = Path(agent_dir) / "themes"
-    if themes_dir.is_dir():
-        for path in sorted(themes_dir.glob("*.json")):
+    if not no_themes:
+        themes_dir = Path(agent_dir) / "themes"
+        if themes_dir.is_dir():
+            for path in sorted(themes_dir.glob("*.json")):
+                try:
+                    themes[path.stem] = _load_theme_file(path)
+                except (OSError, ValueError):
+                    continue
+    for raw in extra_paths or []:
+        path = Path(raw).expanduser()
+        candidates = sorted(path.glob("*.json")) if path.is_dir() else [path]
+        if not path.exists():
+            raise ValueError(f"Theme path does not exist: {path}")
+        for candidate in candidates:
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if isinstance(data, dict) and data and all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
-                themes[path.stem] = data
+                themes[candidate.stem] = _load_theme_file(candidate)
+            except (OSError, ValueError) as exc:
+                raise ValueError(str(exc)) from exc
     return themes
 
 

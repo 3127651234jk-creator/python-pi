@@ -321,7 +321,8 @@ class ExtensionAPI:
 
 class ExtensionManager:
     def __init__(self, config: Configuration, agent: Agent, session: Optional[SessionManager] = None,
-                 registry=None, mcp=None, flag_values: Optional[dict] = None) -> None:
+                 registry=None, mcp=None, flag_values: Optional[dict] = None,
+                 extra_paths: Optional[List[Path]] = None, no_discovery: bool = False) -> None:
         self.config, self.agent = config, agent
         self.context = ExtensionContext(agent, config.cwd, session)
         self.context.config = config
@@ -331,6 +332,10 @@ class ExtensionManager:
         self.context.sync_providers = self.sync_providers
         self.context.sync_virtual_models = self.sync_virtual_models
         self.context.mcp_servers_changed = self.mcp_servers_changed
+        # ``--extension`` paths: loaded even under ``no_discovery`` (--no-extensions),
+        # which skips settings-configured paths, default directories and packages.
+        self.extra_paths = [Path(path) for path in (extra_paths or [])]
+        self.no_discovery = no_discovery
         self.flag_values = dict(flag_values or {})
         self.extensions = []
         self.commands = {}
@@ -434,37 +439,47 @@ class ExtensionManager:
 
     def paths(self):
         paths = []
-        bases = (self.config.cwd / ".pi", self.config.agent_dir) if self.config.project_trusted \
-            else (self.config.agent_dir,)
-        for base in bases:
-            for raw in read_json(base / "settings.json").get("extensions", []):
-                path = Path(raw).expanduser()
-                paths.append(path if path.is_absolute() else base / path)
-        if self.config.settings.get("include_default_extensions", True):
-            default_bases = [self.config.agent_dir / "extensions"]
-            if self.config.project_trusted:
-                default_bases.insert(0, self.config.cwd / ".pi/extensions")
-            for base in default_bases:
-                if base.is_dir():
-                    paths.extend(sorted(base.iterdir()))
-            # Package placement adds a namespace directory. Use its recorded
-            # manifest paths rather than recursively loading helper modules.
-            for package in read_json(self.config.agent_dir / "packages.json").values():
-                for raw in package.get("files", {}).get("extensions", []):
-                    installed = Path(raw)
-                    paths.append(installed)
-                    if installed.is_dir() and not any((installed / name).is_file() for name in
-                            ("__init__.py", "index.ts", "index.mts", "index.js", "index.mjs")):
-                        paths.extend(sorted(installed.iterdir()))
+        if not self.no_discovery:
+            bases = (self.config.cwd / ".pi", self.config.agent_dir) if self.config.project_trusted \
+                else (self.config.agent_dir,)
+            for base in bases:
+                for raw in read_json(base / "settings.json").get("extensions", []):
+                    path = Path(raw).expanduser()
+                    paths.append(path if path.is_absolute() else base / path)
+            if self.config.settings.get("include_default_extensions", True):
+                default_bases = [self.config.agent_dir / "extensions"]
+                if self.config.project_trusted:
+                    default_bases.insert(0, self.config.cwd / ".pi/extensions")
+                for base in default_bases:
+                    if base.is_dir():
+                        paths.extend(sorted(base.iterdir()))
+                # Package placement adds a namespace directory. Use its recorded
+                # manifest paths rather than recursively loading helper modules.
+                for package in read_json(self.config.agent_dir / "packages.json").values():
+                    for raw in package.get("files", {}).get("extensions", []):
+                        installed = Path(raw)
+                        paths.append(installed)
+                        if installed.is_dir() and not any((installed / name).is_file() for name in
+                                ("__init__.py", "index.ts", "index.mts", "index.js", "index.mjs")):
+                            paths.extend(sorted(installed.iterdir()))
+        paths.extend(self.extra_paths)
+        explicit = {Path(path) for path in self.extra_paths}
         result = []
-        for path in paths:
+        for raw in paths:
+            path = Path(raw)
+            if not path.exists():
+                # An explicitly requested --extension path must resolve or load.
+                if path in explicit:
+                    raise ValueError(f"Extension path does not exist: {path}")
+                continue
             if path.is_dir():
                 path = next((path / name for name in
                              ("__init__.py", "index.ts", "index.mts", "index.js", "index.mjs")
                              if (path / name).is_file()), path)
-            if path.suffix in (".py", ".ts", ".mts", ".js", ".mjs") and path.exists() \
-                    and path.resolve() not in result:
+            if path.suffix in (".py", ".ts", ".mts", ".js", ".mjs") and path.resolve() not in result:
                 result.append(path.resolve())
+            elif path in explicit:
+                raise ValueError(f"Extension path is not a supported extension module: {path}")
         return result
 
     async def emit(self, name, event, strict=False):

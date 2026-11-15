@@ -35,7 +35,22 @@ class ModelRegistry:
         self.auth = AuthStore(config.agent_dir / "auth.json")
         self.extension_providers: Dict[str, dict] = {}
         self.virtual_models: Dict[tuple, dict] = {}
+        # --models patterns ("provider/id" with * wildcards); None cycles everything.
+        self.model_scope: Optional[list] = None
         self.reload()
+
+    def scoped_model_items(self) -> list:
+        """(identifier, model) pairs the run's --models scope limits cycling to."""
+        if not self.model_scope:
+            return list(self.models.items())
+        compiled = [re.compile("^" + ".*".join(re.escape(part) for part in pattern.split("*")) + "$")
+                    for pattern in self.model_scope]
+        return [(identifier, model) for identifier, model in self.models.items()
+                if any(expression.match(identifier) or expression.match(model.id) for expression in compiled)]
+
+    def scoped_models(self) -> list:
+        """Models the run's --models scope limits cycling to (all when unset)."""
+        return [model for _, model in self.scoped_model_items()]
 
     def register_extension_providers(self, providers: Dict[str, dict]) -> None:
         """Merge extension-registered providers below user models.json settings."""

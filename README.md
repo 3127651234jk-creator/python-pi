@@ -111,9 +111,11 @@ python -m pi --provider openai --tui fullscreen
 python -m pi --provider anthropic "解释 pyproject.toml"
 ```
 
-常用参数：`--provider <id>`、`--model <id>`、`--base-url`、`--api-key`、`--thinking off|minimal|low|medium|high|xhigh|max`、`-c` 继续上次会话、`--no-session` 不落盘、`--sync-models` 同步在线模型目录。
+常用参数：`--provider <id>`、`--model <id>`、`--base-url`、`--api-key`、`--thinking off|minimal|low|medium|high|xhigh|max`、`-c` 继续上次会话、`-r`/`--resume` 从会话列表中选择恢复、`--session <路径或ID>`、`--session-id <id>` 继续指定 id 的会话（不存在则以该 id 新建）、`--fork <路径或ID>` 将既有会话复制为本目录新会话（可配 `--session-id` 指定新 id）、`--no-session` 不落盘、`--name <名称>`、`--session-dir <目录>`、`--sync-models` 同步在线模型目录、`--models <模式列表>` 限定模型轮换范围（逗号分隔的 `provider/模型` 模式，支持 `*`）、`-p`/`--print` 单次执行（无 prompt 时读 stdin）、`--export <会话文件> [输出路径]` 导出会话（默认 HTML，`.jsonl` 为 TS 格式，`.md` 为 Markdown）并退出、`--system-prompt <文本或文件>` 替换默认系统提示词、`--append-system-prompt <文本或文件>` 追加系统提示词（可重复）、`--no-context-files` 不加载 AGENTS.md/CLAUDE.md/CONTEXT.md、`--verbose` 打印启动耗时分组、`--offline` 离线运行（跳过在线目录刷新）、`--version`、`-v`。
 
-工具选择参数：`--tools <列表>`（逗号分隔的允许名单，支持 `*` 通配，如 `--tools read,codemode,'mcp__radius__*'`；名单不含 `mcp__` 开头的条目时保留 MCP 工具但只供 codemode 调用、不声明给模型，点名 `mcp__` 条目时匹配的 MCP 工具正常声明）、`--exclude-tools <列表>`（排除名单，含 MCP 工具，同样支持 `*`）、`--no-tools` 移除全部工具（含 MCP）、`--no-mcp` 单次运行禁用内置 MCP 支持（不连接服务器、无 MCP 工具）。
+资源加载参数：`-e`/`--extension <路径>` 加载扩展（可重复）、`--no-extensions` 跳过发现的扩展（显式 `-e` 仍加载）、`--skill <路径>`（可重复）、`--no-skills`、`--prompt-template <路径>`（可重复）、`--no-prompt-templates`、`--theme <路径>` 加载主题文件（可重复）、`--use-theme <名称>` 本次运行使用指定主题、`--no-themes` 跳过用户主题目录。
+
+工具选择参数：`--tools <列表>`（逗号分隔的允许名单，支持 `*` 通配，如 `--tools read,codemode,'mcp__radius__*'`；名单不含 `mcp__` 开头的条目时保留 MCP 工具但只供 codemode 调用、不声明给模型，点名 `mcp__` 条目时匹配的 MCP 工具正常声明）、`--exclude-tools <列表>`（排除名单，含 MCP 工具，同样支持 `*`）、`--no-builtin-tools` 只移除内建工具（read、bash、edit、write、grep、find、ls、powershell），扩展与 MCP 工具保留、`--no-tools` 移除全部工具（含 MCP）、`--no-mcp` 单次运行禁用内置 MCP 支持（不连接服务器、无 MCP 工具）。
 
 CLI 还内置 `openai`、`anthropic`、`openrouter`、`google`、`openai-responses`、`google-vertex`、`azure-openai`、`azure-openai-responses`、`amazon-bedrock`、`openai-codex`、`github-copilot`、`kimi-coding`、`xai`、`radius`、`faux`，并可从 `models.json` 注册其他兼容 provider。
 
@@ -299,11 +301,11 @@ RPC/JSON 模式没有交互宿主，`ui.custom` 立即返回 `undefined`（与 T
 {"id":"3","type":"abort"}
 ```
 
-响应格式为 `{"type":"response","id":"1","command":"get_state","success":true,"data":{...}}`。失败时 `success=false` 并携带 `error`；非法 JSON 返回 `command=parse`，服务继续处理下一行。`prompt` 响应只表示接受请求，完成要等待 `agent_settled`。运行中可读取状态、发送 `steer` / `follow_up` 或 `abort`；第二个普通 prompt 会被拒绝。关闭 stdin 请求退出，服务中止活动运行并清理 MCP 连接。
+响应格式为 `{"type":"response","id":"1","command":"get_state","success":true,"data":{...}}`。失败时 `success=false` 并携带 `error`；非法 JSON 返回 `command=parse`，服务继续处理下一行。`prompt` 响应只表示接受请求，完成要等待 `agent_settled`。Agent 空闲时 `prompt` 立即执行；运行中的 `prompt` 需带 `streamingBehavior`（`steer` 或 `followUp`）入队，`steer` / `follow_up` 直接入队，`abort` 中止当前运行，`clear_queue` 清空并返回被清空的队列。关闭 stdin 请求退出，服务中止活动运行并清理 MCP 连接。
 
-当前支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_state`、`get_messages`、`get_tools`、`get_available_models`、`set_model`、`set_thinking_level`、`new_session`、`switch_session`、`fork`、`clone`、`get_tree`、`get_entries`、`set_session_name`、`export`、`sync_models`、`reload_extensions`。会话命令要求启用持久化；修改模型、会话和 `sync_models` 要求 Agent 空闲。参数分别使用 `message`、`model`/`provider`、`level`、`path`、`entry_id` 或 `name`。`export` 根据路径扩展名导出 JSONL、HTML 或 Markdown。
+当前支持的命令：输入 `prompt`、`steer`、`follow_up`、`abort`、`clear_queue`、`set_steering_mode`、`set_follow_up_mode`；状态与统计 `get_state`、`get_session_stats`、`get_usage`、`get_last_assistant_text`、`get_available_thinking_levels`、`get_messages`、`get_tools`、`get_commands`；模型 `get_available_models`、`set_model`、`cycle_model`、`set_thinking_level`、`cycle_thinking_level`；压缩 `compact`、`set_auto_compaction`；会话 `new_session`、`switch_session`、`fork`、`clone`、`set_session_name`、`export_html`、`get_fork_messages`、`get_entries`、`get_tree`；Python 专属 `sync_models`、`reload_extensions`。`set_auto_retry`、`abort_retry`、`bash`、`abort_bash` 明确不支持。会话命令要求启用持久化；修改模型、会话和 `sync_models` 要求 Agent 空闲。`export_html` 按 `outputPath` 写出单文件 HTML（缺省为会话同名 `.html`）。
 
-事件和消息字段采用 Python 的 snake_case，例如 `assistant_message_event`、`tool_call_id`。这是 Python 版协议的核心子集，不保证与 TS 全部命令及 camelCase 字段兼容，也不提供网络监听服务或扩展 UI 协议。
+事件和消息字段采用 TS 的 camelCase 形状（与 `packages/coding-agent/src/modes/rpc` 一致，例如 `assistantMessageEvent`、`toolCallId`），由 `pi/coding_agent/rpc_wire.py` 统一转换；扩展 UI 请求（`extension_ui_request`/`extension_ui_response`）也已接入。Python 版未实现网络监听服务。
 
 异步客户端封装：
 
@@ -581,11 +583,11 @@ provider 还可设置 `api_key`、`api_key_env`、`headers`。`api_key` 和 head
 
 `/settings` 保存用户默认值，下次启动生效；`/reload` 可立即应用 thinking 和压缩配置。项目同名设置仍优先。模型目录的构成与在线同步见上文「模型目录同步」。
 
-会话文件写在 `./.pi/sessions/*.jsonl`。启动时可指定 `--session <路径或ID>`、`--session-dir <目录>`、`--name <名称>`；`-c` 恢复最近会话。
+会话文件写在 `./.pi/sessions/*.jsonl`。启动时可指定 `--session <路径或ID>`、`--session-dir <目录>`、`--name <名称>`；`-c` 恢复最近会话；`-r`/`--resume` 在交互终端列出会话供选择；`--session-id <id>` 继续指定 id 的会话（不存在则打印 warning 并以该 id 新建，id 只能使用字母、数字、点、连字符和下划线）；`--fork <路径或ID>` 把既有会话（含 TS pi v3 格式）完整复制为本目录新会话，可配 `--session-id` 指定新 id。
 
 新记录通过 `id`、`parent_id` 连接成树，另以追加记录保存活动节点和名称。切换分支不会删除原分支，重启后保留最后选择的节点；只有活动分支会送入模型。节点 ID 支持唯一前缀。为避免不完整的工具协议，不能切换或复制到尚缺工具结果的节点。
 
-`/fork` 不带 ID 时复制当前分支；指定 ID 时复制至该消息之后，可在新会话中继续提问。当前为命令行文本操作，不含 TS 版的交互选择器、回填编辑器或离开分支时的自动摘要。JSONL 为 Python 自有格式，可重新加载，不支持读取 TS 会话文件；`/export-ts <path.jsonl>` 可将活动分支导出为 TS pi 会话格式。HTML 为转义后的静态文本。导出不会覆盖已有文件。
+`/fork` 不带 ID 时复制当前分支；指定 ID 时复制至该消息之后，可在新会话中继续提问。当前为命令行文本操作，不含 TS 版的回填编辑器或离开分支时的自动摘要。JSONL 为 Python 自有格式，可重新加载，也能读取 TS pi v3 会话文件（`load` 检测 `type: "session"` 头后自动切换读取器）；`/export-ts <path.jsonl>` 可将活动分支导出为 TS pi 会话格式。HTML 导出为 TS 同款单文件模板（`assets/export/` 内嵌模板与 marked/highlight.js，会话数据以 base64 内嵌，浏览器端渲染会话树、Markdown、代码高亮与工具输出折叠；主题色为内置 dark/light 两套，取自 TS 默认主题）。导出不会覆盖已有文件。`--export <会话文件> [输出]` 可在不开会话的情况下导出任意会话文件。
 
 ## 评测系统（documentation-lift evals）
 

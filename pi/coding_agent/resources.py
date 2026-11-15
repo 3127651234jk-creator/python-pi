@@ -101,9 +101,19 @@ def substitute_arguments(content: str, args: List[str]) -> str:
 
 
 class ResourceCatalog:
-    def __init__(self, config: Configuration, home: Optional[Path] = None) -> None:
+    def __init__(self, config: Configuration, home: Optional[Path] = None,
+                 skill_paths: Optional[List[Path]] = None, prompt_paths: Optional[List[Path]] = None,
+                 no_skills: bool = False, no_prompts: bool = False) -> None:
+        """``skill_paths`` / ``prompt_paths`` are the CLI ``--skill`` /
+        ``--prompt-template`` paths: they load first and still load under
+        ``no_skills`` / ``no_prompts``, which skip configured and default
+        discovery."""
         self.config = config
         self.home = home or Path.home()
+        self.cli_skill_paths = [Path(path).expanduser() for path in (skill_paths or [])]
+        self.cli_prompt_paths = [Path(path).expanduser() for path in (prompt_paths or [])]
+        self.no_skills = no_skills
+        self.no_prompts = no_prompts
         self.skills: Dict[str, Skill] = {}
         self.prompts: Dict[str, PromptTemplate] = {}
         self.diagnostics: List[str] = []
@@ -114,20 +124,38 @@ class ResourceCatalog:
         self.prompts = {}
         self.diagnostics = []
         trusted = self.config.project_trusted
-        # First discovered name wins: explicit project/user paths, then defaults.
-        skill_paths = self.configured_paths("skills", trusted)
-        prompt_paths = self.configured_paths("prompts", trusted)
+        # First discovered name wins: CLI paths, explicit project/user paths, then defaults.
+        skill_paths: List[Path] = []
+        prompt_paths: List[Path] = []
+        if not self.no_skills:
+            skill_paths.extend(self.configured_paths("skills", trusted))
+        if not self.no_prompts:
+            prompt_paths.extend(self.configured_paths("prompts", trusted))
         cwd = self.config.cwd.resolve()
         if self.config.settings.get("include_default_resources", True):
             if trusted:
-                skill_paths.extend([cwd / ".pi" / "skills"])
-                for parent in (cwd, *cwd.parents):
-                    skill_paths.append(parent / ".agents" / "skills")
-                    if (parent / ".git").exists():
-                        break
-                prompt_paths.extend([cwd / ".pi" / "prompts"])
-            skill_paths.extend([self.config.agent_dir / "skills", self.home / ".agents" / "skills"])
-            prompt_paths.extend([self.config.agent_dir / "prompts"])
+                if not self.no_skills:
+                    skill_paths.extend([cwd / ".pi" / "skills"])
+                    for parent in (cwd, *cwd.parents):
+                        skill_paths.append(parent / ".agents" / "skills")
+                        if (parent / ".git").exists():
+                            break
+                if not self.no_prompts:
+                    prompt_paths.extend([cwd / ".pi" / "prompts"])
+            if not self.no_skills:
+                skill_paths.extend([self.config.agent_dir / "skills", self.home / ".agents" / "skills"])
+            if not self.no_prompts:
+                prompt_paths.extend([self.config.agent_dir / "prompts"])
+        # CLI paths load even under --no-skills / --no-prompt-templates, and win
+        # over discovered resources; a missing path is reported, not fatal.
+        for path in self.cli_skill_paths:
+            if not path.exists():
+                self.diagnostics.append(f"Skill path does not exist: {path}")
+        for path in self.cli_prompt_paths:
+            if not path.exists():
+                self.diagnostics.append(f"Prompt template path does not exist: {path}")
+        skill_paths = self.cli_skill_paths + skill_paths
+        prompt_paths = self.cli_prompt_paths + prompt_paths
 
         seen = set()
         for root in skill_paths:

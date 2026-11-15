@@ -1,3 +1,4 @@
 include scripts/build_daemon.py
 include scripts/daemon_entry.py
 recursive-include pi/env/bin pi-env pi-env.exe manifest.json
+recursive-include pi/coding_agent/assets/export *.html *.css *.js

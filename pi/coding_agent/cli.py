@@ -16,6 +16,8 @@ import json
 import getpass
 import threading
 from contextlib import nullcontext, redirect_stdout
+from importlib.metadata import PackageNotFoundError, version as package_version
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 import httpx
 from prompt_toolkit import PromptSession
@@ -53,9 +55,9 @@ from .terminal_image import render_image_lines
 from .output_guard import raw_stdout, restore_stdout, take_over_stdout
 from .packages import PackageManager
 from .provider_attribution import apply_attribution, is_opencode_like
-from .session import SessionManager
+from .session import SESSION_ID_PATTERN, SessionManager, export_session_file
 from .system_prompt import SystemPromptOptions, build_system_prompt
-from .tools import create_default_tools, tool_prompt_contributions
+from .tools import BUILTIN_TOOL_NAMES, create_default_tools, tool_prompt_contributions
 from .trust import TrustStore, project_trust_parent_path, resolve_project_trusted, trust_options
 from .config import Configuration, read_json
 from .custom_api import (RESERVED_PROVIDER_ID, ConcurrentConfigChange, CustomApiSaver,
@@ -83,6 +85,13 @@ BANNER = "pi-python — Python port of the pi coding agent core. Type /help for 
 CRASH_CONTEXT: dict = {}
 
 
+def _version_string() -> str:
+    try:
+        return package_version("pi-python")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pi", description="pi-python coding agent")
     parser.add_argument("prompt", nargs="*", help="Prompt to run once (omit for interactive mode)")
@@ -94,8 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", help="API key (defaults to provider environment variables)")
     parser.add_argument("--thinking", choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     parser.add_argument("-c", "--continue", dest="continue_session", action="store_true", help="Continue latest session")
+    parser.add_argument("-r", "--resume", action="store_true",
+                        help="Pick a previous session to continue from a list")
     parser.add_argument("--no-session", action="store_true", help="Do not persist this conversation")
     parser.add_argument("--session", help="Resume a session path or ID")
+    parser.add_argument("--session-id", help="Continue the session with this exact id, or create a new one with it")
+    parser.add_argument("--fork", metavar="SESSION",
+                        help="Copy a session path or id into a new session in this directory and continue it")
     parser.add_argument("--session-dir", help="Session storage directory")
     parser.add_argument("--name", help="Session name")
     parser.add_argument("--agent-dir", help="User configuration and credential directory")
@@ -113,6 +127,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evals", metavar="FILE", help="Run eval cases from a JSON file and exit")
     parser.add_argument("--no-tools", "-nt", action="store_true",
                         help="Disable all tools by default (built-in, extension and MCP)")
+    parser.add_argument("--no-builtin-tools", "-nbt", action="store_true",
+                        help="Disable the built-in tools (read, bash, edit, write, grep, find, ls, powershell)")
     parser.add_argument("--tools", "-t", metavar="TOOLS",
                         help="Comma-separated allowlist of tool names or patterns (*) to enable. "
                              "Keeps MCP tools unless an entry starts with mcp__")
@@ -121,6 +137,38 @@ def build_parser() -> argparse.ArgumentParser:
                              "Applies to all tools, MCP tools included")
     parser.add_argument("--no-mcp", action="store_true",
                         help="Disable built-in MCP support: no servers connect and no MCP tools")
+    parser.add_argument("-e", "--extension", action="append", metavar="PATH",
+                        help="Load this extension path (repeatable)")
+    parser.add_argument("--no-extensions", "-ne", action="store_true",
+                        help="Skip discovered extensions; explicit --extension paths still load")
+    parser.add_argument("--skill", action="append", metavar="PATH",
+                        help="Load this skill file or directory (repeatable)")
+    parser.add_argument("--no-skills", "-ns", action="store_true",
+                        help="Skip discovered skills; --skill paths still load")
+    parser.add_argument("--prompt-template", action="append", metavar="PATH",
+                        help="Load this prompt template file or directory (repeatable)")
+    parser.add_argument("--no-prompt-templates", "-np", action="store_true",
+                        help="Skip discovered prompt templates; --prompt-template paths still load")
+    parser.add_argument("--theme", action="append", metavar="PATH",
+                        help="Load this theme file or directory (repeatable)")
+    parser.add_argument("--use-theme", metavar="NAME", help="Use this theme for this run")
+    parser.add_argument("--no-themes", action="store_true", help="Skip user theme loading")
+    parser.add_argument("--no-context-files", "-nc", action="store_true",
+                        help="Do not load AGENTS.md / CLAUDE.md / CONTEXT.md into the system prompt")
+    parser.add_argument("--system-prompt", help="Replace the default system prompt (text or file path)")
+    parser.add_argument("--append-system-prompt", action="append",
+                        help="Append to the system prompt (text or file path; repeatable)")
+    parser.add_argument("--models", metavar="PATTERNS",
+                        help="Comma-separated provider/model patterns (*) the model cycle is limited to")
+    parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
+                        help="Run one prompt non-interactively (stdin becomes the prompt when none is given)")
+    parser.add_argument("--export", metavar="FILE",
+                        help="Export a session file (HTML by default; .jsonl for TS format, .md) and exit; "
+                             "the output path is the first positional argument")
+    parser.add_argument("--verbose", action="store_true", help="Print startup timing groups")
+    parser.add_argument("--offline", action="store_true", help="Run without network access")
+    parser.add_argument("--version", "-v", action="version", version=_version_string(),
+                        help="Show the version and exit")
     return parser
 
 
@@ -194,11 +242,26 @@ def split_tool_entries(value: str) -> List[str]:
 
 def tool_selection_from_args(args: argparse.Namespace) -> Optional[ToolSelection]:
     """The selection for one run, or None when no tool flag was given."""
-    if args.tools is None and not args.no_tools and not args.exclude_tools:
+    if args.tools is None and not args.no_tools and not args.exclude_tools and not getattr(args, "no_builtin_tools", False):
         return None
     allowed = split_tool_entries(args.tools) if args.tools is not None else ([] if args.no_tools else None)
     excluded = split_tool_entries(args.exclude_tools) if args.exclude_tools else []
+    if getattr(args, "no_builtin_tools", False):
+        # --no-builtin-tools drops exactly the built-in tools; extension and MCP
+        # tools stay registered and declared.
+        excluded = list(dict.fromkeys(excluded + list(BUILTIN_TOOL_NAMES)))
     return ToolSelection(allowed, excluded)
+
+
+def resolve_prompt_input(value: str) -> str:
+    """A --system-prompt / --append-system-prompt value: file path or literal text."""
+    if os.path.isfile(value):
+        try:
+            with open(value, "r", encoding="utf-8-sig") as handle:
+                return handle.read()
+        except OSError as exc:
+            raise ValueError(f"Could not read {value}: {exc}") from None
+    return value
 
 
 def apply_tool_selection(agent: Agent) -> None:
@@ -297,10 +360,14 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
     if selection is not None:
         tools = [tool for tool in tools if selection.keeps(tool.name)]
     snippets, guidelines = tool_prompt_contributions(tools)
+    append_values = [resolve_prompt_input(value) for value in getattr(args, "append_system_prompt", None) or []]
     options = SystemPromptOptions(
         cwd=cwd, selected_tools=[tool.name for tool in tools],
         hidden_tools=[tool.name for tool in tools if not tool.declared],
-        tool_snippets=snippets, tool_guidelines=guidelines)
+        tool_snippets=snippets, tool_guidelines=guidelines,
+        custom_prompt=resolve_prompt_input(args.system_prompt) if getattr(args, "system_prompt", None) else None,
+        append_system_prompt="\n\n".join(append_values),
+        context_files=[] if getattr(args, "no_context_files", False) else None)
     system_prompt = build_system_prompt(options)
     agent = Agent(model=model, tools=tools, system_prompt=system_prompt,
                  thinking_level=args.thinking or os.environ.get("PI_PY_THINKING") or settings.get("thinking", "off"),
@@ -637,7 +704,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
             if ui and not rest.strip():
                 if command == "/model" and registry:
                     registry.reload()
-                    selected = await ui.choose("Model", [(name, f"{name} ({model.context_window} tokens)") for name, model in sorted(registry.models.items())])
+                    selected = await ui.choose("Model", [(name, f"{name} ({model.context_window} tokens)") for name, model in sorted(registry.scoped_model_items())])
                     if not selected:
                         continue
                     rest = selected
@@ -1452,6 +1519,19 @@ async def render_custom_entries(session: SessionManager, extensions: ExtensionMa
             print("\n".join(lines))
 
 
+def _resolve_session_source(session: SessionManager, identifier: str) -> str:
+    """A --fork / --session argument as a session file path: path or id prefix."""
+    if os.path.isfile(identifier):
+        return identifier
+    sessions = session.list_sessions()
+    matches = [item for item in sessions if item["id"] == identifier]
+    if not matches:
+        matches = [item for item in sessions if item["id"].startswith(identifier)]
+    if len(matches) != 1:
+        raise ValueError("Session ID is unknown or ambiguous")
+    return matches[0]["path"]
+
+
 def restore_session_settings(agent: Agent, session: SessionManager, registry: ModelRegistry) -> None:
     """Replay model_change / thinking_level_change / compaction entries on resume."""
     model_change = session.latest_custom("model_change")
@@ -1524,10 +1604,36 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     filtered_argv, extension_flag_values = split_extension_flags(raw_argv, build_parser())
     args = build_parser().parse_args(filtered_argv)
-    if args.no_session and (args.session or args.continue_session or args.name):
+    if args.offline:
+        os.environ["PI_OFFLINE"] = "1"
+    if args.verbose:
+        os.environ["PI_TIMING"] = "1"
+        timings.ENABLED = True
+    if args.no_session and (args.session or args.continue_session or args.resume or args.name or args.session_id):
         print("error: --no-session cannot be combined with session options", file=sys.stderr)
         return 2
+    if args.session_id and (args.session or args.continue_session or args.resume):
+        print("error: --session-id cannot be combined with --session, --continue or --resume",
+              file=sys.stderr)
+        return 2
+    if args.fork and (args.session or args.continue_session or args.resume or args.no_session):
+        print("error: --fork cannot be combined with --session, --continue, --resume or --no-session",
+              file=sys.stderr)
+        return 2
+    if args.session_id and not SESSION_ID_PATTERN.fullmatch(args.session_id):
+        print("error: --session-id must start and end with a letter or digit and may contain "
+              "letters, digits, dots, dashes and underscores", file=sys.stderr)
+        return 2
     cwd = os.getcwd()
+    if args.export:
+        # Standalone session export: no provider, registry or session state needed.
+        output = next((arg for arg in args.prompt if not arg.startswith("@")), None)
+        try:
+            print(export_session_file(args.export, output))
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
     file_args = [arg[1:] for arg in args.prompt if arg.startswith("@")]
     message_args = [arg for arg in args.prompt if not arg.startswith("@")]
     prompt_text = " ".join(message_args)
@@ -1554,7 +1660,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     # Protocol modes protect their stdout stream from stray print() output.
     if args.mode in ("json", "rpc"):
         take_over_stdout()
-    has_ui = args.mode == "text" and not message_args and sys.stdin.isatty()
+    has_ui = args.mode == "text" and not message_args and not args.print_mode and sys.stdin.isatty()
 
     try:
         registry = ModelRegistry(Configuration(cwd, args.agent_dir or ""))
@@ -1612,7 +1718,29 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         # Re-merge settings so untrusted project settings are not applied.
         registry.config.reload()
         registry.reload()
-        resources = ResourceCatalog(registry.config)
+        if args.models:
+            registry.model_scope = [entry.strip() for entry in args.models.split(",") if entry.strip()]
+            if not registry.model_scope:
+                raise ValueError("--models requires at least one provider/model pattern")
+        try:
+            themes = load_themes(registry.config.agent_dir,
+                                 extra_paths=[Path(path).expanduser() for path in args.theme or []],
+                                 no_themes=args.no_themes)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.use_theme:
+            # Runtime override only: unlike /theme, --use-theme does not persist.
+            if args.use_theme not in themes:
+                print(f"error: unknown theme: {args.use_theme}. Available: {', '.join(sorted(themes))}",
+                      file=sys.stderr)
+                return 2
+            registry.config.settings["theme"] = args.use_theme
+        resources = ResourceCatalog(
+            registry.config,
+            skill_paths=[Path(path).expanduser() for path in args.skill or []],
+            prompt_paths=[Path(path).expanduser() for path in args.prompt_template or []],
+            no_skills=args.no_skills, no_prompts=args.no_prompt_templates)
         report_diagnostics(deduplicate_diagnostics([*settings_diagnostics(registry.config.errors),
             *[Diagnostic("warning", message) for message in resources.diagnostics]]))
         agent = make_agent(args, cwd, registry, resources)
@@ -1629,8 +1757,47 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     session: Optional[SessionManager] = None
     if not args.no_session:
         session = SessionManager(session_dir=args.session_dir or registry.config.settings.get("session_dir"), cwd=cwd)
-        if args.session:
+        resumed = False
+        if args.resume:
+            if not has_ui:
+                print("error: --resume requires an interactive terminal; use --session <path|id> instead",
+                      file=sys.stderr)
+                return 2
+            items = session.list_sessions()
+            chosen = await _choose_console(
+                "Resume session",
+                [(f"{item['name'] or item['id']} ({item['messages']} messages)", item["path"]) for item in items],
+            ) if items else None
+            if chosen is None:
+                print("No session selected")
+                return 0
+            agent.messages = session.load(chosen)
+            resumed = True
+        elif args.session:
             agent.messages = session.resume(args.session)
+            resumed = True
+        elif args.fork:
+            if args.session_id and any(item["id"] == args.session_id for item in session.list_sessions()):
+                print(f"error: a session with id '{args.session_id}' already exists", file=sys.stderr)
+                return 1
+            try:
+                source = _resolve_session_source(session, args.fork)
+                agent.messages = session.fork_from(source, session_id=args.session_id)
+            except (OSError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            resumed = True
+        elif args.session_id:
+            matches = [item for item in session.list_sessions() if item["id"] == args.session_id]
+            if matches:
+                agent.messages = session.load(matches[0]["path"])
+                resumed = True
+            else:
+                print(f"warning: no project session found with id '{args.session_id}'; "
+                      f"creating a new session with that id", file=sys.stderr)
+                session.start_new(args.session_id)
+                for message in agent.messages:
+                    session.append(message)
         elif args.continue_session:
             latest = session.latest_session_file()
             if latest is None:
@@ -1640,6 +1807,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     session.append(message)
             else:
                 agent.messages = session.load(latest)
+                resumed = True
                 print(f"continued session: {os.path.basename(latest)}", file=sys.stderr)
         else:
             session.start_new()
@@ -1647,7 +1815,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 session.append(message)
         if args.name:
             session.rename(args.name)
-        if args.session or args.continue_session:
+        if resumed:
             restore_session_settings(agent, session, registry)
             update = SystemMessage(content="", timestamp=0,
                                    sections={"skills": resources.system_prompt(file_read_tool=skill_file_read_tool(agent)) or None})
@@ -1670,7 +1838,9 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     # and extensions see no MCP manager to register servers on.
     mcp = None if args.no_mcp else McpManager(registry.config)
     extensions = ExtensionManager(registry.config, agent, session, registry=registry, mcp=mcp,
-                                  flag_values=extension_flag_values)
+                                  flag_values=extension_flag_values,
+                                  extra_paths=[Path(path).expanduser() for path in args.extension or []],
+                                  no_discovery=args.no_extensions)
     renderer.extensions = extensions
     try:
         if mcp is not None:
@@ -1715,6 +1885,17 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             finally:
                 await writer.write({"type": "agent_settled"})
             return 0
+        if args.print_mode:
+            # -p forces one-shot output even without a prompt argument: piped
+            # stdin becomes the prompt, mirroring the TS --print consumption.
+            text = prompt_text
+            if not text and not sys.stdin.isatty():
+                text = sys.stdin.read().strip()
+            if not text:
+                print("error: --print requires a prompt argument or piped stdin", file=sys.stderr)
+                return 2
+            await run_prompt(agent, text, renderer, session, resources, extensions, mcp, images=prompt_images)
+            return 0
         if message_args:
             await run_prompt(agent, prompt_text, renderer, session, resources, extensions, mcp, images=prompt_images)
             return 0
@@ -1729,7 +1910,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 return names
             ui = TerminalUI(agent, commands, registry.config.settings,
                             extra_bindings=extensions.all_keybindings(),
-                            themes=load_themes(registry.config.agent_dir), full_screen=args.tui == "fullscreen")
+                            themes=themes, full_screen=args.tui == "fullscreen")
             ui.markdown_transform = lambda text: extensions.transform_markdown(text, "user")
             renderer.ui = ui
             renderer.full_screen = ui.full_screen

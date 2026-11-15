@@ -30,6 +30,7 @@ include = ["pi*"]
 
 [tool.setuptools.package-data]
 "pi.env" = ["bin/*/pi-env", "bin/*/pi-env.exe", "bin/*/manifest.json"]
+"pi.coding_agent" = ["assets/export/template.html", "assets/export/template.css", "assets/export/template.js", "assets/export/vendor/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
