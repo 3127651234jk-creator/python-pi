@@ -19,6 +19,12 @@ from .oauth_callback import generate_pkce, poll_oauth_device_code_flow, start_oa
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Anthropic OAuth: the fixed loopback callback port is preferred so it can be
+# forwarded into containers or over SSH; Anthropic accepts any loopback port,
+# so a bind failure falls back to a free port, then to paste-only login (#10571).
+CLAUDE_CALLBACK_PORT = 53692
+CLAUDE_CALLBACK_PATH = "/callback"
+CLAUDE_MANAGED_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 COPILOT_HEADERS = {"User-Agent": "GitHubCopilotChat/0.35.0", "Editor-Version": "vscode/1.107.0",
     "Editor-Plugin-Version": "copilot-chat/0.35.0", "Copilot-Integration-Id": "vscode-chat"}
@@ -132,26 +138,54 @@ async def refresh_subscription(provider, credential):
 async def login_claude(notify, prompt):
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    redirect = "https://platform.claude.com/oauth/code/callback"
+    # Two channels, like the TypeScript login: the browser redirects to a
+    # loopback callback server when one can be bound (fixed port first, then a
+    # free port per #10571), and pasting the final redirect URL always stays
+    # available for remote machines. The redirect_uri handed to Anthropic is
+    # the one used at authorize time, whichever channel wins.
+    callback = None
+    redirect = CLAUDE_MANAGED_REDIRECT_URI
+    for port in (CLAUDE_CALLBACK_PORT, 0):
+        try:
+            callback = await start_oauth_callback_server("Anthropic", "127.0.0.1", port, CLAUDE_CALLBACK_PATH, state=verifier)
+            redirect = callback.redirect_uri
+            break
+        except OSError:
+            continue
     notify("https://claude.ai/oauth/authorize?" + urlencode({"code": "true", "client_id": CLAUDE_CLIENT_ID,
         "response_type": "code", "redirect_uri": redirect, "scope": "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
         "code_challenge": challenge, "code_challenge_method": "S256", "state": verifier}))
-    value = (await prompt("Paste Claude authorization code (code#state) or redirect URL: ")).strip()
-    state = verifier
-    if "://" in value:
-        params = parse_qs(urlsplit(value).query)
-        code, state = params.get("code", [""])[0], params.get("state", [""])[0]
-    elif "#" in value:
-        code, state = value.split("#", 1)
-    else:
-        code = value
-    if state != verifier or not code:
-        raise ValueError("Missing authorization code or OAuth state mismatch")
-    async with httpx.AsyncClient(timeout=30) as client:
-        data = checked(await client.post("https://platform.claude.com/v1/oauth/token", json={
-            "grant_type": "authorization_code", "client_id": CLAUDE_CLIENT_ID, "code": code,
-            "state": verifier, "code_verifier": verifier, "redirect_uri": redirect}))
-    return token_record(data, "anthropic")
+    notify("Complete login in your browser. If the browser is on another machine, paste the final redirect URL here.")
+    manual = asyncio.ensure_future(prompt("Complete login in your browser, or paste the authorization code (code#state) / redirect URL here: "))
+    pending = {manual, asyncio.ensure_future(callback.wait())} if callback is not None else {manual}
+    try:
+        done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        state = verifier
+        if manual in done:
+            value = manual.result().strip()
+            if "://" in value:
+                params = parse_qs(urlsplit(value).query)
+                code, state = params.get("code", [""])[0], params.get("state", [""])[0]
+            elif "#" in value:
+                code, state = value.split("#", 1)
+            else:
+                code = value
+        else:
+            params = next(iter(done)).result()
+            code, state = params.get("code", ""), params.get("state", "")
+        if state != verifier or not code:
+            raise ValueError("Missing authorization code or OAuth state mismatch")
+        async with httpx.AsyncClient(timeout=30) as client:
+            data = checked(await client.post("https://platform.claude.com/v1/oauth/token", json={
+                "grant_type": "authorization_code", "client_id": CLAUDE_CLIENT_ID, "code": code,
+                "state": verifier, "code_verifier": verifier, "redirect_uri": redirect}))
+        return token_record(data, "anthropic")
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if callback is not None:
+            await callback.close()
 
 
 async def login_codex(notify):

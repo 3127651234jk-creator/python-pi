@@ -32,7 +32,7 @@ def test_claude_pkce_and_state_validation(monkeypatch):
         return httpx.Response(200, json={"access_token": "sk-ant-oat-test", "refresh_token": "refresh", "expires_in": 3600})
     monkeypatch.setattr(httpx.AsyncClient, "post", post)
     async def prompt(message):
-        state = parse_qs(urlsplit(urls[-1]).query)["state"][0]
+        state = parse_qs(urlsplit(urls[0]).query)["state"][0]
         return "authorization#" + state
     record = asyncio.run(login_claude(urls.append, prompt))
     assert record["access"] == "sk-ant-oat-test"
@@ -41,6 +41,110 @@ def test_claude_pkce_and_state_validation(monkeypatch):
     with pytest.raises(ValueError, match="state"):
         asyncio.run(login_claude(urls.append, invalid))
     assert len(requests) == 1
+
+
+def port_is_free(port):
+    """Whether the test environment can bind the preferred callback port (#10571)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def test_claude_login_browser_callback(monkeypatch, direct_httpx):
+    """The browser callback channel completes the login without manual paste."""
+    import pi.coding_agent.subscription_auth as subscription_auth
+
+    fixed_port_free = port_is_free(subscription_auth.CLAUDE_CALLBACK_PORT)
+    urls, requests = [], []
+    async def post(self, url, **kwargs):
+        requests.append(kwargs["json"])
+        return httpx.Response(200, json={"access_token": "sk-ant-oat-test", "refresh_token": "refresh", "expires_in": 3600})
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+
+    async def check():
+        manual_reached = asyncio.Event()
+
+        async def prompt(message):
+            manual_reached.set()
+            await asyncio.Event().wait()  # the manual channel stays open; the callback wins
+
+        task = asyncio.ensure_future(login_claude(urls.append, prompt))
+        while len(urls) < 2:  # authorize URL + instruction
+            await asyncio.sleep(0.01)
+        authorize = parse_qs(urlsplit(urls[0]).query)
+        redirect = authorize["redirect_uri"][0]
+        await manual_reached.wait()
+        # Simulate the browser hitting the loopback callback with the code.
+        response = await httpx.AsyncClient().get(redirect, params={"code": "auth-code", "state": authorize["state"][0]})
+        assert response.status_code == 200
+        return await asyncio.wait_for(task, 10), redirect, requests[0]
+
+    record, redirect, exchange = asyncio.run(asyncio.wait_for(check(), 30))
+    assert record["access"] == "sk-ant-oat-test"
+    parsed = urlsplit(redirect)
+    assert parsed.hostname == "127.0.0.1" and parsed.port > 0
+    # The preferred fixed port is used when this machine can bind it; otherwise
+    # login falls back to a free port (#10571).
+    assert (parsed.port == subscription_auth.CLAUDE_CALLBACK_PORT) == fixed_port_free
+    assert exchange["redirect_uri"] == redirect  # exchange reuses the authorize-time redirect_uri
+
+
+def test_claude_login_falls_back_to_free_port(monkeypatch):
+    """#10571 semantics: an unbindable preferred port falls back to a free port."""
+    import pi.coding_agent.subscription_auth as subscription_auth
+
+    real = subscription_auth.start_oauth_callback_server
+
+    async def wrapped(provider, host, port, path, **kwargs):
+        if port == subscription_auth.CLAUDE_CALLBACK_PORT:
+            raise OSError("port excluded by Hyper-V/WSL")
+        return await real(provider, host, port, path, **kwargs)
+
+    monkeypatch.setattr(subscription_auth, "start_oauth_callback_server", wrapped)
+    urls, requests = [], []
+    async def post(self, url, **kwargs):
+        requests.append(kwargs["json"])
+        return httpx.Response(200, json={"access_token": "sk-ant-oat-test", "refresh_token": "refresh", "expires_in": 3600})
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    async def prompt(message):
+        state = parse_qs(urlsplit(urls[0]).query)["state"][0]
+        # Terminal paste often carries surrounding whitespace/newlines; it must be trimmed.
+        return "  authorization#" + state + "\n"
+
+    record = asyncio.run(login_claude(urls.append, prompt))
+    redirect = parse_qs(urlsplit(urls[0]).query)["redirect_uri"][0]
+    assert urlsplit(redirect).port != subscription_auth.CLAUDE_CALLBACK_PORT
+    assert urlsplit(redirect).port > 0
+    assert requests[0]["redirect_uri"] == redirect
+    assert requests[0]["code"] == "authorization"
+    assert record["access"] == "sk-ant-oat-test"
+
+
+def test_claude_login_paste_only_without_callback_server(monkeypatch):
+    """With no bindable port at all, login keeps the managed-redirect paste flow."""
+    import pi.coding_agent.subscription_auth as subscription_auth
+
+    async def refuse(*args, **kwargs):
+        raise OSError("no sockets available")
+
+    monkeypatch.setattr(subscription_auth, "start_oauth_callback_server", refuse)
+    urls, requests = [], []
+    async def post(self, url, **kwargs):
+        requests.append(kwargs["json"])
+        return httpx.Response(200, json={"access_token": "sk-ant-oat-test", "refresh_token": "refresh", "expires_in": 3600})
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    async def prompt(message):
+        state = parse_qs(urlsplit(urls[0]).query)["state"][0]
+        return "authorization#" + state
+
+    record = asyncio.run(login_claude(urls.append, prompt))
+    redirect = parse_qs(urlsplit(urls[0]).query)["redirect_uri"][0]
+    assert redirect == subscription_auth.CLAUDE_MANAGED_REDIRECT_URI
+    assert requests[0]["redirect_uri"] == redirect
+    assert record["access"] == "sk-ant-oat-test"
 
 
 def test_codex_device_flow(monkeypatch):
