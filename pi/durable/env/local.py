@@ -497,6 +497,7 @@ class LocalExecutionEnv:
         self._watch_mode = watch_mode
         self._watch_max_directories = watch_max_directories
         self._active_children: set = set()
+        self._cleanup_generation = 0
 
     # -- paths ----------------------------------------------------------------
 
@@ -842,6 +843,7 @@ class LocalExecutionEnv:
     # -- shell ----------------------------------------------------------------
 
     async def exec(self, command, options: Optional[ShellExecOptions], context: Context) -> Result:
+        cleanup_generation = self._cleanup_generation
         if context.aborted:
             return err(ExecutionError("aborted", "aborted"))
         timeout = None
@@ -884,10 +886,20 @@ class LocalExecutionEnv:
                 )
             )
 
-        runner = _CommandRunner(self, program, args, cwd, options or ShellExecOptions(), context, stdin_command)
+        runner = _CommandRunner(
+            self,
+            program,
+            args,
+            cwd,
+            options or ShellExecOptions(),
+            context,
+            stdin_command,
+            cleanup_generation,
+        )
         return await runner.run()
 
     async def cleanup(self, context: Context) -> None:
+        self._cleanup_generation += 1
         for pid in list(self._active_children):
             await kill_process_tree(pid)
         self._active_children.clear()
@@ -905,6 +917,7 @@ class _CommandRunner:
         options: ShellExecOptions,
         context: Context,
         stdin_command: Optional[str],
+        cleanup_generation: Optional[int] = None,
     ) -> None:
         self._env = env
         self._program = program
@@ -913,6 +926,9 @@ class _CommandRunner:
         self._options = options
         self._context = context
         self._stdin_command = stdin_command
+        self._cleanup_generation = (
+            env._cleanup_generation if cleanup_generation is None else cleanup_generation
+        )
         self._timed_out = False
         self._callback_error: Optional[ExecutionError] = None
         self._spill_error: Optional[ExecutionError] = None
@@ -934,6 +950,7 @@ class _CommandRunner:
         self._last_stream = "stdout"
         self._last_emit = 0.0
         self._abort_task: Optional[asyncio.Task] = None
+        self._kill_task: Optional[asyncio.Task] = None
         self._timeout_handle = None
         self._pump_tasks: List[asyncio.Task] = []
 
@@ -946,7 +963,8 @@ class _CommandRunner:
             for task in self._pump_tasks:
                 task.cancel()
             if self._process is not None and self._process.pid:
-                await kill_process_tree(self._process.pid)
+                self._kill()
+                await self._wait_for_kill()
                 await self._process.wait()
             raise
         finally:
@@ -961,6 +979,7 @@ class _CommandRunner:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await self._wait_for_kill()
             if self._spill_handle is not None:
                 self._spill_handle.close()
             if self._process is not None and self._process.pid:
@@ -985,6 +1004,8 @@ class _CommandRunner:
             return err(ExecutionError("spawn_error", str(exc), exc))
         if self._process.pid:
             self._env._active_children.add(self._process.pid)
+        if self._cleanup_generation != self._env._cleanup_generation:
+            self._kill()
         if self._stdin_command is not None and self._process.stdin is not None:
             try:
                 self._process.stdin.write(self._stdin_command.encode("utf-8"))
@@ -1069,8 +1090,17 @@ class _CommandRunner:
 
     def _kill(self) -> None:
         process = self._process
-        if process is not None and process.pid and process.returncode is None:
-            asyncio.get_running_loop().create_task(kill_process_tree(process.pid))
+        if (
+            process is not None
+            and process.pid
+            and process.returncode is None
+            and self._kill_task is None
+        ):
+            self._kill_task = asyncio.get_running_loop().create_task(kill_process_tree(process.pid))
+
+    async def _wait_for_kill(self) -> None:
+        if self._kill_task is not None:
+            await asyncio.gather(self._kill_task, return_exceptions=True)
 
     async def _watch_abort(self) -> None:
         signal_ = self._context.abort_signal

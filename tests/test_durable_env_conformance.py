@@ -82,3 +82,29 @@ def test_env_conformance(case_name, tmp_path):
 
 def candidate_timeout(case):
     return case.timeout_seconds or 30.0
+
+
+def test_cleanup_kills_a_command_still_starting(tmp_path, monkeypatch):
+    async def main():
+        env = LocalExecutionEnv(cwd=str(tmp_path))
+        original = asyncio.create_subprocess_exec
+        spawn_started = asyncio.Event()
+        allow_spawn = asyncio.Event()
+
+        async def delayed_spawn(*args, **kwargs):
+            if args[0] == sys.executable:
+                spawn_started.set()
+                await allow_spawn.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+        command = [sys.executable, "-c", "import time; time.sleep(30)"]
+        task = asyncio.create_task(env.exec(command, None, Context()))
+        await spawn_started.wait()
+        await env.cleanup(Context())
+        allow_spawn.set()
+        result = await asyncio.wait_for(task, timeout=10)
+        assert result.ok
+        assert result.value.exit_code != 0
+
+    asyncio.run(main())

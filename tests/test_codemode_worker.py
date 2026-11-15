@@ -114,6 +114,26 @@ class WorkerDriver:
             if process.returncode is None:
                 process.kill()
             await process.wait()
+            process.stdin.close()
+            try:
+                await asyncio.wait_for(process.stdin.wait_closed(), timeout=5)
+            except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+                pass
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+            pipe_transports = [
+                candidate
+                for stream in (process.stdin, process.stdout)
+                for candidate in [
+                    getattr(stream, "transport", None) or getattr(stream, "_transport", None)
+                ]
+                if candidate is not None
+            ]
+            for _ in range(100):
+                if all(getattr(candidate, "_closed", True) for candidate in pipe_transports):
+                    break
+                await asyncio.sleep(0.01)
             run.exit_code = process.returncode
         return run
 

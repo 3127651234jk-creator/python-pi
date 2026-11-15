@@ -208,6 +208,14 @@ def test_server_cli_smoke(tmp_path):
             if process.returncode is None:
                 process.terminate()
             await asyncio.wait_for(process.wait(), 20)
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+            stdout_transport = getattr(process.stdout, "_transport", None)
+            for _ in range(100):
+                if stdout_transport is None or getattr(stdout_transport, "_closed", True):
+                    break
+                await asyncio.sleep(0.01)
     asyncio.run(asyncio.wait_for(check(), 120))
 
 

@@ -298,9 +298,9 @@ class Connection:
 
         abort_task = asyncio.ensure_future(_cancel_when_aborted()) if options.abort_signal else None
         try:
+            self._write(session, frame(REQUEST, request_id, {**json, "op": op}, options.payload or b""))
             if options.on_start is not None:
                 options.on_start(request_id, session.id)
-            self._write(session, frame(REQUEST, request_id, {**json, "op": op}, options.payload or b""))
             return await future
         finally:
             session.pending.pop(request_id, None)

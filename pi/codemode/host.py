@@ -420,6 +420,22 @@ async def execute_codemode(
             except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionError,
                     OSError, RuntimeError):
                 pass
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
+        pipe_transports = [
+            candidate
+            for stream in (process.stdin, process.stdout)
+            if stream is not None
+            for candidate in [
+                getattr(stream, "transport", None) or getattr(stream, "_transport", None)
+            ]
+            if candidate is not None
+        ]
+        for _ in range(100):
+            if all(getattr(candidate, "_closed", True) for candidate in pipe_transports):
+                break
+            await asyncio.sleep(0.01)
     for record in calls:
         if record.status == "running":
             record.status = "cancelled"

@@ -460,6 +460,7 @@ class RemoteExecutionEnv:
         self._watch_options = watch or RemoteWatchOptions()
         # Running commands this environment started, for ``cleanup()``.
         self._running: Dict[int, int] = {}
+        self._cleanup_generation = 0
 
     # -- paths -----------------------------------------------------------------
 
@@ -883,6 +884,7 @@ class RemoteExecutionEnv:
     async def exec(
         self, command: Any, options: Optional[ShellExecOptions], context: Context
     ) -> Result:
+        cleanup_generation = self._cleanup_generation
         signal = context.abort_signal
         if signal is not None and signal.is_set():
             return err(ExecutionError("aborted", "aborted"))
@@ -951,6 +953,8 @@ class RemoteExecutionEnv:
             nonlocal running
             running = request_id
             self._running[request_id] = session_id
+            if cleanup_generation != self._cleanup_generation:
+                self.connection.kill(request_id, session_id)
 
         try:
             reply = await self.connection.request(
@@ -1024,6 +1028,7 @@ class RemoteExecutionEnv:
 
     async def cleanup(self, context: Context) -> None:
         # Kill without aborting, so the commands settle with their killed status, as ``NodeExecutionEnv`` does.
+        self._cleanup_generation += 1
         for request_id, session_id in list(self._running.items()):
             self.connection.kill(request_id, session_id)
         self._running.clear()

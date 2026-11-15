@@ -214,6 +214,39 @@ def test_exec_cleanup_kills_without_aborting(tmp_path):
     asyncio.run(main())
 
 
+def test_exec_cleanup_covers_a_command_still_starting(tmp_path, monkeypatch):
+    async def main():
+        connection, environment = make_env(tmp_path)
+        original_resolve = environment._resolve
+        resolve_started = asyncio.Event()
+        allow_resolve = asyncio.Event()
+
+        async def delayed_resolve(path):
+            resolve_started.set()
+            await allow_resolve.wait()
+            return await original_resolve(path)
+
+        monkeypatch.setattr(environment, "_resolve", delayed_resolve)
+        try:
+            command = [sys.executable, "-c", "import time; time.sleep(30)"]
+            task = asyncio.create_task(
+                environment.exec(command, ShellExecOptions(cwd="."), Context())
+            )
+            await resolve_started.wait()
+            await environment.cleanup(Context())
+            allow_resolve.set()
+            result = await asyncio.wait_for(task, timeout=10)
+            assert result.ok
+            assert result.value.exit_code in (1, 137)
+        finally:
+            allow_resolve.set()
+            await environment.cleanup(Context())
+            connection.close()
+            await connection.wait_closed()
+
+    asyncio.run(main())
+
+
 def test_exec_spill(tmp_path):
     async def main():
         connection, environment = make_env(tmp_path)

@@ -1340,12 +1340,13 @@ def kill_tree(pid: int) -> None:
     if WINDOWS:
         system_root = os.environ.get("SystemRoot", "C:\\Windows")
         try:
-            subprocess_module.Popen(
+            subprocess_module.run(
                 [os.path.join(system_root, "System32", "taskkill.exe"), "/F", "/T", "/PID", str(pid)],
                 stdin=subprocess_module.DEVNULL,
                 stdout=subprocess_module.DEVNULL,
                 stderr=subprocess_module.DEVNULL,
                 creationflags=getattr(subprocess_module, "CREATE_NO_WINDOW", 0),
+                check=False,
             )
         except OSError:
             pass
