@@ -10,6 +10,7 @@ from pi.ai.types import (TextContent, ImageContent, AudioContent, VideoContent, 
     SystemMessage, UserMessage, AssistantMessage, ToolResultMessage, TranscriptContext,
     DoneEvent, StreamErrorEvent, Usage)
 from pi.ai.json_io import to_json, message_from_json
+from pi.ai.utils import pi_user_agent
 from pi.ai.providers.base import SimpleStreamOptions
 from pi.ai.providers import openai_responses, google, amazon_bedrock, openai_completions, anthropic
 from pi.coding_agent.config import Configuration
@@ -488,6 +489,70 @@ def test_bedrock_non_object_additional_model_request_fields_rejected():
     model = bedrock_model("amazon.nova-pro-v1:0", params={"additionalModelRequestFields": "bad"})
     with pytest.raises(ValueError, match="additionalModelRequestFields must be an object"):
         amazon_bedrock.build_request(model, context(), SimpleStreamOptions())
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses / Codex header merge order
+# ---------------------------------------------------------------------------
+
+
+def codex_model(**kwargs):
+    return Model(id="gpt-5.1", name="t", api="openai-codex-responses", provider="openai-codex",
+                 base_url="https://chatgpt.com/backend-api", api_key="token", **kwargs)
+
+
+def codex_sent_headers(monkeypatch, model, options=None):
+    captured = {}
+    async def send(self, request, **kwargs):
+        captured["headers"] = request.headers
+        wire = ('data: {"type":"response.completed","response":{"id":"r","model":"gpt-5.1",'
+                '"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}\n\n')
+        return httpx.Response(200, request=request, content=wire.encode())
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+
+    async def run():
+        return [event async for event in openai_responses.stream_openai_responses(model, context(), options)]
+
+    asyncio.run(run())
+    return captured["headers"]
+
+
+def test_codex_default_headers_overridable_by_model_then_caller(monkeypatch):
+    # Regression for B-AI-10 (#10429): defaults first, model headers next,
+    # caller headers last; each stage overrides the previous one. Header names
+    # are case-insensitive, so an override must not send a duplicate header.
+    headers = codex_sent_headers(monkeypatch, codex_model())
+    assert headers["originator"] == "pi"
+    assert headers["user-agent"] == pi_user_agent()
+    assert headers["openai-beta"] == "responses=experimental"
+
+    model = codex_model(headers={"Originator": "custom", "USER-AGENT": "custom-agent/1"})
+    headers = codex_sent_headers(monkeypatch, model)
+    assert headers["originator"] == "custom"
+    assert headers["user-agent"] == "custom-agent/1"
+    assert [name for name, _ in headers.multi_items() if name in ("originator", "user-agent")] == \
+        ["originator", "user-agent"]
+
+    model = codex_model(headers={"originator": "custom"})
+    headers = codex_sent_headers(monkeypatch, model,
+                                 SimpleStreamOptions(headers={"ORIGINATOR": "caller", "X-Extra": "1"}))
+    assert headers["originator"] == "caller"
+    assert headers["x-extra"] == "1"
+    assert [name for name, _ in headers.multi_items() if name == "originator"] == ["originator"]
+
+    # A None caller value deletes the header (TS additionalHeaders semantics).
+    headers = codex_sent_headers(monkeypatch, codex_model(),
+                                 SimpleStreamOptions(headers={"Originator": None}))
+    assert "originator" not in headers
+
+
+def test_codex_auth_header_cannot_be_overridden(monkeypatch):
+    # Credentials lock last, matching the TS buildBaseCodexHeaders contract;
+    # case-variant names must not slip a second Authorization header through.
+    model = codex_model(headers={"AUTHORIZATION": "Bearer fake"})
+    headers = codex_sent_headers(monkeypatch, model, SimpleStreamOptions(headers={"authorization": "Bearer caller"}))
+    assert headers["authorization"] == "Bearer token"
+    assert [name for name, _ in headers.multi_items() if name == "authorization"] == ["authorization"]
 
 
 # ---------------------------------------------------------------------------

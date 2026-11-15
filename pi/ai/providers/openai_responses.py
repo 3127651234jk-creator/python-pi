@@ -6,7 +6,7 @@ import os
 from urllib.parse import urlencode
 
 from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, get_system_message_text, get_message_text
-from ..utils import normalize_context
+from ..utils import normalize_context, pi_user_agent
 from .base import SimpleStreamOptions, apply_model_params, resolve_max_tokens, run_provider_stream, usage_from_counts
 from .blocks import BlockEvents
 from .copilot import copilot_headers
@@ -173,10 +173,26 @@ async def stream_openai_responses(model, context, options=None):
         path += "?" + urlencode({"api-version": model.params.get("api_version") or os.environ.get("AZURE_OPENAI_API_VERSION") or "v1"})
     def headers():
         key = options.api_key or model.api_key or ""
-        return {**({"api-key": key} if azure and model.auth_type != "entra" else {"Authorization": "Bearer " + key}),
-                "content-type": "application/json",
-                **({"originator": "pi", "OpenAI-Beta": "responses=experimental"} if model.api == "openai-codex-responses" else {}),
-                **model.headers, **copilot_headers(model, context)}
+        codex = model.api == "openai-codex-responses"
+        # Defaults first so model headers, then caller headers, can override
+        # them; credentials lock last so auth cannot be overridden (B-AI-10,
+        # TS #10429 buildBaseCodexHeaders order). Keys are lowercased because
+        # header names are case-insensitive: a plain dict merge would send
+        # duplicates (e.g. "Authorization" plus "authorization") instead of
+        # overriding. A None caller value deletes the header, like TS.
+        merged = {"content-type": "application/json"}
+        if codex:
+            merged.update({"originator": "pi", "user-agent": pi_user_agent(),
+                           "openai-beta": "responses=experimental"})
+        merged.update({name.lower(): value for name, value in model.headers.items()})
+        for name, value in (options.headers or {}).items():
+            if value is None:
+                merged.pop(name.lower(), None)
+            else:
+                merged[name.lower()] = value
+        merged.update({name.lower(): value for name, value in copilot_headers(model, context).items()})
+        merged.update({"api-key": key} if azure and model.auth_type != "entra" else {"authorization": "Bearer " + key})
+        return merged
     async for event in run_provider_stream(model, lambda: build_request(model, context, options), path,
         headers, convert, options, int(time.time() * 1000)):
         yield event

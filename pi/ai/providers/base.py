@@ -62,6 +62,10 @@ class SimpleStreamOptions:
     session_id: Optional[str] = None
     tool_choice: Optional[Any] = None  # "auto" | "none" | "required" | {"type": "function", "function": {...}}
     debug: bool = False
+    # Per-request caller headers (port of TS additionalHeaders): applied after
+    # model headers, before the provider's auth lock. Consumed by providers
+    # that need it (openai_responses today); others ignore it.
+    headers: Optional[Dict[str, str]] = None
     # Hooks, sync or awaitable (port of TS StreamOptions onPayload/onResponse/
     # onProviderStreamEvent): inspect or replace the request payload, observe
     # the raw HTTP response, and observe raw provider events pre-conversion.

@@ -300,7 +300,15 @@ class ModelRegistry:
                 record = self.auth.get(provider)
                 resolved.auth_type = record.get("type", "api_key")
                 if provider == "openai-codex":
-                    resolved.headers.update({"chatgpt-account-id": record["account_id"], "originator": "pi"})
+                    # Fill only what the user did not configure (B-AI-10): a
+                    # models.json-configured originator survives instead of
+                    # being reset to "pi" on every credential refresh. Header
+                    # names compare case-insensitively, like HTTP.
+                    configured = {name.lower() for name in resolved.headers}
+                    if "chatgpt-account-id" not in configured:
+                        resolved.headers["chatgpt-account-id"] = record["account_id"]
+                    if "originator" not in configured:
+                        resolved.headers["originator"] = "pi"
                 elif provider == "github-copilot":
                     resolved.base_url = copilot_endpoint(key)
                     resolved.headers.update({**COPILOT_HEADERS, "x-github-api-version": "2026-06-01", "openai-intent": "conversation-panel", "X-Initiator": "user"})

@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from pi.coding_agent.auth import AuthStore
-from pi.coding_agent.config import Configuration
+from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.model_registry import ModelRegistry
 from pi.coding_agent.oauth_callback import start_oauth_callback_server
 from pi.coding_agent.subscription_auth import (login_claude, login_codex, login_copilot, login_kimi_coding, login_openai_chatgpt,
@@ -217,6 +217,25 @@ def test_codex_endpoint_body_and_headers(tmp_path):
     body = openai_responses.build_request(model, TranscriptContext([UserMessage(content="hello", timestamp=0)]), SimpleStreamOptions())
     assert "max_output_tokens" not in body and not body["store"]
     assert body["instructions"] and model.base_url == "https://chatgpt.com/backend-api"
+
+
+def test_codex_credentials_fill_only_missing_headers(tmp_path):
+    # Regression for B-AI-10: a models.json-configured originator must survive
+    # the credential refresh instead of being reset to "pi" on every request,
+    # while the credential-derived account-id is still filled in.
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "models.json", {"providers": {"openai-codex": {
+        "headers": {"Originator": "custom"},
+    }}})
+    registry = ModelRegistry(config)
+    registry.auth.set("openai-codex", {"type": "oauth", "access": jwt(), "refresh": "refresh",
+                                       "expires": time.time() + 3600, "account_id": "account"})
+    model = registry.resolve("openai-codex")
+    asyncio.run(model.get_api_key(model.provider))
+    # Case-variant configuration survives without a duplicate "originator".
+    assert model.headers["Originator"] == "custom"
+    assert "originator" not in model.headers
+    assert model.headers["chatgpt-account-id"] == "account"
 
 
 def test_claude_oauth_headers_and_tool_names(tmp_path, monkeypatch):

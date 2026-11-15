@@ -7,6 +7,7 @@ and ``validateToolArguments`` from ``packages/ai/src``.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import platform
 import time
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,14 @@ from .types import (
 )
 
 _SYSTEM_ROLES = ("system", "user", "assistant", "toolResult")
+
+
+def pi_user_agent() -> str:
+    """Default ``User-Agent`` identifying pi to providers (port of TS
+    ``getPiUserAgent``, packages/ai/src/utils/pi-user-agent.ts). Providers put
+    it in their header defaults, so model or caller headers can override it."""
+    system = platform.system().lower()
+    return f"pi ({'win32' if system == 'windows' else system} {platform.release()}; {platform.machine()})"
 
 
 def is_llm_message(message: Any) -> bool:
