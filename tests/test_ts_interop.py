@@ -232,3 +232,32 @@ def test_export_refuses_non_jsonl_and_overwrite(tmp_path):
     exported = manager.export_ts(str(tmp_path / "out.jsonl"))
     with pytest.raises(FileExistsError):
         write_ts_file(exported, manager)
+
+
+def test_tool_result_duration_ms_ts_roundtrip(tmp_path):
+    """ToolResultMessage.duration_ms maps to durationMs in TS session files (#10549: F-AI-02)."""
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.start_new()
+    manager.append(
+        ToolResultMessage(tool_call_id="t1", tool_name="bash", content=[TextContent(text="ok")],
+                          is_error=False, timestamp=1, duration_ms=1500)
+    )
+    exported = manager.export_ts(str(tmp_path / "out.jsonl"))
+    records = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text(encoding="utf-8").splitlines()]
+    message = next(r["message"] for r in records if r["type"] == "message")
+    assert message["durationMs"] == 1500
+    restored = read_ts_file(exported)["records"][0]["message"]
+    assert restored.duration_ms == 1500
+
+    lines = [
+        {"type": "session", "version": TS_VERSION, "id": "s1", "timestamp": 1700000000000, "cwd": "/tmp"},
+        {"type": "message", "id": "e1", "parentId": None, "timestamp": 1,
+         "message": {"role": "toolResult", "toolCallId": "t1", "toolName": "bash", "isError": False,
+                     "timestamp": 1, "durationMs": 42,
+                     "content": [{"type": "text", "text": "ok"}]}},
+    ]
+    path = tmp_path / "ts-duration.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    imported = read_ts_file(str(path))["records"][0]["message"]
+    assert isinstance(imported, ToolResultMessage)
+    assert imported.duration_ms == 42

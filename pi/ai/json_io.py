@@ -104,6 +104,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             details=data.get("details"),
             usage=usage_from_json(usage_data) if usage_data else None,
             nested_calls=nested_calls_from_json(data.get("nested_calls")),
+            duration_ms=data.get("duration_ms"),
         )
     raise ValueError(f"Unknown message role: {role!r}")
 

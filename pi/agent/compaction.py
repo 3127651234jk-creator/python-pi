@@ -304,8 +304,14 @@ def prefix_checkpoint(prefix: List[Message]) -> Optional[dict]:
 
     if not prefix:
         return None
+    last = asdict(prefix[-1])
+    # Checkpoints written before duration_ms existed fingerprint every other
+    # field identically; dropping the key when absent keeps those checkpoints
+    # matching after the upgrade instead of dropping the summary on resume.
+    if last.get("duration_ms") is None:
+        last.pop("duration_ms", None)
     digest = hashlib.sha256(
-        json.dumps(asdict(prefix[-1]), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        json.dumps(last, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
     return {"length": len(prefix), "last": digest}
 

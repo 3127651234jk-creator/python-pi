@@ -7,17 +7,34 @@ import queue
 import pytest
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers.base import make_partial
-from pi.ai.types import StreamErrorEvent, SystemMessage, UserMessage
+from pi.ai.types import StreamErrorEvent, SystemMessage, TextContent, UserMessage
 
 from pi.agent.agent import Agent
+from pi.agent.types import AgentToolResult, ToolExecutionEndEvent
 from pi.ai.models import resolve_model
 from pi.ai.providers.faux import reset_script_index
 from pi.coding_agent.config import Configuration
 from pi.coding_agent.model_registry import ModelRegistry
 from pi.coding_agent.rpc import JsonWriter, RpcServer
 from pi.coding_agent.rpc_client import RpcClient
+from pi.coding_agent.rpc_wire import event_to_ts
 from pi.coding_agent.cli import async_main
 from pi.coding_agent.session import SessionManager
+
+
+def test_rpc_wire_tool_execution_end_duration_mapping():
+    """tool_execution_end carries durationMs only for executed calls (#10549)."""
+    timed = ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="bash",
+        result=AgentToolResult(content=[TextContent(text="out")], details={}),
+        is_error=False, duration_ms=1500,
+    )
+    assert event_to_ts(timed)["durationMs"] == 1500
+    untimed = ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="bash",
+        result=AgentToolResult(content=[], details={}), is_error=False,
+    )
+    assert "durationMs" not in event_to_ts(untimed)
 
 
 def test_rpc_validation_state_and_events():

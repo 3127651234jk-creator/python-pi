@@ -259,6 +259,8 @@ class ToolExecutionEndEvent:
     result: Any = None
     is_error: bool = False
     parent_tool_call_id: Optional[str] = None
+    # Monotonic-clock execute() duration; None when the call never executed.
+    duration_ms: Optional[int] = None
 
 
 @dataclass

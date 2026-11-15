@@ -67,6 +67,24 @@ def test_session_roundtrip(tmp_path):
     assert loaded[3].details == {"k": 1}
 
 
+def test_session_roundtrip_preserves_duration_ms(tmp_path):
+    """ToolResultMessage.duration_ms survives the JSONL record (#10549: F-AI-02)."""
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.start_new()
+    manager.append(
+        ToolResultMessage(
+            tool_call_id="t1",
+            tool_name="bash",
+            content=[TextContent(text="contents")],
+            is_error=False,
+            timestamp=4,
+            duration_ms=1500,
+        )
+    )
+    loaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path)).load(manager.session_file)
+    assert loaded[0].duration_ms == 1500
+
+
 def test_latest_session_file(tmp_path):
     manager = SessionManager(session_dir=str(tmp_path), cwd=str(tmp_path))
     first = manager.start_new()

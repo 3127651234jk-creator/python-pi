@@ -179,6 +179,8 @@ def event_to_ts(event) -> dict:
     if kind == "tool_execution_end":
         result = {"type": kind, "toolCallId": event.tool_call_id, "toolName": event.tool_name,
                   "result": tool_result_to_ts(event.result), "isError": event.is_error}
+        if event.duration_ms is not None:
+            result["durationMs"] = event.duration_ms
         if event.parent_tool_call_id is not None:
             result["parentToolCallId"] = event.parent_tool_call_id
         return result

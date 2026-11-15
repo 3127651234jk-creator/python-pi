@@ -399,6 +399,20 @@ def make_agent(args: argparse.Namespace, cwd: str, registry: Optional[ModelRegis
     return agent
 
 
+def format_duration(ms: float) -> str:
+    """Adaptive duration label for the shell tools' Took line (port of the TS
+    shell renderers' formatDuration)."""
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total_seconds = int(seconds)
+    minutes = total_seconds // 60
+    remainder = total_seconds % 60
+    if minutes < 60:
+        return f"{minutes}m {remainder}s"
+    return f"{minutes // 60}h {minutes % 60}m {remainder}s"
+
+
 class CliRenderer:
     """Prints agent events to the terminal (markdown mode + tool output folding)."""
 
@@ -497,6 +511,11 @@ class CliRenderer:
                     print(f"{indent}  {line}", flush=True)
                 if len(lines) > self.fold:
                     print(f"{indent}  [+{len(lines) - self.fold} lines folded; /set fold_output 0 shows all]", flush=True)
+            if event.duration_ms is not None and event.tool_name in ("bash", "powershell"):
+                # The recorded execute() duration: monotonic and reloaded from
+                # the session record, unlike the wall-clock wait the command
+                # itself reports (matching the TS shell renderers' Took line).
+                print(f"{indent}  Took {format_duration(event.duration_ms)}", flush=True)
             for block in getattr(result, "content", None) or []:
                 if isinstance(block, ImageContent):
                     self.print_image_block(block)

@@ -95,6 +95,7 @@ def _from_dict(data: dict) -> Any:
             details=data.get("details"),
             usage=Usage(**{k: v for k, v in usage_data.items() if k in Usage.__dataclass_fields__}) if usage_data else None,
             nested_calls=nested_calls_from_json(data.get("nested_calls")),
+            duration_ms=data.get("duration_ms"),
         )
     raise ValueError(f"Unknown message role: {role!r}")
 

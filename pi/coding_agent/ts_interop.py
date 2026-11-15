@@ -151,7 +151,8 @@ def ts_message_to_ours(data: dict):
         return ToolResultMessage(tool_call_id=data.get("toolCallId", ""), tool_name=data.get("toolName", ""),
             content=blocks, is_error=bool(data.get("isError", False)), timestamp=timestamp,
             details=data.get("details"), usage=_ts_usage(usage) if usage else None,
-            nested_calls=_nested_calls_from_ts(data.get("nestedCalls")))
+            nested_calls=_nested_calls_from_ts(data.get("nestedCalls")),
+            duration_ms=data.get("durationMs"))
     raise ValueError(f"Unknown TS message role: {role!r}")
 
 
@@ -185,6 +186,8 @@ def our_message_to_ts(message) -> dict:
             result["usage"] = usage_to_ts(message.usage)
         if message.nested_calls is not None:
             result["nestedCalls"] = _nested_calls_to_ts(message.nested_calls)
+        if message.duration_ms is not None:
+            result["durationMs"] = message.duration_ms
         return result
     # AssistantMessage
     blocks = []

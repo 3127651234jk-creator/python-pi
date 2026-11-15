@@ -649,6 +649,7 @@ async def execute_tool_calls_sequential(
                 tool_name=tool_call.name,
                 result=finalized["result"],
                 is_error=finalized["is_error"],
+                duration_ms=finalized.get("duration_ms"),
             )
         )
         tool_result_message = create_tool_result_message(finalized)
@@ -741,6 +742,7 @@ async def execute_tool_calls_parallel(
                     tool_name=tool_call.name,
                     result=finalized["result"],
                     is_error=finalized["is_error"],
+                    duration_ms=finalized.get("duration_ms"),
                 )
             )
             return finalized
@@ -877,22 +879,32 @@ async def execute_prepared_tool_call(
             return
 
     tool: AgentTool = prepared["tool"]
+    # Timed like the TS loop: the clock wraps only the execute() run, so the
+    # before/after hooks are excluded from the reported duration.
+    started_at = time.perf_counter()
+
+    def elapsed_ms() -> int:
+        return round((time.perf_counter() - started_at) * 1000)
+
     try:
         result = await tool.execute(prepared["tool_call"].id, prepared["args"], signal, sink)
+        duration_ms = elapsed_ms()
         accepting_updates = False
         if update_tasks:
             await asyncio.gather(*update_tasks, return_exceptions=True)
-        return {"result": result, "is_error": bool(result.is_error)}
+        return {"result": result, "is_error": bool(result.is_error), "duration_ms": duration_ms}
     except AbortError:
+        duration_ms = elapsed_ms()
         accepting_updates = False
         if update_tasks:
             await asyncio.gather(*update_tasks, return_exceptions=True)
-        return {"result": create_error_tool_result("Operation aborted"), "is_error": True}
+        return {"result": create_error_tool_result("Operation aborted"), "is_error": True, "duration_ms": duration_ms}
     except Exception as exc:  # noqa: BLE001
+        duration_ms = elapsed_ms()
         accepting_updates = False
         if update_tasks:
             await asyncio.gather(*update_tasks, return_exceptions=True)
-        return {"result": create_error_tool_result(str(exc)), "is_error": True}
+        return {"result": create_error_tool_result(str(exc)), "is_error": True, "duration_ms": duration_ms}
     finally:
         accepting_updates = False
         for task in update_tasks:
@@ -952,7 +964,8 @@ async def finalize_executed_tool_call(
             result = create_error_tool_result(str(exc))
             is_error = True
 
-    return {"tool_call": prepared["tool_call"], "result": result, "is_error": is_error}
+    return {"tool_call": prepared["tool_call"], "result": result, "is_error": is_error,
+            "duration_ms": executed.get("duration_ms")}
 
 
 def create_error_tool_result(message: str) -> AgentToolResult:
@@ -976,6 +989,7 @@ def create_tool_result_message(finalized: Dict[str, Any]) -> ToolResultMessage:
         details=result.details,
         usage=usage,
         nested_calls=finalized.get("nested_calls"),
+        duration_ms=finalized.get("duration_ms"),
     )
 
 

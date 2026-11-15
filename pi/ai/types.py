@@ -301,6 +301,9 @@ class ToolResultMessage:
     usage: Optional[Usage] = None
     # Calls this tool made to other tools. Kept for the session record; not sent to the model.
     nested_calls: Optional[NestedToolCalls] = None
+    # Monotonic-clock duration of this call's execute() run in milliseconds.
+    # Calls that never executed (immediate results, blocked calls) have none.
+    duration_ms: Optional[int] = None
 
 
 Message = Union[SystemMessage, UserMessage, AssistantMessage, ToolResultMessage]

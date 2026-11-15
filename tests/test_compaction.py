@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import json
+from dataclasses import asdict
 
 import pytest
 
@@ -17,7 +20,8 @@ from pi.ai.providers import STREAM_FNS
 from pi.ai.providers import SimpleStreamOptions
 from pi.ai.retry import RetryPolicy
 from pi.ai.types import (
-    AssistantMessage, DoneEvent, StreamErrorEvent, TextContent, TranscriptContext, Usage, UserMessage,
+    AssistantMessage, DoneEvent, StreamErrorEvent, TextContent, ToolResultMessage,
+    TranscriptContext, Usage, UserMessage,
 )
 from pi.coding_agent.session import SessionManager
 from pi.coding_agent.usage import session_stats, summary_usage_extra
@@ -358,6 +362,29 @@ def test_restore_without_entry_resets_state():
     assert restore_compaction(fresh, [UserMessage(content="hello", timestamp=0)], None) is False
     assert fresh.prefix == []
     assert fresh.summary == ""
+
+
+def test_prefix_checkpoint_still_matches_records_written_before_duration_ms():
+    """A toolResult checkpoint fingerprint written before duration_ms existed
+    must keep matching after the upgrade (#10549), so resume keeps the summary."""
+    message = ToolResultMessage(
+        tool_call_id="t1", tool_name="bash", content=[TextContent(text="out")],
+        is_error=False, timestamp=5, details={},
+    )
+    previous_payload = {k: v for k, v in asdict(message).items() if k != "duration_ms"}
+    previous_digest = hashlib.sha256(
+        json.dumps(previous_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    assert prefix_checkpoint([message]) == {"length": 1, "last": previous_digest}
+
+    class Compactor:
+        summary = ""
+        prefix = []
+
+    compactor = Compactor()
+    data = {"summary": "compressed", "checkpoint": {"length": 1, "last": previous_digest}}
+    assert restore_compaction(compactor, [message], data) is True
+    assert compactor.summary == "compressed"
 
 
 def test_summary_request_usage_is_captured_across_chunks():

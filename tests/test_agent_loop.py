@@ -887,3 +887,103 @@ def test_agent_auto_retry_reports_aborted_retry_as_failed(monkeypatch):
         assert [(e.success, e.attempt, e.final_error) for e in ends] == [(False, 1, "Retry cancelled")]
 
     asyncio.run(scenario())
+
+
+def test_tool_results_carry_execute_duration(monkeypatch):
+    """Executed calls record a monotonic execute() duration; calls that never
+    ran (unknown tool) have none (#10549: F-AG-01/F-AI-02).
+
+    The loop clock is faked so the recorded duration is deterministic: real
+    sleeps cannot prove an elapsed-time lower bound because Windows timer
+    slewing can fire asyncio timers early.
+    """
+
+    async def scenario():
+        use_script(
+            [
+                {"text": "", "toolCalls": [
+                    {"id": "t1", "name": "slow", "arguments": {}},
+                    {"id": "t2", "name": "missing", "arguments": {}},
+                ]},
+                {"text": "done"},
+            ]
+        )
+
+        async def stream_fn(model, context, options=None):
+            async for event in faux.stream_faux(model, context, options):
+                yield event
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("pi.agent.agent_loop.time.perf_counter", lambda: clock["now"])
+
+        async def execute(tool_call_id, params, signal=None, on_update=None):
+            clock["now"] += 0.05
+            return AgentToolResult(content=[TextContent(text="ok")], details={})
+
+        slow = AgentTool(
+            name="slow", label="slow", description="do timed work",
+            parameters={"type": "object", "properties": {}}, execute=execute,
+        )
+        events = []
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[slow]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: events.append(e) or asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+
+        executed = next(m for m in messages if isinstance(m, ToolResultMessage) and m.tool_call_id == "t1")
+        immediate = next(m for m in messages if isinstance(m, ToolResultMessage) and m.tool_call_id == "t2")
+        assert executed.duration_ms == 50
+        assert immediate.duration_ms is None
+
+        end = next(e for e in events if isinstance(e, ToolExecutionEndEvent) and e.tool_call_id == "t1")
+        assert end.duration_ms == 50
+        skipped = next(e for e in events if isinstance(e, ToolExecutionEndEvent) and e.tool_call_id == "t2")
+        assert skipped.duration_ms is None
+
+    asyncio.run(scenario())
+
+
+def test_failed_tool_call_still_records_execute_duration(monkeypatch):
+    """A tool raising an error reports the time it ran before failing."""
+
+    async def scenario():
+        use_script(
+            [
+                {"text": "", "toolCalls": [{"id": "t1", "name": "boom", "arguments": {}}]},
+                {"text": "done"},
+            ]
+        )
+
+        async def stream_fn(model, context, options=None):
+            async for event in faux.stream_faux(model, context, options):
+                yield event
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("pi.agent.agent_loop.time.perf_counter", lambda: clock["now"])
+
+        async def execute(tool_call_id, params, signal=None, on_update=None):
+            clock["now"] += 0.02
+            raise ValueError("boom")
+
+        boom = AgentTool(
+            name="boom", label="boom", description="fail",
+            parameters={"type": "object", "properties": {}}, execute=execute,
+        )
+        messages = await run_agent_loop(
+            prompts=[UserMessage(content="go", timestamp=0)],
+            context=AgentContext(messages=[], tools=[boom]),
+            config=AgentLoopConfig(model=make_model(), convert_to_llm=default_convert_to_llm),
+            signal=None,
+            emit=lambda e: asyncio.sleep(0),
+            stream_fn=stream_fn,
+        )
+
+        result = next(m for m in messages if isinstance(m, ToolResultMessage))
+        assert result.is_error is True
+        assert result.duration_ms == 20
+
+    asyncio.run(scenario())

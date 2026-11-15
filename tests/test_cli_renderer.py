@@ -6,7 +6,7 @@ import pytest
 
 from pi.agent.types import AgentToolResult, MessageEndEvent, ToolExecutionStartEvent, ToolExecutionEndEvent
 from pi.ai.types import AssistantMessage, ImageContent, TextContent, Usage
-from pi.coding_agent.cli import CliRenderer
+from pi.coding_agent.cli import CliRenderer, format_duration
 
 
 @pytest.mark.parametrize("with_text", [False, True])
@@ -59,3 +59,50 @@ def test_renderer_labels_a_search_with_its_pattern(capsys):
     event = ToolExecutionStartEvent(tool_call_id="t", tool_name="find", args={"pattern": "*.py"})
     asyncio.run(CliRenderer()(event))
     assert "[find] *.py" in capsys.readouterr().out
+
+
+def test_renderer_shows_took_for_shell_results(capsys):
+    """Shell results show the recorded execute() duration (#10549: B-CA-01)."""
+    event = ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="bash",
+        result=AgentToolResult(content=[TextContent(text="out")]), is_error=False, duration_ms=1500,
+    )
+    asyncio.run(CliRenderer()(event))
+    assert "Took 1.5s" in capsys.readouterr().out
+
+
+def test_renderer_shows_took_for_errors_and_nested_calls(capsys):
+    event = ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="powershell",
+        result=AgentToolResult(content=[TextContent(text="nope")]), is_error=True,
+        duration_ms=62_000, parent_tool_call_id="p1",
+    )
+    asyncio.run(CliRenderer()(event))
+    output = capsys.readouterr().out
+    assert "error: nope" in output
+    assert "Took 1m 2s" in output
+
+
+def test_renderer_took_is_shell_only_and_needs_a_duration(capsys):
+    other = ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="read",
+        result=AgentToolResult(content=[TextContent(text="x")]), is_error=False, duration_ms=1500,
+    )
+    asyncio.run(CliRenderer()(other))
+    assert "Took" not in capsys.readouterr().out
+    untimed = ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="bash",
+        result=AgentToolResult(content=[TextContent(text="x")]), is_error=False,
+    )
+    asyncio.run(CliRenderer()(untimed))
+    assert "Took" not in capsys.readouterr().out
+
+
+def test_format_duration_matches_the_ts_shell_renderers():
+    assert format_duration(0) == "0.0s"
+    assert format_duration(1500) == "1.5s"
+    assert format_duration(59_900) == "59.9s"
+    assert format_duration(60_000) == "1m 0s"
+    assert format_duration(125_000) == "2m 5s"
+    assert format_duration(3_600_000) == "1h 0m 0s"
+    assert format_duration(3_725_000) == "1h 2m 5s"
