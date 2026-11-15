@@ -22,6 +22,46 @@ class ModelCost:
     cache_read: float = 0.0
     cache_write: float = 0.0
     cache_write_1h: float = 0.0
+    # Request-wide prompt-length pricing tiers; the highest matching input
+    # threshold applies to the full request (port of ModelCost.tiers).
+    tiers: Optional[List[Dict[str, Any]]] = None
+
+
+def parse_cost_tiers(raw: Any, base: Optional[Dict[str, float]] = None) -> Optional[List[Dict[str, Any]]]:
+    """Normalize pricing tiers from catalogs or models.json into snake_case dicts.
+
+    Accepts the models.dev wire shape (``{"tier": {"type": "context", "size":
+    N}, "input": ...}``), the normalized shape (``{"input_tokens_above": N,
+    ...}``), the gateway shape (``{"inputTokensAbove": N, ...}``), and
+    camelCase rate keys. Rates a tier does not list keep the base price;
+    entries without a valid numeric threshold are dropped. Returns None when
+    nothing valid remains.
+    """
+    if not isinstance(raw, list):
+        return None
+    tiers: List[Dict[str, Any]] = []
+    for tier in raw:
+        if not isinstance(tier, dict):
+            continue
+        above = tier.get("input_tokens_above")
+        if above is None:
+            above = tier.get("inputTokensAbove")
+        context = tier.get("tier")
+        if above is None and isinstance(context, dict) and context.get("type") == "context":
+            above = context.get("size")
+        if isinstance(above, bool) or not isinstance(above, (int, float)) or above < 0:
+            continue
+        entry: Dict[str, Any] = {"input_tokens_above": above}
+        for key in ("input", "output", "cache_read", "cache_write"):
+            value = tier.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                value = tier.get("cacheRead" if key == "cache_read" else "cacheWrite" if key == "cache_write" else key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                value = (base or {}).get(key)
+            if value is not None:
+                entry[key] = value
+        tiers.append(entry)
+    return tiers or None
 
 
 @dataclass
@@ -103,14 +143,35 @@ class Model:
 
     def calculate_cost(self, usage) -> Dict[str, float]:
         m = 1_000_000.0
-        input_cost = usage.input * self.costs.input / m
-        output_cost = usage.output * self.costs.output / m
-        cache_read_cost = usage.cache_read * self.costs.cache_read / m
-        cache_write_cost = usage.cache_write * self.costs.cache_write / m
-        # Anthropic extended-TTL rule: 1h cache writes bill at 2x base input
-        # unless the catalog carries a dedicated 1h price. Only Anthropic
-        # reports cache_write_1h tokens, so the fallback is safe elsewhere.
-        write_1h_price = self.costs.cache_write_1h or 2 * self.costs.input
+        # Prompt-length tiers: the highest matching input threshold prices the
+        # whole request (not just the part above it); the threshold counts
+        # every input-side token the provider bills. Rates a tier does not
+        # list keep the base price.
+        input_side = usage.input + usage.cache_read + usage.cache_write + usage.cache_write_1h
+        rates = {"input": self.costs.input, "output": self.costs.output,
+                 "cache_read": self.costs.cache_read, "cache_write": self.costs.cache_write}
+        matched = -1
+        for tier in self.costs.tiers or []:
+            if not isinstance(tier, dict):
+                continue
+            above = tier.get("input_tokens_above")
+            if isinstance(above, bool) or not isinstance(above, (int, float)):
+                continue
+            if input_side > above and above > matched:
+                for key in rates:
+                    value = tier.get(key)
+                    if not isinstance(value, bool) and isinstance(value, (int, float)):
+                        rates[key] = value
+                matched = above
+        input_cost = usage.input * rates["input"] / m
+        output_cost = usage.output * rates["output"] / m
+        cache_read_cost = usage.cache_read * rates["cache_read"] / m
+        cache_write_cost = usage.cache_write * rates["cache_write"] / m
+        # Anthropic extended-TTL rule: 1h cache writes bill at 2x the effective
+        # input rate unless the catalog carries a dedicated 1h price. Only
+        # Anthropic reports cache_write_1h tokens, so the fallback is safe
+        # elsewhere.
+        write_1h_price = self.costs.cache_write_1h or 2 * rates["input"]
         cache_write_1h_cost = usage.cache_write_1h * write_1h_price / m
         return {
             "input": input_cost,

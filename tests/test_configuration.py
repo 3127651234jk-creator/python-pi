@@ -12,6 +12,7 @@ from pi.ai.models import ModelError, resolve_model
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers.faux import reset_script_index
 from pi.coding_agent.auth import AuthStore, login_device, login_openrouter
+from pi.coding_agent.catalog_sync import normalize_catalog, save_cache
 from pi.coding_agent.cli import (CliRenderer, async_main, authenticate, build_parser, interactive_loop,
                                  login_provider_options, make_agent)
 from pi.coding_agent.config import Configuration, write_json
@@ -64,6 +65,55 @@ def test_model_capabilities_and_credentials(config, monkeypatch):
     assert registry.auth.get("local") is None
     if os.name != "nt":
         assert (registry.auth.path.stat().st_mode & 0o777) == 0o600
+
+
+def _synced_catalog() -> dict:
+    return normalize_catalog({
+        "openai": {"models": {"gpt-synced": {
+            "name": "GPT Synced", "reasoning": False, "input": ["text"],
+            "limit": {"context": 128000, "output": 8192},
+            "cost": {"input": 1, "output": 2, "cache_read": 0.1, "cache_write": 0.2,
+                     "tiers": [{"input": 2, "tier": {"type": "context", "size": 100000}}]},
+        }}},
+        "anthropic": {"models": {"claude-synced": {
+            "name": "Claude Synced", "reasoning": True, "input": ["text"],
+            "limit": {"context": 200000, "output": 64000},
+            "cost": {"input": 1, "output": 2},
+        }}},
+    })
+
+
+def test_synced_catalog_models_inherit_the_provider_endpoint(config, monkeypatch):
+    """models.dev sync used to fail reload: synced entries had no endpoint."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    save_cache(config.agent_dir, _synced_catalog())
+    registry = ModelRegistry(config)
+    assert registry.models["openai/gpt-synced"].base_url == "https://api.openai.com/v1"
+    assert registry.models["anthropic/claude-synced"].base_url == "https://api.anthropic.com"
+    # Pricing tiers survive the sync (B-AI-07).
+    assert registry.models["openai/gpt-synced"].costs.tiers == [
+        {"input_tokens_above": 100000, "input": 2, "output": 2, "cache_read": 0.1, "cache_write": 0.2}]
+    # Resolution reuses the provider endpoint instead of raising on an empty URL.
+    assert registry.resolve("openai", "gpt-synced").base_url == "https://api.openai.com/v1"
+
+
+def test_synced_catalog_models_follow_env_endpoints(config, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openai-proxy.example/v1")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://anthropic-proxy.example")
+    save_cache(config.agent_dir, _synced_catalog())
+    registry = ModelRegistry(config)
+    assert registry.models["openai/gpt-synced"].base_url == "https://openai-proxy.example/v1"
+    assert registry.models["anthropic/claude-synced"].base_url == "https://anthropic-proxy.example"
+
+
+def test_user_provider_settings_override_the_default_endpoint(config, monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    write_json(config.agent_dir / "models.json",
+               {"providers": {"openai": {"base_url": "https://gateway.example/v1"}}})
+    registry = ModelRegistry(config)
+    assert registry.models["openai/gpt-4o"].base_url == "https://gateway.example/v1"
+    assert registry.resolve("openai", "gpt-4o").base_url == "https://gateway.example/v1"
 
 
 def test_no_auth_local_provider_and_model_switch_metadata(config):

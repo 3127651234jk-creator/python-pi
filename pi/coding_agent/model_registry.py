@@ -6,7 +6,7 @@ from dataclasses import replace
 from typing import Dict, Optional
 from urllib.parse import urlsplit
 
-from ..ai.models import Model, ModelCost, ModelError, list_catalog, resolve_model
+from ..ai.models import Model, ModelCost, ModelError, list_catalog, parse_cost_tiers, resolve_model
 from .auth import AuthStore
 from .catalog_sync import sync_overlay
 from .config import Configuration, read_json
@@ -27,6 +27,20 @@ def validate_url(value: str) -> None:
     parsed = urlsplit(value)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise ModelError("Endpoint must be an HTTP(S) URL without embedded credentials")
+
+
+def default_base_url(provider: str) -> str:
+    """Shipped endpoint for providers whose models have no per-model base_url.
+
+    Mirrors resolve_model's precedence (PI_PY_BASE_URL, then the provider
+    variable, then the public host) so catalog, synced and models.json models
+    all resolve to the same endpoint. Without it, models synced from the online
+    catalog for ``openai``/``anthropic`` have no endpoint at all.
+    """
+    generic = os.environ.get("PI_PY_BASE_URL")
+    if provider == "anthropic":
+        return generic or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+    return generic or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
 
 
 class ModelRegistry:
@@ -83,7 +97,9 @@ class ModelRegistry:
             "amazon-bedrock": {"api": "bedrock-converse-stream", "auth_required": False,
                 "base_url": "https://bedrock-runtime." + (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1") + ".amazonaws.com",
                 "models": [{"id": "anthropic.claude-3-5-sonnet-20241022-v2:0", "input": ["text", "image"], "context_window": 200000}]},
-            "openai": {}, "anthropic": {}, "faux": {}, "openrouter": {
+            "openai": {"base_url": default_base_url("openai")},
+            "anthropic": {"base_url": default_base_url("anthropic")},
+            "faux": {}, "openrouter": {
             "api": "openai-completions", "base_url": "https://openrouter.ai/api/v1",
             "models": [{"id": "openrouter/auto", "name": "OpenRouter Auto"}],
         }}
@@ -183,9 +199,17 @@ class ModelRegistry:
                 changes = {k: v for k, v in entry.items() if k not in ("id", "costs")}
                 if "costs" in entry:
                     costs = entry["costs"]
-                    if not isinstance(costs, dict) or set(costs) - set(ModelCost.__dataclass_fields__) or not all(type(v) in (int, float) and v >= 0 for v in costs.values()):
+                    if not isinstance(costs, dict) or set(costs) - set(ModelCost.__dataclass_fields__):
                         raise ModelError("Invalid model costs")
-                    changes["costs"] = ModelCost(**costs)
+                    if not all(type(v) in (int, float) and v >= 0 for k, v in costs.items() if k != "tiers"):
+                        raise ModelError("Invalid model costs")
+                    raw_tiers = costs.get("tiers")
+                    tiers = None
+                    if raw_tiers is not None:
+                        tiers = parse_cost_tiers(raw_tiers, base={k: costs[k] for k in ("input", "output", "cache_read", "cache_write") if k in costs})
+                        if tiers is None:
+                            raise ModelError("Invalid model costs")
+                    changes["costs"] = ModelCost(**{k: v for k, v in costs.items() if k != "tiers"}, tiers=tiers)
                 model = replace(base, **changes)
                 if any(type(getattr(model, field)) is not int or getattr(model, field) <= 0 for field in ("context_window", "max_tokens")):
                     raise ModelError("Context window and output limit must be positive integers")

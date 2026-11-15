@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from ..ai.models import parse_cost_tiers
 from .config import read_json, write_json
 
 MODELS_DEV_URL = "https://models.dev/api.json"
@@ -96,6 +97,11 @@ def normalize_catalog(data: dict) -> Dict[str, dict]:
             rates = {k: cost.get(k) for k in ("input", "output", "cache_read", "cache_write")}
             if all(isinstance(v, (int, float)) for v in rates.values()):
                 entry["costs"] = rates
+                # Keep prompt-length pricing tiers; long prompts bill at the
+                # tier rate for the whole request (B-AI-07).
+                tiers = parse_cost_tiers(cost.get("tiers"), base=rates)
+                if tiers:
+                    entry["costs"] = {**rates, "tiers": tiers}
             entries.append(entry)
         if entries:
             providers[name] = {"models": entries}

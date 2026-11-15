@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from ..ai.models import parse_cost_tiers
 from ..ai.providers.base import trust_env_for_url
 from .config import read_json, write_json
 from .subscription_auth import DEFAULT_RADIUS_GATEWAY, normalize_radius_gateway
@@ -80,6 +81,11 @@ def normalize_gateway_config(data: Any, gateway: str) -> Dict[str, Any]:
                  and raw["cost"][wire] >= 0}
         if costs:
             entry["costs"] = costs
+            # Gateway prompt-length pricing tiers price the whole request.
+            tiers = parse_cost_tiers(raw["cost"].get("tiers"),
+                                     base={k: costs[k] for k in ("input", "output", "cache_read", "cache_write") if k in costs})
+            if tiers:
+                entry["costs"] = {**costs, "tiers": tiers}
         level_map = raw.get("thinkingLevelMap")
         if isinstance(level_map, dict) and all(isinstance(key, str) for key in level_map):
             entry["thinking_level_map"] = level_map
