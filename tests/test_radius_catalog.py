@@ -133,6 +133,31 @@ def test_user_models_json_models_win(tmp_path):
     assert reg.resolve("radius", "max").context_window == 200000
 
 
+def test_gateway_catalog_replaces_other_radius_sources(tmp_path):
+    """A cached gateway catalog replaces the radius model list (B-AI-04): an
+    org owner disabling a model must remove it from the registry, not leave it
+    merged in from an earlier source."""
+    agent_dir = tmp_path / "agent"
+
+    def make():
+        reg = ModelRegistry(Configuration(tmp_path, agent_dir))
+        reg.register_extension_providers({
+            "radius": {"models": [{"id": "legacy", "context_window": 1000}]}
+        })
+        return reg
+
+    # Without a catalog the pre-existing entries stand (baseline fallback).
+    reg = make()
+    assert "radius/legacy" in reg.models
+    assert reg.resolve("radius", "legacy").context_window == 1000
+
+    # With a cached catalog that does not contain "legacy", it is replaced.
+    save_cache(agent_dir, "https://gw.example", normalize_gateway_config(GATEWAY_CONFIG, "https://gw.example"))
+    reg = make()
+    radius_ids = {model.id for model in reg.models.values() if model.provider == "radius"}
+    assert radius_ids == {"balanced", "max"}
+
+
 def test_radius_overlay_gating(tmp_path):
     agent_dir = tmp_path / "agent"
     save_cache(agent_dir, "https://gw.example", normalize_gateway_config(GATEWAY_CONFIG, "https://gw.example"))

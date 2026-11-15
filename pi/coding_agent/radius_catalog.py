@@ -2,8 +2,10 @@
 
 Fetches the gateway model catalog from ``/v1/config`` (port of
 ``packages/ai/src/providers/radius-config.ts``), maps it onto registry model
-entries, and caches the result in the agent directory. The cache overlays the
-registry on reload; model ids the user configured in models.json still win.
+entries, and caches the result in the agent directory. The cached catalog
+replaces the provider's model list on reload (org owners can disable models,
+so a known catalog must not merge with the pre-existing entries); model ids
+the user configured in models.json still win.
 """
 
 from __future__ import annotations
@@ -130,7 +132,12 @@ def load_cache(agent_dir: Path, max_age: float = CACHE_MAX_AGE) -> Optional[dict
 
 
 def radius_overlay(agent_dir: Path, enabled: bool = True) -> dict:
-    """Cached gateway catalog as a provider overlay for ModelRegistry.reload()."""
+    """Cached gateway catalog as a replacement overlay for ModelRegistry.reload().
+
+    The returned model list is the provider's full model list while it is
+    applied (not an increment); an empty or expired cache yields no overlay,
+    leaving the pre-existing entries in place.
+    """
     if not enabled:
         return {}
     cached = load_cache(agent_dir)

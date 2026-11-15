@@ -100,15 +100,15 @@ class ModelRegistry:
             extra = [entry for entry in overlay.get("models", []) if entry.get("id") not in known]
             if extra:
                 merged[name] = {**merged.get(name, {}), "models": merged.get(name, {}).get("models", []) + extra}
-        # Discovered Radius gateway models overlay the provider (including a user
-        # models.json configuration) with real capability and cost data; ids the
-        # user declared keep their explicit settings.
+        # A discovered Radius gateway catalog is authoritative for the account
+        # (org owners can disable models): a fetched or cached catalog REPLACES
+        # the provider's model list instead of appending to it, so disabled
+        # models stop being listed. Without a catalog the pre-existing entries
+        # stand. User-declared radius models in models.json still win; they are
+        # resolved after this loop.
         for name, overlay in radius_overlay(self.config.agent_dir, self.config.settings.get("sync_catalog", True)).items():
             entry = merged.get(name, {})
-            known = {model.get("id") for model in entry.get("models", [])}
-            extra = [model for model in overlay["models"] if isinstance(model, dict) and model.get("id") not in known]
-            if extra:
-                merged[name] = {**entry, "models": entry.get("models", []) + extra}
+            merged[name] = {**entry, "models": [model for model in overlay["models"] if isinstance(model, dict)]}
         for name, provider in providers.items():
             if not isinstance(name, str) or not name or not isinstance(provider, dict):
                 raise ModelError("Each provider must be an object")
