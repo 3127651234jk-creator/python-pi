@@ -506,6 +506,32 @@ def test_finish_reason_without_done_sentinel(monkeypatch, reason):
     assert events[-1].message.content[0].arguments == {"path": "x"}
 
 
+def test_mistral_style_finish_reason_error_is_retryable(monkeypatch):
+    # Regression for #10487 (semantics of TS mistral-raw-stop-reason.test.ts):
+    # Mistral via OpenAI-compatible endpoints reports transient server failures
+    # as finish_reason "error"; the failing turn must classify as retryable
+    # instead of ending the run, and the raw reason is preserved.
+    from pi.ai.providers import openai_completions
+    from pi.ai.retry import is_retryable_assistant_error
+
+    _canned_send(monkeypatch, [
+        {"choices": [{"delta": {}, "finish_reason": "error"}]},
+        "[DONE]",
+    ])
+
+    async def run():
+        return [event async for event in openai_completions.stream_openai_completions(
+            make_model("openai"), user_context())]
+
+    events = asyncio.run(run())
+    assert isinstance(events[-1], StreamErrorEvent)
+    assert events[-1].reason == "error"
+    assert events[-1].error.stop_reason == "error"
+    assert events[-1].error.raw_stop_reason == "error"
+    assert "Provider finish_reason: error" in events[-1].error.error_message
+    assert is_retryable_assistant_error(events[-1].error) is True
+
+
 def test_bare_eof_does_not_complete_partial_tool_call(monkeypatch):
     from pi.ai.providers import openai_completions
 

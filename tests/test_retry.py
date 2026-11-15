@@ -362,6 +362,19 @@ def test_matches_server_busy_errors(text):
     assert is_retryable_assistant_error(error_message(text)) is True
 
 
+def test_retries_mistral_finish_reason_error():
+    # Regression for #10487: Mistral (also via OpenAI-compatible endpoints)
+    # reports transient server failures as finish_reason "error", which the
+    # provider surfaces as "Provider error: RuntimeError: Provider finish_reason:
+    # error". Other unknown finish reasons stay non-retryable.
+    assert is_retryable_assistant_error(
+        error_message("Provider error: RuntimeError: Provider finish_reason: error")
+    ) is True
+    assert is_retryable_assistant_error(
+        error_message("Provider error: RuntimeError: Provider finish_reason: unmapped_error")
+    ) is False
+
+
 def test_keeps_provider_limit_errors_non_retryable():
     assert is_retryable_assistant_error(error_message("429 quota exceeded")) is False
 

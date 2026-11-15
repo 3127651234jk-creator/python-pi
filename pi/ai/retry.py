@@ -60,6 +60,10 @@ RETRYABLE_PROVIDER_ERROR_PATTERN = _build_provider_error_pattern([
     "service.?unavailable",
     "server.?error",
     "internal.?error",
+    # Mistral reports transient server failures as finish_reason "error" — also
+    # via OpenAI-compatible endpoints, where the message surfaces as
+    # "Provider error: RuntimeError: Provider finish_reason: error" (#10487).
+    "finish_reason: error",
     # Wrapper/provider text for transient upstream failures, including OpenRouter
     # "Provider returned error" responses (#2264).
     "provider.?returned.?error",
