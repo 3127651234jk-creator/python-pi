@@ -42,6 +42,10 @@ NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = _build_provider_error_pattern([
 RETRYABLE_PROVIDER_ERROR_PATTERN = _build_provider_error_pattern([
     # Generic provider load, HTTP status, and server-side transient failures.
     "overloaded",
+    # Aggregating gateways report a busy server pool as a plain error string
+    # instead of an HTTP 429/503 (#10543).
+    "server_busy",
+    "servers are currently busy",
     "currently experiencing high demand",
     "model is at capacity",
     "rate.?limit",

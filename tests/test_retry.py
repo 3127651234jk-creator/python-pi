@@ -350,6 +350,18 @@ def test_matches_azure_peak_load_capacity_errors():
     assert is_retryable_assistant_error(error_message(AZURE_PEAK_LOAD_ERROR)) is True
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "server_busy",
+        "All inference servers are currently busy. Please try again shortly.",
+    ],
+)
+def test_matches_server_busy_errors(text):
+    # Regression for #10543.
+    assert is_retryable_assistant_error(error_message(text)) is True
+
+
 def test_keeps_provider_limit_errors_non_retryable():
     assert is_retryable_assistant_error(error_message("429 quota exceeded")) is False
 
