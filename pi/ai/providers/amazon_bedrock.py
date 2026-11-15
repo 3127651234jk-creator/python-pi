@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from typing import Optional
+from typing import List, Optional
 
 try:
     import boto3
@@ -22,10 +22,47 @@ from .blocks import BlockEvents
 # Converse top-level keys the adapter always builds itself.
 _STRUCTURAL_KEYS = ("modelId", "messages", "system")
 
+# OpenAI GPT models (GPT-5.x, GPT-6) take a nested `reasoning.effort` and reject `minimal`.
+_GPT_EFFORT = {"minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
+# gpt-oss takes a flat `reasoning_effort` and only accepts low, medium and high.
+_GPT_OSS_EFFORT = {"minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
+
 
 def _is_nova(model_id: str) -> bool:
     lowered = model_id.lower()
     return lowered.startswith("amazon.") and "nova" in lowered
+
+
+def _model_match_candidates(model) -> List[str]:
+    """Id/name match candidates (port of TS ``getModelMatchCandidates``):
+    lowercased values, plus a variant folding whitespace, underscores, dots and
+    colons to dashes so catalog spellings like ``GPT_OSS`` still match."""
+    values = [model.id, model.name] if model.name else [model.id]
+    candidates: List[str] = []
+    for value in values:
+        lowered = value.lower()
+        candidates.append(lowered)
+        candidates.append(re.sub(r"[\s_.:]+", "-", lowered))
+    return candidates
+
+
+def _openai_reasoning_fields(model, reasoning: str) -> Optional[dict]:
+    """Additional fields that carry the reasoning level to OpenAI models on
+    Bedrock (port of the gpt branches in TS ``buildAdditionalModelRequestFields``,
+    #9331/#10142): without them these models always run at the Bedrock default
+    effort. ``model.thinking_level_map`` takes priority over the static maps; a
+    level outside the known set is ignored (TS drops the undefined field) so
+    unvalidated entry points such as env/settings/session replay cannot raise."""
+    candidates = _model_match_candidates(model)
+    if any("gpt-oss" in candidate for candidate in candidates):
+        effort = _GPT_OSS_EFFORT.get(reasoning)
+        return {"reasoning_effort": effort} if effort is not None else None
+    if any("gpt-" in candidate for candidate in candidates):
+        mapped = (model.thinking_level_map or {}).get(reasoning)
+        effort = mapped if isinstance(mapped, str) else _GPT_EFFORT.get(reasoning)
+        if effort is not None:
+            return {"reasoning": {"effort": effort}}
+    return None
 
 
 def _apply_model_params(body: dict, model, options, max_tokens: Optional[int] = None) -> None:
@@ -41,6 +78,10 @@ def _apply_model_params(body: dict, model, options, max_tokens: Optional[int] = 
     passes the already-clamped output budget so params cannot override it.
     """
     params = model.params or {}
+    if "additionalModelRequestFields" in params and not isinstance(params["additionalModelRequestFields"], dict):
+        # Both reasoning branches write into this object; reject an invalid
+        # shape here instead of failing later with a bare TypeError.
+        raise ValueError("Model params.additionalModelRequestFields must be an object")
     for key, value in params.items():
         if key in _STRUCTURAL_KEYS or key == "top_k":
             continue
@@ -105,12 +146,21 @@ def build_request(model, context, options):
         body["inferenceConfig"]["temperature"] = options.temperature
     _apply_model_params(body, model, options,
                         max_tokens=max_tokens if options and options.max_tokens else None)
-    if model.reasoning and "anthropic." in model.id and options.reasoning not in (None, "off"):
-        budget = min(thinking_budget(options.reasoning), body["inferenceConfig"]["maxTokens"] - 1024)
-        if budget < 1024:
-            raise ValueError("Bedrock thinking requires an output budget of at least 2048 tokens")
-        body.setdefault("additionalModelRequestFields", {})["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        body["inferenceConfig"].pop("temperature", None)
+    if model.reasoning and options.reasoning not in (None, "off"):
+        if "anthropic." in model.id:
+            budget = min(thinking_budget(options.reasoning), body["inferenceConfig"]["maxTokens"] - 1024)
+            if budget < 1024:
+                raise ValueError("Bedrock thinking requires an output budget of at least 2048 tokens")
+            body.setdefault("additionalModelRequestFields", {})["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            body["inferenceConfig"].pop("temperature", None)
+        else:
+            openai_fields = _openai_reasoning_fields(model, options.reasoning)
+            if openai_fields:
+                fields = body.setdefault("additionalModelRequestFields", {})
+                for key, value in openai_fields.items():
+                    # Explicit params keep precedence over the derived value.
+                    if key not in fields:
+                        fields[key] = value
     if system:
         body["system"] = [{"text": get_system_message_text(system)}]
         if cache_point:

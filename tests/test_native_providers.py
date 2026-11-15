@@ -417,6 +417,79 @@ def test_bedrock_thinking_param_precedence():
     assert "temperature" not in body["inferenceConfig"]
 
 
+def test_bedrock_sends_reasoning_effort_to_gpt_oss():
+    # Regression for B-AI-09 (#9331/#10142): without this the model always ran
+    # at the Bedrock default effort.
+    model = bedrock_model("openai.gpt-oss-120b-1:0", reasoning=True)
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="medium"))
+    assert body["additionalModelRequestFields"]["reasoning_effort"] == "medium"
+    # gpt-oss only accepts low/medium/high: minimal and the extended levels clamp.
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="minimal"))
+    assert body["additionalModelRequestFields"]["reasoning_effort"] == "low"
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="max"))
+    assert body["additionalModelRequestFields"]["reasoning_effort"] == "high"
+
+
+def test_bedrock_sends_reasoning_effort_to_gpt_models():
+    model = bedrock_model("openai.gpt-5.1-1:0", reasoning=True)
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="minimal"))
+    assert body["additionalModelRequestFields"]["reasoning"] == {"effort": "low"}
+    # Extended levels pass through to the nested effort.
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="xhigh"))
+    assert body["additionalModelRequestFields"]["reasoning"] == {"effort": "xhigh"}
+    # thinking_level_map takes priority over the static mapping.
+    model.thinking_level_map = {"high": "none"}
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="high"))
+    assert body["additionalModelRequestFields"]["reasoning"] == {"effort": "none"}
+
+
+def test_bedrock_gpt_reasoning_matches_by_model_name():
+    # Application inference profiles can carry the family in the name; the
+    # name match folds GPT_OSS-style spellings to gpt-oss.
+    model = bedrock_model("arn:aws:bedrock:us-east-1:123456789012:foundation-model/unknown-id", reasoning=True)
+    model.name = "GPT_OSS_20B"
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="low"))
+    assert body["additionalModelRequestFields"]["reasoning_effort"] == "low"
+
+
+def test_bedrock_gpt_reasoning_param_precedence():
+    # Explicit params keep precedence over the derived reasoning value.
+    model = bedrock_model("openai.gpt-oss-120b-1:0", reasoning=True,
+        params={"additionalModelRequestFields": {"reasoning_effort": "low"}})
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="high"))
+    assert body["additionalModelRequestFields"]["reasoning_effort"] == "low"
+
+
+def test_bedrock_other_families_get_no_reasoning_fields():
+    model = bedrock_model("amazon.nova-pro-v1:0", reasoning=True)
+    body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="high"))
+    assert "additionalModelRequestFields" not in body
+
+
+def test_bedrock_unknown_reasoning_level_is_ignored():
+    # Env/settings/session replay do not validate the level; degrade like TS
+    # (drop the undefined field) instead of raising from the effort maps.
+    for model_id in ("openai.gpt-oss-120b-1:0", "openai.gpt-5.1-1:0"):
+        model = bedrock_model(model_id, reasoning=True)
+        body = amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="future-level"))
+        assert "additionalModelRequestFields" not in body
+
+
+def test_bedrock_non_object_additional_model_request_fields_rejected():
+    # An invalid params shape used to fail with a bare TypeError in the
+    # reasoning branches (always for Anthropic thinking, only at write time for
+    # OpenAI effort); reject it up front with an actionable message.
+    for model_id in ("anthropic.claude-sonnet-4-5", "openai.gpt-oss-120b-1:0"):
+        for bad in ("not-an-object", None, ["x"]):
+            model = bedrock_model(model_id, reasoning=True, params={"additionalModelRequestFields": bad})
+            with pytest.raises(ValueError, match="additionalModelRequestFields must be an object"):
+                amazon_bedrock.build_request(model, context(), SimpleStreamOptions(reasoning="high"))
+    # Validation does not depend on a reasoning level being requested.
+    model = bedrock_model("amazon.nova-pro-v1:0", params={"additionalModelRequestFields": "bad"})
+    with pytest.raises(ValueError, match="additionalModelRequestFields must be an object"):
+        amazon_bedrock.build_request(model, context(), SimpleStreamOptions())
+
+
 # ---------------------------------------------------------------------------
 # JSON round-trip for the new block and tool fields
 # ---------------------------------------------------------------------------
