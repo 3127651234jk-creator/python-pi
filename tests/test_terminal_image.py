@@ -39,6 +39,14 @@ def test_detect_capabilities_for_known_terminals():
     assert tmux.images is None and tmux.hyperlinks is True
 
 
+def test_detect_capabilities_herdr_supports_hyperlinks():
+    # B-TUI-01: Herdr forwards OSC 8 hyperlinks. It runs inside another terminal
+    # whose leaked variables (e.g. KITTY_WINDOW_ID) must not enable image protocols.
+    herdr = ti.detect_capabilities({"TERM_PROGRAM": "herdr", "KITTY_WINDOW_ID": "1"})
+    assert herdr.images is None and herdr.hyperlinks is True
+    assert ti.detect_capabilities({"TERM_PROGRAM": "Herdr"}).hyperlinks is True
+
+
 def test_detect_capabilities_honors_overrides():
     caps = ti.detect_capabilities(
         {"PI_IMAGE_PROTOCOL": "iterm2", "PI_TRUE_COLOR": "0", "PI_HYPERLINKS": "0"})
