@@ -191,7 +191,9 @@ DESCRIPTION_INTRO = (
 
 DESCRIPTION_GLOBALS = (
     "Globals:\n"
-    "- text(value), image(dataUriOrImageBlock), print(...), and `result` add output; exit(value) ends the script.\n"
+    "- text(value), image(dataUriOrImageBlock), print(...), and `result` add output; exit(value) ends the script. "
+    "With several text items, each starts with a `==> text N/M <==` line, and console lines follow the other "
+    "output in one `<console_output>` block.\n"
     "- store(key, value) and load(key) keep JSON values across codemode calls; store(key) deletes.\n"
     "- ALL_TOOLS lists every tool; search_tools(query, {limit?, namespace?}), "
     "describe_tool(name), describe_namespace(name) find unlisted tools, such as MCP tools."
@@ -313,17 +315,35 @@ def _result_text(result: AgentToolResult) -> str:
 
 
 def _build_output_items(output_items: List[dict], extra_text: str) -> List[Union[TextContent, ImageContent]]:
-    """Output items in production order: text first, images after, then the extra text."""
+    """Output items in production order: text first, images after, then the extra text.
 
-    items: List[Union[TextContent, ImageContent]] = []
+    Providers join adjacent text blocks with a newline or with nothing, so with more than one
+    text item (text() or the returned value) each starts with a ``==> text N/M <==`` line;
+    console lines follow all other output in one ``<console_output>`` block.
+    """
+
+    texts: List[str] = []
+    console_lines: List[str] = []
     for item in output_items:
-        if item.get("type") == "text":
-            items.append(TextContent(text=str(item.get("text", ""))))
+        if item.get("type") != "text":
+            continue
+        if item.get("console"):
+            console_lines.append(str(item.get("text", "")))
+        else:
+            texts.append(str(item.get("text", "")))
     if extra_text:
-        items.append(TextContent(text=extra_text))
+        texts.append(extra_text)
+    items: List[Union[TextContent, ImageContent]] = []
+    if len(texts) > 1:
+        items.extend(TextContent(text=f"==> text {index}/{len(texts)} <==\n{text}")
+                     for index, text in enumerate(texts, 1))
+    elif texts:
+        items.append(TextContent(text=texts[0]))
     for item in output_items:
         if item.get("type") == "image" and isinstance(item.get("data"), str):
             items.append(ImageContent(data=item["data"], mime_type=str(item.get("mime_type", "image/png"))))
+    if console_lines:
+        items.append(TextContent(text="<console_output>\n" + "\n".join(console_lines) + "\n</console_output>"))
     return items
 
 
@@ -338,7 +358,10 @@ def _failed_result(call_id: str, output_items: List[dict], calls: List[dict], er
     else:
         summary = "No tool calls were made."
     header = f"Script failed\nWall time {wall_time:.1f} seconds\nOutput:"
-    items = _build_output_items(output_items, f"{error_text}\n\n{summary}".strip())
+    # The error wrapper is not script output: it stays unnumbered and follows the
+    # console block, like the TS host pushing the error after formatOutput.
+    items = _build_output_items(output_items, "")
+    items.append(TextContent(text=f"{error_text}\n\n{summary}".strip()))
     return AgentToolResult(content=[TextContent(text=header)] + items,
                            details={"calls": calls}, is_error=True)
 

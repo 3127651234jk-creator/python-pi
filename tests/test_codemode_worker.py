@@ -389,6 +389,10 @@ def test_worker_output_items_and_serialization(tmp_path):
         assert run.value == "end"
         assert texts(run) == ["plain", '{"k": [1, true, null]}',
                               'a 1 None {"x": "y"}', "log", "err"]
+        # print/console items carry the console flag so the host groups them into
+        # one <console_output> block; text() items do not.
+        assert [item.get("console") for item in run.output if item.get("type") == "text"] == \
+            [None, None, True, True, True]
 
     asyncio.run(scenario())
 

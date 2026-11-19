@@ -450,7 +450,10 @@ WORKER_SOURCE = textwrap.dedent('''
         class Console:
             @staticmethod
             def _log(*args):
-                emit({"type": "text", "text": " ".join(stringify(a) for a in args)})
+                # console: true lets the host group these lines into one
+                # <console_output> block after the text() output.
+                emit({"type": "text", "console": True,
+                      "text": " ".join(stringify(a) for a in args)})
 
         console = type("ConsoleType", (), {
             "log": staticmethod(lambda *a: Console._log(*a)),

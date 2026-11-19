@@ -344,12 +344,68 @@ def test_output_ordering_texts_result_then_images():
         texts = texts_of(result)
         assert texts[0].startswith("Script completed\nWall time ")
         assert texts[0].endswith(" seconds\nOutput:")
-        # Produced text first, then the result value, then the image group.
-        assert texts[1:5] == ["t1", "t2", "t3", "RES"]
-        assert isinstance(result.content[-1], ImageContent)
+        # Text items carry ==> text N/M <== heads so providers cannot blur item
+        # boundaries; print output follows the images in one console block.
+        assert texts[1:4] == ["==> text 1/3 <==\nt1", "==> text 2/3 <==\nt3", "==> text 3/3 <==\nRES"]
+        assert isinstance(result.content[-2], ImageContent)
+        assert texts[-1] == "<console_output>\nt2\n</console_output>"
         save_notes = [text for text in texts if text.startswith("[Image saved to ")]
         assert len(save_notes) == 1
         assert save_notes[0].startswith("[Image saved to ") and "image/png, 70 bytes)]" in save_notes[0]
+
+    asyncio.run(scenario())
+
+
+# B-CA-02: multiple text()/console outputs are separated so the model can tell them apart.
+
+
+def test_output_separates_multiple_text_items_with_headers():
+    async def scenario():
+        tool = create_codemode_tool([leaf("echo")])
+        code = "text('first')\ntext('second')\n"
+        result = await tool.execute("c", {"code": code}, None, None)
+        assert texts_of(result)[1:3] == ["==> text 1/2 <==\nfirst", "==> text 2/2 <==\nsecond"]
+        # A single text item has no header.
+        single = await tool.execute("c", {"code": "text('only')\n"}, None, None)
+        assert texts_of(single)[1] == "only"
+
+    asyncio.run(scenario())
+
+
+def test_output_groups_console_lines_in_one_block():
+    async def scenario():
+        tool = create_codemode_tool([leaf("echo")])
+        code = "console.log('log line')\nconsole.error('error line')\nconsole.warn('warn line')\n"
+        result = await tool.execute("c", {"code": code}, None, None)
+        # Each console call is one line of the single block; no text() output means no headers.
+        assert texts_of(result)[1] == ("<console_output>\n"
+                                       "log line\nerror line\nwarn line\n</console_output>")
+
+    asyncio.run(scenario())
+
+
+def test_output_mixed_text_console_and_result():
+    async def scenario():
+        tool = create_codemode_tool([leaf("echo")])
+        code = "print('debug 1')\ntext('t1')\nconsole.log('debug 2')\nresult = 'RES'\n"
+        result = await tool.execute("c", {"code": code}, None, None)
+        # Non-console texts are numbered in production order (the returned value
+        # is appended like text()); console lines follow all other output.
+        assert texts_of(result)[1:3] == ["==> text 1/2 <==\nt1", "==> text 2/2 <==\nRES"]
+        assert texts_of(result)[3] == "<console_output>\ndebug 1\ndebug 2\n</console_output>"
+
+    asyncio.run(scenario())
+
+
+def test_failed_output_error_text_is_unnumbered_after_console_block():
+    async def scenario():
+        tool = create_codemode_tool([leaf("echo")])
+        result = await tool.execute("c", {"code": "text('a')\ntext('b')\nprint('c')\n1/0"}, None, None)
+        assert result.is_error is True
+        texts = texts_of(result)
+        assert texts[1:3] == ["==> text 1/2 <==\na", "==> text 2/2 <==\nb"]
+        assert texts[3] == "<console_output>\nc\n</console_output>"
+        assert texts[4].startswith("Script error:\nTraceback")
 
     asyncio.run(scenario())
 
