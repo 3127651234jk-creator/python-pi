@@ -783,11 +783,11 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             await mcp.oauth_logout(parts[1])
                             sync_mcp_tools(agent, mcp)
                             print(f"credentials removed for MCP server {parts[1]}")
-                        for name, client in mcp.clients.items():
-                            state = "lazy" if name in mcp.lazy_servers else f"connected, {len(client.tools)} tools"
+                        for name, state in mcp.server_states().items():
                             print(f"{name}: {state}")
                         for name, error in mcp.errors.items():
-                            print(f"{name}: {error}")
+                            if name in mcp.clients:
+                                print(f"{name}: {error}")
                     except AbortError:
                         print("error: MCP sign-in cancelled")
                     except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, httpx.HTTPError) as exc:
@@ -944,7 +944,7 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                                 print(f"warning: {diagnostic}", file=sys.stderr)
                         print("configuration reloaded")
                         if mcp:
-                            await mcp.reload()
+                            await mcp.reload(wait=False)
                             sync_mcp_tools(agent, mcp)
                         if extensions:
                             await extensions.reload()
@@ -1585,6 +1585,12 @@ def sync_mcp_tools(agent: Agent, mcp: Optional[McpManager]) -> None:
     apply_tool_selection(agent)
 
 
+def report_mcp_state(server: str, state: str, error: Optional[str] = None) -> None:
+    """Print MCP connect failures as they happen; status stays visible via /mcp."""
+    if state in ("failed", "login-required") and error:
+        print(f"MCP {server}: {error}", file=sys.stderr)
+
+
 def describe_error(exc: BaseException) -> str:
     """Exception text, falling back to the type name when the message is empty."""
     return str(exc) or type(exc).__name__
@@ -1866,9 +1872,12 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     renderer.extensions = extensions
     try:
         if mcp is not None:
-            await mcp.reload()
-            sync_mcp_tools(agent, mcp)
+            # Connects run in the background so a slow server cannot hold startup;
+            # tools arrive through on_tools_changed as each server lands.
             mcp.on_tools_changed = lambda server: sync_mcp_tools(agent, mcp)
+            mcp.on_state_changed = report_mcp_state
+            await mcp.reload(wait=False)
+            sync_mcp_tools(agent, mcp)
         try:
             await extensions.reload()
         except ValueError as exc:
@@ -1885,8 +1894,6 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 agent.tools, session, codemode_settings,
                 execute_tool=execute_nested_tool))
         timings.time("extensions")
-        for name, error in (mcp.errors.items() if mcp is not None else []):
-            print(f"MCP {name}: {error}", file=sys.stderr)
         if args.evals:
             passed = await run_evals_file(agent, renderer, session, args.evals, mcp)
             timings.print_timings()

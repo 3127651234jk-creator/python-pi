@@ -539,6 +539,7 @@ class McpManager:
         self.oauth_store = McpOAuthStore(config.agent_dir)
         self.notify = print
         self.on_tools_changed = None  # set by the CLI to refresh agent.tools
+        self.on_state_changed = None  # callback(server, state, error=None): connecting/connected/failed/disabled/login-required
         self.lazy_servers = set()
         self.log_path = config.agent_dir / "mcp.log"
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
@@ -598,7 +599,16 @@ class McpManager:
         except OSError:
             pass
 
-    async def reload(self):
+    async def reload(self, wait: bool = True) -> None:
+        """Re-read the configuration and connect every server.
+
+        With ``wait`` the new connections settle before this returns (tests,
+        ``/mcp reconnect``). Otherwise connects run in the background: a slow or
+        stalled server cannot hold startup, ``/reload`` or extension registration
+        hostage, and tools arrive through ``on_tools_changed`` as each server lands.
+        Late connections cannot register into a closed generation.
+        """
+
         self._ensure_locks()
         async with self._reload_lock:
             await self._close_all()
@@ -608,9 +618,9 @@ class McpManager:
                 self._active = True
                 self.errors, self.tools = {}, []
                 self._refresh_locks = {}
-            await self._reload_servers(generation)
+            await self._reload_servers(generation, wait)
 
-    async def _reload_servers(self, generation: int) -> None:
+    async def _reload_servers(self, generation: int, wait: bool = True) -> None:
         servers = {}
         paths = [self.config.agent_dir / "mcp.json"]
         if self.config.project_trusted:
@@ -619,15 +629,19 @@ class McpManager:
             entries = read_json(path).get("mcpServers", {})
             if not isinstance(entries, dict):
                 self.errors[str(path)] = "mcpServers must be an object"
+                await self._notify_state(str(path), "failed", "mcpServers must be an object")
                 continue
             for name, value in entries.items():
                 if not isinstance(value, dict):
                     self.errors[name] = "Server configuration must be an object"
+                    await self._notify_state(name, "failed", "Server configuration must be an object")
                     continue
                 servers[name] = {**servers.get(name, {}), **value}
         # File configuration has precedence over ephemeral extension registrations.
         servers = {**self.extension_servers, **servers}
         normalized = set()
+        connects: List[asyncio.Task] = []
+        client: Optional[McpClient] = None
         for name, settings in servers.items():
             client = None
             try:
@@ -637,6 +651,7 @@ class McpManager:
                 normalized.add(namespace)
                 if not settings.get("enabled", True):
                     self.errors[name] = "disabled"
+                    await self._notify_state(name, "disabled")
                     continue
                 if ("command" in settings) == ("url" in settings):
                     raise ValueError("Specify either command or url")
@@ -673,38 +688,95 @@ class McpManager:
                 client = McpClient(name, settings, self.config.cwd)
                 if client.lazy and "url" not in settings:
                     raise ValueError("lazy tool discovery requires an HTTP server")
-                # Registered as opening before the first await, so a concurrent
-                # close can signal it and wait for it to settle.
-                await self._open_client(client, namespace, generation, register_name=name)
+                # Connect in a tracked task. The registration into ``_opening``
+                # happens here under the state lock, so a concurrent close sees
+                # every connect and waits for it, even one that never ran yet.
+                task = asyncio.ensure_future(
+                    self._connect_and_register(client, namespace, generation, name))
                 async with self._state_lock:
-                    if not self._active or generation != self._generation:
-                        raise RuntimeError(f"MCP server {name} connection cancelled")
-                    if client.lazy:
-                        self.lazy_servers.add(name)
-                    else:
-                        self._register_server_tools(namespace, client)
-                if client.tools_changed:
-                    # A list_changed notification raced the connect; list again now that
-                    # the client is registered.
-                    await self.ensure_tools(name, generation)
+                    self._opening[id(client)] = (client, task)
+                connects.append(task)
             except asyncio.CancelledError:
                 # A cancelled reload must not leave the half-opened transport running.
-                if client:
+                if client is not None:
                     await client.close()
                 raise
             except Exception as exc:  # noqa: BLE001 - one invalid server must not abort reload
                 if self._active and generation == self._generation:
                     self.errors[name] = str(exc) or type(exc).__name__
-                if client:
+                    await self._notify_state(name, "failed", self.errors[name])
+                if client is not None:
                     await client.close()
-                async with self._state_lock:
-                    if self.clients.get(name) is client:
-                        self.clients.pop(name, None)
-                        self.tools = [tool for tool in self.tools
-                                      if not getattr(tool, "_mcp_server", None) == name]
-        async with self._state_lock:
+        if wait and connects:
+            await asyncio.gather(*connects, return_exceptions=True)
+
+    async def _connect_and_register(self, client: McpClient, namespace: str, generation: int,
+                                    register_name: str) -> None:
+        """Connect one validated server and register its tools, for both the waiting
+        and the background reload. Failures land in ``errors`` and are broadcast."""
+
+        name = register_name
+        await self._notify_state(name, "connecting")
+        try:
+            await self._open_client(client, namespace, generation, register_name=name)
+            async with self._state_lock:
+                if not self._active or generation != self._generation:
+                    raise RuntimeError(f"MCP server {name} connection cancelled")
+                if client.lazy:
+                    self.lazy_servers.add(name)
+                else:
+                    self._register_server_tools(namespace, client)
+                if client.resources_supported:
+                    self._register_resource_tools()
+            if client.tools_changed:
+                # A list_changed notification raced the connect; list again now that
+                # the client is registered.
+                await self.ensure_tools(name, generation)
+            if self.on_tools_changed is not None:
+                await _maybe_call(self.on_tools_changed, name)
+            await self._notify_state(name, "connected")
+        except asyncio.CancelledError:
+            # A cancelled reload must not leave the half-opened transport running.
+            await client.close()
+            raise
+        except Exception as exc:  # noqa: BLE001 - one failed server must not abort reload
+            error = str(exc) or type(exc).__name__
             if self._active and generation == self._generation:
-                self._register_resource_tools()
+                self.errors[name] = error
+                state = "login-required" if isinstance(exc, McpLoginRequired) else "failed"
+                await self._notify_state(name, state, error)
+            await client.close()
+            async with self._state_lock:
+                if self.clients.get(name) is client:
+                    self.clients.pop(name, None)
+                    self.tools = [tool for tool in self.tools
+                                  if not getattr(tool, "_mcp_server", None) == name]
+
+    async def _notify_state(self, server: str, state: str, error: Optional[str] = None) -> None:
+        """Broadcast one server lifecycle transition to the host."""
+
+        callback = self.on_state_changed
+        if callback is None:
+            return
+        try:
+            await _maybe_call(callback, server, state, error)
+        except Exception:  # noqa: BLE001 - a broken listener must not break connects
+            pass
+
+    def server_states(self) -> Dict[str, str]:
+        """Per-server status for ``/mcp``: connecting, connected/lazy tools, sign-in
+        needed, or the configured error (disabled, invalid, failed connect)."""
+
+        states: Dict[str, str] = {}
+        for client, _task in self._opening.values():
+            states[client.name] = "connecting"
+        for name, client in self.clients.items():
+            states[name] = "lazy" if name in self.lazy_servers else f"connected, {len(client.tools)} tools"
+        for name in self.login_servers:
+            states[name] = "requires sign-in (run /mcp login <server>)"
+        for name, error in self.errors.items():
+            states.setdefault(name, error)
+        return states
 
     async def register_extension_server(self, name: str, settings: dict, owner: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -978,8 +1050,10 @@ class McpManager:
     def _register_resource_tools(self) -> None:
         """The resource tools Codex and opencode use: list, list templates, read. With a
         ``server`` argument one page is listed and ``cursor`` continues it; without, every
-        page of every server, with per-server errors collected."""
+        page of every server, with per-server errors collected. Re-entrant: it is called
+        after every registration, so previous copies are replaced, not duplicated."""
 
+        self.tools = [tool for tool in self.tools if not getattr(tool, "_mcp_resource_tool", False)]
         if not any(client.resources_supported for client in self.clients.values()):
             return
 
@@ -1065,16 +1139,19 @@ class McpManager:
             description="Lists resources provided by MCP servers. Resources allow servers to share data that provides "
                         "context to language models, such as files, database schemas, or application-specific information.",
             parameters=list_params, execute=lambda *args, **kwargs: list_call(*args, key="resources", method="resources/list", **kwargs)))
+        self.tools[-1]._mcp_resource_tool = True
         self.tools.append(AgentTool(name="list_mcp_resource_templates",
             description="Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to "
                         "share data that takes parameters and provides context to language models.",
             parameters=list_params, execute=lambda *args, **kwargs: list_call(*args, key="resourceTemplates", method="resources/templates/list", **kwargs)))
+        self.tools[-1]._mcp_resource_tool = True
         self.tools.append(AgentTool(name="read_mcp_resource",
             description="Read a specific resource from an MCP server given the server name and resource URI.",
             parameters={"type": "object",
                         "properties": {"server": {"type": "string"}, "uri": {"type": "string"}},
                         "required": ["server", "uri"]},
             execute=read_resource))
+        self.tools[-1]._mcp_resource_tool = True
 
     def _save_blob(self, blob: str, mime_type: str) -> str:
         """Save a base64 resource blob to a temp file; returns the model-facing text."""

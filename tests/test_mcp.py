@@ -1,12 +1,21 @@
 import asyncio
 import json
 import sys
+import time
 
 import httpx
 import pytest
 
 from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.mcp import McpClient, McpManager, create_tool_name_matcher, is_mcp_tool_name
+
+
+async def wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition was not reached")
+        await asyncio.sleep(0.01)
 
 
 @pytest.mark.parametrize("newline", ["\r", "\n", "\r\n"])
@@ -345,4 +354,101 @@ def test_close_is_idempotent_after_failed_connect(tmp_path):
         assert client.closed
 
     asyncio.run(scenario())
+
+
+# -- B-CA-04: reload can connect servers in the background so startup is not blocked
+
+
+def write_remote_server_config(tmp_path):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json",
+               {"mcpServers": {"remote": {"url": "https://example.test/mcp"}}})
+    return config
+
+
+def test_background_reload_does_not_block_startup(tmp_path, monkeypatch):
+    async def scenario():
+        gate = asyncio.Event()  # the server does not answer initialize until released
+        manager = McpManager(write_remote_server_config(tmp_path))
+        transitions = []
+        changed = []
+
+        async def send(self, request, **kwargs):
+            body = json.loads(request.content)
+            if body.get("method") == "initialize":
+                await gate.wait()
+            if "id" not in body:
+                return httpx.Response(202)
+            result = {"protocolVersion": "2025-03-26"} if body["method"] == "initialize" else {
+                "tools": [{"name": "echo", "description": "Echo",
+                           "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}]}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+        monkeypatch.setattr(httpx.AsyncClient, "send", send)
+        manager.on_state_changed = lambda server, state, error=None: transitions.append((server, state))
+        manager.on_tools_changed = lambda server: changed.append(server)
+        try:
+            await asyncio.wait_for(manager.reload(wait=False), 5)
+            # The reload returned while the connect is still waiting on the server.
+            assert manager.clients == {}
+            assert "remote" not in manager.errors
+            assert manager.server_states().get("remote") == "connecting"
+            gate.set()
+            await wait_until(lambda: "remote" in manager.clients)
+            assert manager.server_states()["remote"] == "connected, 1 tools"
+            assert transitions == [("remote", "connecting"), ("remote", "connected")]
+            assert changed == ["remote"]
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_background_connect_does_not_register_into_a_closed_generation(tmp_path, monkeypatch):
+    async def scenario():
+        gate = asyncio.Event()
+        manager = McpManager(write_remote_server_config(tmp_path))
+
+        async def send(self, request, **kwargs):
+            body = json.loads(request.content)
+            if body.get("method") == "initialize":
+                await gate.wait()
+            if "id" not in body:
+                return httpx.Response(202)
+            result = {"protocolVersion": "2025-03-26"} if body["method"] == "initialize" else {"tools": []}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+        monkeypatch.setattr(httpx.AsyncClient, "send", send)
+        await asyncio.wait_for(manager.reload(wait=False), 5)
+        # close() invalidates the generation and waits for the connect to settle.
+        close_task = asyncio.create_task(manager.close())
+        await asyncio.sleep(0.05)
+        assert not close_task.done()
+        gate.set()
+        await asyncio.wait_for(close_task, 5)
+        assert manager.clients == {}
+        assert manager.tools == []
+        assert not any(state.startswith("connected") for state in manager.server_states().values())
+
+    asyncio.run(scenario())
+
+
+def test_server_states_reports_disabled_and_invalid_servers(tmp_path):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "off": {"command": "unused", "enabled": False},
+        "bad": {"url": "notaurl"},
+    }})
+
+    async def check():
+        manager = McpManager(config)
+        try:
+            await manager.reload()
+            states = manager.server_states()
+            assert states["off"] == "disabled"
+            assert "HTTP(S) URL" in states["bad"]
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
 
