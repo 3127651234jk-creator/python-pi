@@ -58,6 +58,7 @@ from .mcp_oauth import (
 )
 from .model_registry import expand, validate_url
 from .oauth_callback import start_oauth_callback_server
+from ..util import AbortError
 
 RESOURCE_TOOLS = ("list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource")
 
@@ -567,6 +568,9 @@ class McpManager:
         self._oauth_locks: Dict[str, asyncio.Lock] = {}
         self._oauth_tasks: set = set()
         self._oauth_epoch: Dict[str, int] = {}
+        # In-flight ``oauth_login`` tasks, keyed by server: close() cancels them so
+        # a session shutdown does not leave a sign-in (and its callback server) running.
+        self._login_tasks: Dict[str, asyncio.Task] = {}
 
     def _ensure_locks(self) -> None:
         """Create the lifecycle locks inside the running loop (Python 3.9 binding)."""
@@ -1211,17 +1215,44 @@ class McpManager:
             await self.ensure_tools(name, generation)
         return bool(changed)
 
-    async def oauth_login(self, server: str) -> None:
+    async def oauth_login(self, server: str, signal=None) -> None:
         """Run the browser authorization flow, save the grant and connect the server.
 
         Works after the first 401 removed the failed client: the configuration and
-        challenge are kept in ``login_servers``/``login_challenges``.
+        challenge are kept in ``login_servers``/``login_challenges``. ``signal``
+        aborts the flow (raising :class:`AbortError`), including an in-flight
+        request; a session shutdown cancels the task through ``close()`` instead.
+        The task is tracked per server, so both paths close the callback server
+        and save no credentials.
         """
 
+        task = asyncio.current_task()
+        self._login_tasks[server] = task
+        try:
+            if signal is None:
+                await self._oauth_login(server, None)
+                return
+            inner = asyncio.ensure_future(self._oauth_login(server, signal))
+            abort = asyncio.ensure_future(signal.wait())
+            try:
+                await asyncio.wait({inner, abort}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                inner.cancel()
+                abort.cancel()
+                await asyncio.gather(inner, abort, return_exceptions=True)
+            signal.throw_if_aborted()
+            await asyncio.gather(inner)
+        finally:
+            if self._login_tasks.get(server) is task:
+                self._login_tasks.pop(server, None)
+
+    async def _oauth_login(self, server: str, signal) -> None:
         client = self.clients.get(server)
         settings = client.config if client is not None else self.login_servers.get(server)
         if settings is None or "url" not in settings:
             raise ValueError(f"MCP server not connected: {server}")
+        if signal is not None:
+            signal.throw_if_aborted()
         oauth = settings.get("oauth") or {}
         values = validate_oauth_settings(oauth)
         key = self._oauth_key(server, settings)
@@ -1239,13 +1270,17 @@ class McpManager:
                 record = self.oauth_store.get(key)
                 record, authorization_url = await self._prepare_login(
                     server, settings, record, redirect_url, state, challenge, http)
+                if signal is not None:
+                    signal.throw_if_aborted()
                 # Keep the registered client and PKCE verifier even if the user never
                 # finishes; a later sign-in then reuses the registration.
                 self.oauth_store.set(key, record)
                 self.notify(f"MCP authorization required for {settings['url']}\nOpen: {authorization_url}")
-                params = await callback_server.wait()
+                params = await self._wait_callback_or_abort(callback_server, signal)
                 if not params:
                     raise ValueError("MCP sign-in cancelled")
+                if signal is not None:
+                    signal.throw_if_aborted()
                 record = await self._complete_login(server, settings, record, params, http)
                 self.oauth_store.set(key, record)
         finally:
@@ -1253,6 +1288,25 @@ class McpManager:
         self.login_challenges.pop(server, None)
         self.errors.pop(server, None)
         await self._connect_after_login(server, settings)
+
+    @staticmethod
+    async def _wait_callback_or_abort(callback_server, signal):
+        """Wait for the browser callback; an abort fires :class:`AbortError` while
+        the callback server stays open for the caller's cleanup."""
+
+        if signal is None:
+            return await callback_server.wait()
+        waiter = asyncio.ensure_future(callback_server.wait())
+        abort = asyncio.ensure_future(signal.wait())
+        try:
+            await asyncio.wait({waiter, abort}, return_when=asyncio.FIRST_COMPLETED)
+            if abort.done() and not waiter.done():
+                raise AbortError("MCP sign-in cancelled")
+            return waiter.result()
+        finally:
+            waiter.cancel()
+            abort.cancel()
+            await asyncio.gather(waiter, abort, return_exceptions=True)
 
     async def _prepare_login(self, server: str, settings: dict, record: dict, redirect_url: str,
                              state: str, challenge: dict, http: httpx.AsyncClient):
@@ -1385,6 +1439,8 @@ class McpManager:
             refresh_tasks = list(self._refresh_tasks)
             self._refresh_tasks.clear()
             oauth_tasks = list(self._oauth_tasks)
+            login_tasks = list(self._login_tasks.values())
+            self._login_tasks.clear()
             tasks = set(self._cleanup_tasks)
             for client in clients:
                 tasks.add(self._track_cleanup(self._safe_close(client)))
@@ -1407,6 +1463,11 @@ class McpManager:
                 # is bounded by the per-request timeout, so shutdown cannot hang on a
                 # stalled network; anything still running past the deadline is cancelled.
                 tasks.add(self._track_cleanup(self._settle_refresh(task)))
+            for task in login_tasks:
+                if task is not current:
+                    # A sign-in holds no saved grant yet: abort it instead of waiting.
+                    task.cancel()
+                    tasks.add(self._track_cleanup(self._settle(task)))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 

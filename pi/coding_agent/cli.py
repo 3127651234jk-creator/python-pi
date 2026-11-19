@@ -28,6 +28,7 @@ from ..ai.retry import RetryPolicy
 from ..ai.types import AssistantMessage, ImageContent, ImagesContext, SystemMessage, TextContent, TextDeltaEvent, get_message_text
 from ..agent.agent import Agent
 from ..agent.compaction import compact_agent, prefix_checkpoint, restore_compaction
+from ..util import AbortError
 from ..agent.types import (
     AgentEndEvent,
     AutoRetryEndEvent,
@@ -787,6 +788,8 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             print(f"{name}: {state}")
                         for name, error in mcp.errors.items():
                             print(f"{name}: {error}")
+                    except AbortError:
+                        print("error: MCP sign-in cancelled")
                     except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, httpx.HTTPError) as exc:
                         print(f"error: {exc}")
                 continue

@@ -12,6 +12,7 @@ import pytest
 from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.mcp import McpManager, oauth_key
 from pi.coding_agent.mcp_oauth import McpLoginRequired
+from pi.util import AbortError, AbortSignal
 
 
 RESOURCE_METADATA_URL = "https://example.test/.well-known/oauth-protected-resource/mcp"
@@ -469,6 +470,56 @@ def test_close_gives_up_on_a_stalled_refresh_after_the_deadline(tmp_path, monkey
         # settles cancelled (blocking reload) or normally (background reload).
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(reload_task, 5)
+
+    asyncio.run(scenario())
+
+
+# -- B-CA-05: sign-in can be aborted; shutdown cancels a pending login
+
+
+def test_login_signal_aborts_and_saves_no_credentials(tmp_path, monkeypatch):
+    fake = FakeOAuthMcp()
+    install(monkeypatch, fake)
+    messages = []
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path))
+        manager.notify = messages.append
+        await manager.reload()
+        signal = AbortSignal()
+        login = asyncio.create_task(manager.oauth_login("remote", signal))
+        await wait_for(lambda: any("Open: " in message for message in messages))
+        key = oauth_key("remote", "https://example.test/mcp")
+        signal.abort()
+        with pytest.raises(AbortError):
+            await asyncio.wait_for(login, 5)
+        assert not fake.token_requests
+        stored = manager.oauth_store.get(key)
+        assert not stored.get("access") and not stored.get("refresh")
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_close_aborts_an_in_flight_login(tmp_path, monkeypatch):
+    fake = FakeOAuthMcp()
+    install(monkeypatch, fake)
+    messages = []
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path))
+        manager.notify = messages.append
+        await manager.reload()
+        login = asyncio.create_task(manager.oauth_login("remote"))
+        await wait_for(lambda: any("Open: " in message for message in messages))
+        key = oauth_key("remote", "https://example.test/mcp")
+        # Session shutdown: the pending sign-in is cancelled and saves nothing.
+        await manager.close()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(login, 5)
+        assert not fake.token_requests
+        stored = manager.oauth_store.get(key)
+        assert not stored.get("access") and not stored.get("refresh")
 
     asyncio.run(scenario())
 
