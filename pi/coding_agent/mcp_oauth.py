@@ -28,7 +28,10 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 
 LATEST_PROTOCOL_VERSION = "2025-03-26"
-REFRESH_REQUEST_TIMEOUT_SECONDS = 15
+# Bounds each request to the authorization server, so an unresponsive one cannot
+# hold the refresh lock, delay shutdown, or keep a sign-in waiting for long
+# (alignment of the TS OAUTH_REQUEST_TIMEOUT_MS).
+OAUTH_REQUEST_TIMEOUT_SECONDS = 15
 LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1", "[::1]")
 
 

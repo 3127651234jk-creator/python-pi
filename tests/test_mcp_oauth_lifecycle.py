@@ -1,6 +1,7 @@
 """MCP OAuth lifecycle: discovery on 401, sign-in, refresh, logout (O01, O06-O11)."""
 
 import asyncio
+import contextlib
 import json
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -412,6 +413,62 @@ def test_o09_close_waits_for_refresh_persistence(tmp_path, monkeypatch):
         stored = manager.oauth_store.get(key)
         assert stored["access"] == "refreshed-1"
         assert stored["refresh"] == "rotated-1"
+
+    asyncio.run(scenario())
+
+
+# -- B-CA-06: shutdown waits for in-flight refreshes instead of cancelling them
+
+
+def test_close_waits_for_an_in_flight_refresh_response(tmp_path, monkeypatch):
+    fake = FakeOAuthMcp()
+    fake.refresh = "r1"
+    install(monkeypatch, fake)
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path))
+        key = oauth_key("remote", "https://example.test/mcp")
+        manager.oauth_store.set(key, record_for(tmp_path, "old", "r1", expires=0))
+        fake.token_started = asyncio.Event()
+        fake.token_release = asyncio.Event()  # the token response is on the wire
+        reload_task = asyncio.create_task(manager.reload())
+        await asyncio.wait_for(fake.token_started.wait(), 5)
+        close_task = asyncio.create_task(manager.close())
+        await asyncio.sleep(0.05)
+        # The pending refresh is awaited, not cancelled: cancelling here would lose
+        # the rotated grant after the server already spent the old refresh token.
+        assert not close_task.done()
+        fake.token_release.set()
+        await asyncio.wait_for(close_task, 5)
+        await asyncio.wait_for(reload_task, 5)
+        stored = manager.oauth_store.get(key)
+        assert stored["access"] == "refreshed-1"
+        assert stored["refresh"] == "rotated-1"
+
+    asyncio.run(scenario())
+
+
+def test_close_gives_up_on_a_stalled_refresh_after_the_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr("pi.coding_agent.mcp.OAUTH_REQUEST_TIMEOUT_SECONDS", 0.05)
+    fake = FakeOAuthMcp()
+    fake.refresh = "r1"
+    install(monkeypatch, fake)
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path))
+        key = oauth_key("remote", "https://example.test/mcp")
+        manager.oauth_store.set(key, record_for(tmp_path, "old", "r1", expires=0))
+        fake.token_release = asyncio.Event()  # never set: the token response never arrives
+        reload_task = asyncio.create_task(manager.reload())
+        await wait_for(lambda: bool(fake.token_requests))
+        close_task = asyncio.create_task(manager.close())
+        # The wait is bounded by the per-request timeout: shutdown does not hang.
+        await asyncio.wait_for(close_task, 5)
+        assert manager.oauth_store.get(key)["access"] == "old"  # nothing was saved
+        # The refresh was cancelled at the deadline, so the reload that awaited it
+        # settles cancelled (blocking reload) or normally (background reload).
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(reload_task, 5)
 
     asyncio.run(scenario())
 

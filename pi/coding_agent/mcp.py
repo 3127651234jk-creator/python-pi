@@ -35,7 +35,7 @@ from ..ai.models import ModelError
 from ..ai.types import TextContent, ImageContent
 from .config import Configuration, read_json, write_json
 from .mcp_oauth import (
-    REFRESH_REQUEST_TIMEOUT_SECONDS,
+    OAUTH_REQUEST_TIMEOUT_SECONDS,
     McpAuthorizationRequired,
     McpLoginRequired,
     McpOAuthError,
@@ -816,7 +816,7 @@ class McpManager:
             key = self._oauth_key(client.name, client.config)
             record = self.oauth_store.get(key)
             try:
-                async with httpx.AsyncClient(timeout=30) as http:
+                async with httpx.AsyncClient(timeout=OAUTH_REQUEST_TIMEOUT_SECONDS) as http:
                     discovery = await self._discover_oauth(client.config, record, exc.challenge, http)
                 self.oauth_store.set(key, {**record, "discovery": discovery})
             except (McpOAuthError, httpx.HTTPError, ValueError, OSError):
@@ -865,7 +865,7 @@ class McpManager:
             client_info = latest.get("client") or static_client(oauth)
             if not client_info:
                 raise McpLoginRequired(self._login_message(server))
-            async with httpx.AsyncClient(timeout=REFRESH_REQUEST_TIMEOUT_SECONDS) as http:
+            async with httpx.AsyncClient(timeout=OAUTH_REQUEST_TIMEOUT_SECONDS) as http:
                 discovery = await self._discover_oauth(settings, latest, challenge, http)
                 metadata = discovery.get("authorization_server_metadata")
                 resource = select_resource(settings["url"], discovery.get("resource_metadata"))
@@ -1235,7 +1235,7 @@ class McpManager:
             state=state, timeout_ms=int(values["timeout"] * 1000))
         try:
             redirect_url = callback["fixed_redirect_url"] or callback_server.redirect_uri
-            async with httpx.AsyncClient(timeout=30) as http:
+            async with httpx.AsyncClient(timeout=OAUTH_REQUEST_TIMEOUT_SECONDS) as http:
                 record = self.oauth_store.get(key)
                 record, authorization_url = await self._prepare_login(
                     server, settings, record, redirect_url, state, challenge, http)
@@ -1401,13 +1401,12 @@ class McpManager:
             for task in oauth_tasks:
                 if task is current:
                     continue
-                if getattr(task, "oauth_saving", False):
-                    # The server already answered and the rotated tokens are being
-                    # saved; dropping them would lose the grant.
-                    tasks.add(self._track_cleanup(self._settle(task)))
-                else:
-                    task.cancel()
-                    tasks.add(self._track_cleanup(self._settle(task)))
+                # Wait for in-flight refreshes instead of cancelling them: cancelling
+                # between "the server rotated the grant" and "the client saved it"
+                # loses the rotated refresh token and forces a new sign-in. The wait
+                # is bounded by the per-request timeout, so shutdown cannot hang on a
+                # stalled network; anything still running past the deadline is cancelled.
+                tasks.add(self._track_cleanup(self._settle_refresh(task)))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1428,6 +1427,18 @@ class McpManager:
             await task
         except BaseException:  # noqa: BLE001 - cleanup waits, it does not re-raise
             pass
+
+    async def _settle_refresh(self, task: asyncio.Task) -> None:
+        """Wait for one in-flight refresh so a rotated grant is saved before shutdown
+        moves on; a task still running past the deadline is cancelled."""
+
+        try:
+            await asyncio.wait_for(asyncio.shield(task), OAUTH_REQUEST_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:  # noqa: BLE001 - timeout or failure: cancel, never re-raise
+            task.cancel()
+        await self._settle(task)
 
 
 async def _maybe_call(fn, *args):
