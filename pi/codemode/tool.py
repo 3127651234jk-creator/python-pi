@@ -367,7 +367,8 @@ def _failed_result(call_id: str, output_items: List[dict], calls: List[dict], er
 
 
 def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManager] = None,
-                         settings: Optional[dict] = None, execute_tool=None) -> AgentTool:
+                         settings: Optional[dict] = None, execute_tool=None,
+                         model_registry=None) -> AgentTool:
     """Build the ``codemode`` AgentTool over the given callable tools.
 
     ``execute_tool(name, args, signal)`` returns a
@@ -375,6 +376,8 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
     the call through the agent pipeline, so nested calls get the same
     validation, hooks, permission checks, events, and usage accounting as
     direct calls. The CLI always passes the unified callback.
+    ``model_registry`` powers the script's ``models.*`` namespace (model
+    lookup and classifiers); without one those calls fail.
     """
 
     state = {"settings": settings or {}}
@@ -429,6 +432,173 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
             return structured
         return _result_text(outcome.result)
 
+    # -- models.* namespace (F-CA-04) ---------------------------------------
+
+    MODEL_TYPES = ("chat", "image", "classifier")
+    CLASSIFIER_CONTEXT_SHAPE = (
+        '{ state: { ... }, images?: [{ type: "image", data: <base64>, mimeType }], '
+        'questions: { <id>: { type: "choice", instructions, criteria: { <label>: <meaning> } } | '
+        '{ type: "score", instructions, criteria: [<lowest level>, ..., <highest level>] } | '
+        '{ type: "bool", instructions, criteria: { true: <meaning>, false: <meaning> } } } }')
+
+    def _model_info(model):
+        from ..coding_agent.rpc_wire import model_to_ts
+        info = model_to_ts(model)
+        info.pop("headers", None)  # models.json headers can carry credentials
+        return info
+
+    def _fail_shape(problem: str) -> ValueError:
+        return ValueError(
+            f"models.classify() {problem}. Expected context: {CLASSIFIER_CONTEXT_SHAPE}. "
+            'See "Classify" in the codemode docs.')
+
+    def check_classifier_context(context: Any) -> dict:
+        """Validate a script's classifier context so mistakes fail with the
+        expected shape instead of a provider error (port of checkClassifierContext)."""
+
+        def is_record(value: Any) -> bool:
+            return isinstance(value, dict)
+
+        def describe_value(value: Any) -> str:
+            if value is None:
+                return "None"
+            if isinstance(value, list):
+                return "an empty array" if not value else "an array"
+            if isinstance(value, dict):
+                keys = list(value)
+                if not keys:
+                    return "{}"
+                return "{ " + ", ".join(keys[:6]) + (", ..." if len(keys) > 6 else "") + " }"
+            if isinstance(value, str):
+                return "a string"
+            return f"a {type(value).__name__}"
+
+        if not is_record(context):
+            raise _fail_shape(f"expects a context object as its second argument, got {describe_value(context)}")
+        if not is_record(context.get("state")):
+            raise _fail_shape(f"context.state must be an object, got {describe_value(context.get('state'))}")
+        images = context.get("images")
+        if images is not None:
+            if not isinstance(images, list):
+                raise _fail_shape(f"context.images must be an array, got {describe_value(images)}")
+            for index, image in enumerate(images):
+                if (not isinstance(image, dict) or image.get("type") != "image"
+                        or not isinstance(image.get("data"), str)
+                        or not isinstance(image.get("mimeType"), str)):
+                    raise _fail_shape(f"context.images[{index}] must be an image block, got {describe_value(image)}")
+        questions = context.get("questions")
+        if not is_record(questions) or not questions:
+            raise _fail_shape(f"context.questions must map question IDs to questions, got {describe_value(questions)}")
+        for question_id, question in questions.items():
+            at = f"context.questions.{question_id}"
+            if not is_record(question):
+                raise _fail_shape(f"{at} must be a question object, got {describe_value(question)}")
+            if not isinstance(question.get("instructions"), str):
+                raise _fail_shape(f"{at}.instructions must be a string")
+            criteria = question.get("criteria")
+            if question.get("type") == "choice":
+                if (not is_record(criteria) or not criteria
+                        or not all(isinstance(value, str) for value in criteria.values())):
+                    raise _fail_shape(f'{at} is a "choice" question, so criteria must map each label to its meaning')
+            elif question.get("type") == "score":
+                if (not isinstance(criteria, list) or not criteria
+                        or not all(isinstance(value, str) for value in criteria)):
+                    raise _fail_shape(f'{at} is a "score" question, so criteria must list the levels as strings, lowest first')
+            elif question.get("type") == "bool":
+                if (not is_record(criteria) or not isinstance(criteria.get("true"), str)
+                        or not isinstance(criteria.get("false"), str)):
+                    raise _fail_shape(f'{at} is a "bool" question, so criteria must be {{ true: string, false: string }}')
+            else:
+                raise _fail_shape(f'{at}.type must be "choice", "score", or "bool", got {json.dumps(question.get("type"))}')
+        return context
+
+    def _classifier_questions(questions: dict) -> Dict[str, Any]:
+        from ..ai.types import (
+            ClassifierBoolQuestion,
+            ClassifierChoiceQuestion,
+            ClassifierScoreQuestion,
+        )
+        built: Dict[str, Any] = {}
+        for question_id, question in questions.items():
+            if question["type"] == "choice":
+                built[question_id] = ClassifierChoiceQuestion(
+                    instructions=question["instructions"], criteria=dict(question["criteria"]))
+            elif question["type"] == "score":
+                built[question_id] = ClassifierScoreQuestion(
+                    instructions=question["instructions"], criteria=list(question["criteria"]))
+            else:
+                built[question_id] = ClassifierBoolQuestion(
+                    instructions=question["instructions"],
+                    criteria={"true": question["criteria"]["true"], "false": question["criteria"]["false"]})
+        return built
+
+    def _classifier_result_to_script(result) -> dict:
+        from dataclasses import asdict
+        from ..ai.types import ClassifierResult as _Result  # noqa: F401 - shape reference
+        data = {
+            "api": result.api, "provider": result.provider, "model": result.model,
+            "answers": {name: asdict(answer) for name, answer in result.answers.items()},
+            "usage": None, "stopReason": result.stop_reason, "errorMessage": result.error_message,
+            "timestamp": result.timestamp,
+        }
+        if result.usage is not None:
+            data["usage"] = result.usage.to_dict()
+        return data
+
+    async def run_model_call(name: str, args: list, signal, record: host.CallRecord) -> Any:
+        """Execute one models.* call: registry lookup and classifier runs in the
+        host; a script-supplied baseUrl or headers never receives credentials."""
+        if model_registry is None:
+            raise ValueError("the models namespace is not available (no model registry)")
+        if name in ("models.getModelsOfType", "models.getAvailableOfType"):
+            if not isinstance(args, list) or len(args) != 2:
+                raise ValueError(f"{name}() expects (type, provider=None)")
+            model_type, provider = args
+            if model_type not in MODEL_TYPES:
+                raise ValueError(f'Unknown model type {json.dumps(model_type)}. Use "chat", "image", or "classifier".')
+            if provider is not None and not isinstance(provider, str):
+                raise ValueError("provider must be a string")
+            return [_model_info(model) for model in model_registry.get_models_of_type(model_type, provider)]
+        if name == "models.getModelOfType":
+            if not isinstance(args, list) or len(args) != 3 or not all(isinstance(a, str) for a in args):
+                raise ValueError('models.getModelOfType(type, provider, id) expects three strings. '
+                                 'For example models.getModelOfType("classifier", "openai", "gpt-6-luna").')
+            model_type, provider, model_id = args
+            if model_type not in MODEL_TYPES:
+                raise ValueError(f'Unknown model type {json.dumps(model_type)}. Use "chat", "image", or "classifier".')
+            model = model_registry.get_model_of_type(model_type, provider, model_id)
+            return _model_info(model) if model is not None else None
+        if name == "models.classify":
+            if not isinstance(args, list) or len(args) != 2:
+                raise ValueError("models.classify() expects (model, context)")
+            model_ref, context = args
+            list_hint = 'List the classifier models you can use with models.getAvailableOfType("classifier").'
+            if (not isinstance(model_ref, dict) or not isinstance(model_ref.get("provider"), str)
+                    or not isinstance(model_ref.get("id"), str)):
+                hint = (" models.getModelOfType() returns None for an unknown provider or id."
+                        if model_ref is None else "")
+                raise ValueError(f'models.classify() expects a classifier model as its first argument, '
+                                 f'got {json.dumps(model_ref) if model_ref is not None else "None"}.{hint} {list_hint}')
+            ref = f'{model_ref["provider"]}/{model_ref["id"]}'
+            resolved = model_registry.get_model_of_type("classifier", model_ref["provider"], model_ref["id"])
+            if resolved is None:
+                raise ValueError(f'Unknown classifier model "{ref}". {list_hint}')
+            checked = check_classifier_context(context)
+            from ..ai.providers import SimpleStreamOptions, classify
+            from ..ai.types import ClassifierContext
+            images = [ImageContent(data=image["data"], mime_type=image["mimeType"])
+                      for image in (checked.get("images") or [])]
+            classifier_context = ClassifierContext(state=dict(checked["state"]),
+                                                   questions=_classifier_questions(checked["questions"]),
+                                                   images=images or None)
+            result = await classify(resolved, classifier_context,
+                                    SimpleStreamOptions(signal=signal))
+            if result.usage is not None:
+                record.cost = result.usage.cost.get("total", 0.0)
+            return _classifier_result_to_script(result)
+        raise ValueError(f"Unknown models namespace call: {name}")
+        return _result_text(outcome.result)
+
     async def execute(call_id: str, params: dict, signal=None, on_update=None) -> AgentToolResult:
         code = params.get("code")
         if not isinstance(code, str) or not code.strip():
@@ -451,6 +621,7 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
             code=code, root_id=call_id, tools_meta=build_tool_meta(),
             store=load_codemode_store(session), timeout_ms=timeout_ms,
             signal=signal, on_call=run_script_tool,
+            on_model_call=run_model_call,
             on_update=publish if on_update is not None else None, runtime=runtime)
 
         if outcome.status == host.STATUS_ABORTED:

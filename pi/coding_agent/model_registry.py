@@ -3,10 +3,11 @@
 import os
 import re
 from dataclasses import replace
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from urllib.parse import urlsplit
 
 from ..ai.models import Model, ModelCost, ModelError, list_catalog, parse_cost_tiers, resolve_model
+from ..ai.utils import PI_ORIGINATOR
 from .auth import AuthStore
 from .catalog_sync import sync_overlay
 from .config import Configuration, read_json
@@ -43,6 +44,18 @@ def default_base_url(provider: str) -> str:
     return generic or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
 
 
+# OpenAI Decisions API (public beta): gpt-6-luna is its only model. It bills input
+# tokens only, with the same long-context multiplier as chat requests. Only API
+# keys work: Sign in with ChatGPT tokens are rejected on /v1/decisions.
+OPENAI_CLASSIFIER_MODELS = [Model(
+    id="gpt-6-luna", name="GPT-6 Luna", api="openai-decisions", provider="openai",
+    base_url="https://api.openai.com/v1", input=["text", "image"], context_window=922_000,
+    costs=ModelCost(input=0.1, output=0, cache_read=0, cache_write=0,
+                    tiers=[{"input_tokens_above": 272_000, "input": 0.2, "output": 0,
+                            "cache_read": 0, "cache_write": 0}]),
+)]
+
+
 class ModelRegistry:
     def __init__(self, config: Configuration) -> None:
         self.config = config
@@ -51,6 +64,7 @@ class ModelRegistry:
         self.virtual_models: Dict[tuple, dict] = {}
         # --models patterns ("provider/id" with * wildcards); None cycles everything.
         self.model_scope: Optional[list] = None
+        self.classifier_models: Dict[str, Model] = {}
         self.reload()
 
     def scoped_model_items(self) -> list:
@@ -65,6 +79,26 @@ class ModelRegistry:
     def scoped_models(self) -> list:
         """Models the run's --models scope limits cycling to (all when unset)."""
         return [model for _, model in self.scoped_model_items()]
+
+    def get_model_of_type(self, model_type: str, provider: str, model_id: str) -> Optional[Model]:
+        """One model of a given type (chat/classifier); None when unknown."""
+        if model_type == "classifier":
+            return self.classifier_models.get(provider + "/" + model_id)
+        if model_type == "chat":
+            return self.models.get(provider + "/" + model_id)
+        # Image models have no registry-level catalog in this port.
+        return None
+
+    def get_models_of_type(self, model_type: str, provider: Optional[str] = None) -> List[Model]:
+        """Known models of a type, optionally restricted to one provider."""
+        if model_type == "classifier":
+            source = self.classifier_models
+        elif model_type == "chat":
+            source = self.models
+        else:
+            return []
+        return [model for identifier, model in source.items()
+                if provider is None or model.provider == provider]
 
     def register_extension_providers(self, providers: Dict[str, dict]) -> None:
         """Merge extension-registered providers below user models.json settings."""
@@ -150,7 +184,7 @@ class ModelRegistry:
             api = provider.get("api", "anthropic-messages" if name == "anthropic" else "faux" if name == "faux" else "openai-completions")
             # A provider with a custom stream function implements its own protocol,
             # so it may name its api freely and keep its endpoint empty.
-            if stream_simple is None and api not in ("pi-messages", "azure-openai-responses", "anthropic-messages", "openai-completions", "faux", "openai-responses", "openai-codex-responses", "google-generative-ai", "google-vertex", "azure-openai", "bedrock-converse-stream"):
+            if stream_simple is None and api not in ("pi-messages", "azure-openai-responses", "anthropic-messages", "openai-completions", "faux", "openai-responses", "openai-codex-responses", "openai-decisions", "typesafe-system-one", "google-generative-ai", "google-vertex", "azure-openai", "bedrock-converse-stream"):
                 raise ModelError(f"Unsupported API: {api}")
             # Providers may leave the endpoint empty: Vertex and Azure build it from
             # the environment at request time, and catalog models carry their own
@@ -179,7 +213,7 @@ class ModelRegistry:
             for entry in entries:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
                     raise ModelError("Model requires a nonempty id")
-                if set(entry) - {"id", "name", "reasoning", "context_window", "max_tokens", "input", "costs", "params", "base_url", "thinking_level_map", "compat"}:
+                if set(entry) - {"id", "name", "reasoning", "context_window", "max_tokens", "input", "costs", "params", "base_url", "thinking_level_map", "sampling_params_by_thinking_level", "prompt_cache", "compat"}:
                     raise ModelError("Unknown model capability field")
                 compat = entry.get("compat", {})
                 if (not isinstance(compat, dict)
@@ -189,6 +223,16 @@ class ModelRegistry:
                     raise ModelError("Invalid model compat settings")
                 if "params" in entry and (not isinstance(entry["params"], dict) or not all(isinstance(k, str) for k in entry["params"])):
                     raise ModelError("Model params must be an object with string keys")
+                if "sampling_params_by_thinking_level" in entry and (
+                        not isinstance(entry["sampling_params_by_thinking_level"], dict)
+                        or not all(isinstance(level, str) and isinstance(params, dict) and all(isinstance(key, str) for key in params)
+                                   for level, params in entry["sampling_params_by_thinking_level"].items())):
+                    raise ModelError("Model sampling_params_by_thinking_level must map level names to objects with string keys")
+                if "prompt_cache" in entry and (
+                        not isinstance(entry["prompt_cache"], dict)
+                        or set(entry["prompt_cache"]) - {"5m", "1h"}
+                        or not all(isinstance(value, int) and value > 0 for value in entry["prompt_cache"].values())):
+                    raise ModelError('Model prompt_cache must map "5m"/"1h" to positive TTL seconds')
                 if "base_url" in entry and (not isinstance(entry["base_url"], str) or not entry["base_url"]):
                     raise ModelError("Model base_url must be a nonempty string")
                 if "thinking_level_map" in entry and (not isinstance(entry["thinking_level_map"], dict)
@@ -240,6 +284,15 @@ class ModelRegistry:
                 max_tokens=definition.get("maxTokens") or 1,
                 input=list(definition.get("input") or ["text", "image"]),
             )
+        # Classifier models are not chat models: the injected OpenAI Decisions
+        # catalog plus any models.json entries declared with that api.
+        classifier_models = {model.provider + "/" + model.id: replace(model, api_key=None)
+                             for model in OPENAI_CLASSIFIER_MODELS}
+        for identifier, model in list(models.items()):
+            if model.api in ("openai-decisions", "typesafe-system-one"):
+                classifier_models[identifier] = model
+                del models[identifier]
+        self.classifier_models = classifier_models
         self.providers = merged
         self.models = models
 
@@ -308,7 +361,7 @@ class ModelRegistry:
                     if "chatgpt-account-id" not in configured:
                         resolved.headers["chatgpt-account-id"] = record["account_id"]
                     if "originator" not in configured:
-                        resolved.headers["originator"] = "pi"
+                        resolved.headers["originator"] = PI_ORIGINATOR
                 elif provider == "github-copilot":
                     resolved.base_url = copilot_endpoint(key)
                     resolved.headers.update({**COPILOT_HEADERS, "x-github-api-version": "2026-06-01", "openai-intent": "conversation-panel", "X-Initiator": "user"})

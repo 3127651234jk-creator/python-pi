@@ -47,6 +47,9 @@ STATUS_CRASHED = "crashed"
 # value; raises to fail the call. Defined here so the tool adapter and the
 # host agree on the record contract without sharing agent types.
 CallExecutor = Callable[[str, dict, Optional[AbortSignal], "CallRecord"], Awaitable[Any]]
+# Executes one models.* call: (name, args-as-list, signal, record) -> value.
+# Tool calls use object args; namespace calls pass positional lists verbatim.
+ModelCallExecutor = Callable[[str, list, Optional[AbortSignal], "CallRecord"], Awaitable[Any]]
 # Receives the calls snapshot at the original publish points.
 UpdateListener = Callable[[dict], Union[None, Awaitable[None]]]
 
@@ -65,9 +68,11 @@ class CallRecord:
     status: str = "running"
     duration_ms: Optional[int] = None
     error: Optional[str] = None
+    # models.* calls report the classifier/image call's usage cost here.
+    cost: Optional[float] = None
 
     def as_dict(self) -> dict:
-        return {
+        record = {
             "id": self.id,
             "name": self.name,
             "args": self.args,
@@ -75,6 +80,9 @@ class CallRecord:
             "duration_ms": self.duration_ms,
             "error": self.error,
         }
+        if self.cost is not None:
+            record["cost"] = self.cost
+        return record
 
 
 @dataclass
@@ -226,12 +234,15 @@ async def execute_codemode(
     on_call: CallExecutor,
     on_update: Optional[UpdateListener] = None,
     runtime: CodemodeRuntime,
+    on_model_call: Optional[ModelCallExecutor] = None,
 ) -> CodemodeOutcome:
     """Run ``code`` in a fresh ``python -I`` subprocess and collect the outcome.
 
     ``on_call`` executes one script call through the caller's pipeline and may
-    backfill ``record.id``; ``on_update`` receives ``{"calls": [...]}`` at the
-    same points the monolithic implementation published its snapshot.
+    backfill ``record.id``; ``on_model_call`` executes the ``models.*``
+    namespace calls (registry lookup, classify) when the host provides one;
+    ``on_update`` receives ``{"calls": [...]}`` at the same points the
+    monolithic implementation published its snapshot.
     """
 
     code_path = runtime.workdir / f"script_{to_codemode_file_stem(root_id)}.py"
@@ -326,6 +337,36 @@ async def execute_codemode(
         args = message.get("args")
         if args is None:
             args = {}
+        if name.startswith("models."):
+            # Namespace calls pass positional args as a JSON array and run in
+            # the host's model runtime, never through the tool pipeline.
+            if not isinstance(args, list):
+                raise BridgeError("models.* call arguments must be an array")
+            if on_model_call is None:
+                raise BridgeError("the models namespace is not available in this run")
+            index = len(calls) + 1
+            record = CallRecord(id=f"{root_id}/{index}", name=name, args="")
+            calls.append(record)
+            publish()
+            started = asyncio.get_event_loop().time()
+            future = asyncio.ensure_future(on_model_call(name, args, signal, record))
+            pending[call_id] = future
+
+            def done(fut):
+                record.duration_ms = round((asyncio.get_event_loop().time() - started) * 1000)
+                if fut.cancelled():
+                    record.status = "cancelled"
+                elif fut.exception() is not None:
+                    record.status = "cancelled" if signal is not None and signal.aborted else "error"
+                    record.error = str(fut.exception())[:ERROR_PREVIEW_CHARS]
+                else:
+                    record.status = "ok"
+                pending.pop(call_id, None)
+                publish()
+                asyncio.ensure_future(_write_reply(process, _reply_from_future(call_id, fut)))
+
+            future.add_done_callback(done)
+            return
         if not isinstance(args, dict):
             raise BridgeError("tool arguments are not an object")
         index = len(calls) + 1

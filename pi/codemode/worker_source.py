@@ -172,6 +172,18 @@ WORKER_SOURCE = textwrap.dedent('''
             self._send({"type": "call", "id": call_id, "tool": canonical, "args": args})
             return Call(name, future)
 
+        def call(self, name, args):
+            """Host namespace call (models.*): the args pass through verbatim."""
+            with self.map_lock:
+                if self.closed:
+                    raise RuntimeError("codemode bridge closed")
+                self.next_id += 1
+                call_id = self.next_id
+                future = concurrent.futures.Future()
+                self.futures[call_id] = future
+            self._send({"type": "call", "id": call_id, "tool": name, "args": args})
+            return Call(name, future)
+
     class ToolFn:
         def __init__(self, bridge, name):
             self._bridge = bridge
@@ -466,8 +478,34 @@ WORKER_SOURCE = textwrap.dedent('''
         class Pi:
             pass
 
+        class ModelsNamespace:
+            """Host-side model registry access (F-CA-04): model lookup by type
+            and classifier calls run in the host, never in the sandbox."""
+
+            def get_models_of_type(self, model_type, provider=None):
+                return bridge.call("models.getModelsOfType", [model_type, provider]).result()
+
+            def get_available_of_type(self, model_type, provider=None):
+                return bridge.call("models.getAvailableOfType", [model_type, provider]).result()
+
+            getAvailableOfType = get_available_of_type
+            getModelsOfType = get_models_of_type
+
+            def get_model_of_type(self, model_type, provider, model_id):
+                return bridge.call("models.getModelOfType", [model_type, provider, model_id]).result()
+
+            getModelOfType = get_model_of_type
+
+            def classify(self, model, context):
+                if not isinstance(model, dict):
+                    raise TypeError("models.classify() expects a model object as its first argument")
+                if not isinstance(context, dict):
+                    raise TypeError("models.classify() expects a context object as its second argument")
+                return bridge.call("models.classify", [model, context]).result()
+
         pi = Pi()
         pi.tools = ToolsNamespace(bridge, [m.get("js_name") or m["name"] for m in init.get("tools", [])])
+        pi.models = ModelsNamespace()
         pi.ALL_TOOLS = all_tools
         pi.text = ScriptCallable(text)
         pi.image = ScriptCallable(image)
@@ -484,6 +522,7 @@ WORKER_SOURCE = textwrap.dedent('''
 
         tools = pi.tools
         environment = {"pi": pi, "tools": tools, "ALL_TOOLS": all_tools,
+                       "models": pi.models,
                        "text": pi.text, "image": pi.image, "exit": pi.exit,
                        "store": pi.store, "load": pi.load, "wait": pi.wait,
                        "wait_all": pi.wait_all, "wait_any": pi.wait_any,
