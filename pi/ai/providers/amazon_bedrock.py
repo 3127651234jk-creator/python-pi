@@ -133,8 +133,18 @@ def build_request(model, context, options):
                       and message.api == model.api and message.model == model.id)
         content = []
         if isinstance(message, ToolResultMessage):
-            content = [{"toolResult": {"toolUseId": normalize_tool_call_id(message.tool_call_id), "status": "error" if message.is_error else "success",
-                "content": [{"text": b.text} for b in message.content if isinstance(b, TextContent)] or [{"text": "(empty result)"}]}}]
+            result_content = []
+            for block in message.content:
+                if isinstance(block, ImageContent):
+                    if "image" in model.input:
+                        result_content.append({"image": {
+                            "format": block.mime_type.split("/")[-1].replace("jpg", "jpeg"),
+                            "source": {"bytes": base64.b64decode(block.data)}}})
+                elif isinstance(block, TextContent) and block.text.strip():
+                    result_content.append({"text": block.text})
+            content = [{"toolResult": {"toolUseId": normalize_tool_call_id(message.tool_call_id),
+                "status": "error" if message.is_error else "success",
+                "content": result_content or [{"text": "(empty result)"}]}}]
         else:
             for block in [TextContent(text=message.content)] if isinstance(message.content, str) else message.content:
                 if isinstance(block, TextContent):

@@ -109,8 +109,12 @@ NO_CHANGES = ToolStateChanges(tools_added=[], tools_removed=[])
 
 
 def normalize_tool_call_id(call_id: str) -> str:
-    """Use the call portion of compound IDs and satisfy Claude's ID limits."""
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", call_id.split("|", 1)[0])[:64] or "call"
+    """Sanitize the full ID to Anthropic/Bedrock's allowed pattern and length.
+
+    Compound Responses IDs use ``call_id|item_id``; splitting on the pipe would
+    collapse two calls that share a call_id, so the whole string is cleaned.
+    """
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", call_id)[:64] or "call"
 
 
 def repair_tool_results(messages: List[Message]) -> List[Message]:

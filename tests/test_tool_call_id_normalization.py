@@ -13,7 +13,7 @@ from pi.ai.types import AssistantMessage, TextContent, ToolCall, ToolResultMessa
     (anthropic, "anthropic-messages"), (amazon_bedrock, "bedrock-converse-stream"),
 ])
 @pytest.mark.parametrize("call_id,expected", [
-    ("call_abc|fc_" + "x" * 120, "call_abc"),
+    ("call_abc|fc_" + "x" * 120, ("call_abc_fc_" + "x" * 120)[:64]),
     ("a" * 132, "a" * 64),
     ("call.bad:/中文", "call_bad____"),
     ("valid-ID_123", "valid-ID_123"),

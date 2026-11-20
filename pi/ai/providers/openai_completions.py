@@ -8,6 +8,7 @@ OpenRouter, vLLM, llama.cpp, ...).
 from __future__ import annotations
 
 import json
+import re
 from urllib.parse import quote, urlencode, urlsplit
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -64,7 +65,7 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
     body: Dict[str, Any] = {
         "model": model.id,
         "stream": True,
-        "messages": convert_messages(system, messages),
+        "messages": convert_messages(system, messages, model),
     }
     if model.compat.get("supportsUsageInStreaming", True):
         body["stream_options"] = {"include_usage": True}
@@ -110,7 +111,68 @@ def _declared_tools(system: Optional[SystemMessage]) -> List[Tool]:
     return list(system.tools_added)
 
 
-def convert_messages(system: Optional[SystemMessage], messages: List[Any]) -> List[Dict[str, Any]]:
+def _utf16_units(value: str):
+    """Yield JS ``charCodeAt`` code units (surrogate pairs for non-BMP chars)."""
+    for char in value:
+        code = ord(char)
+        if code <= 0xFFFF:
+            yield code
+        else:
+            code -= 0x10000
+            yield 0xD800 + (code >> 10)
+            yield 0xDC00 + (code & 0x3FF)
+
+
+def _imul(left: int, right: int) -> int:
+    return ((left & 0xFFFFFFFF) * (right & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def _base36(value: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if value == 0:
+        return "0"
+    result = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        result = digits[remainder] + result
+    return result
+
+
+def _short_hash(value: str) -> str:
+    """Port of TS ``shortHash`` (packages/ai/src/utils/hash.ts)."""
+    h1, h2 = 0xDEADBEEF, 0x41C6CE57
+    for code in _utf16_units(value):
+        h1 = _imul(h1 ^ code, 2654435761)
+        h2 = _imul(h2 ^ code, 1597334677)
+    h1 = _imul(h1 ^ (h1 >> 16), 2246822507) ^ _imul(h2 ^ (h2 >> 13), 3266489909)
+    h2 = _imul(h2 ^ (h2 >> 16), 2246822507) ^ _imul(h1 ^ (h1 >> 13), 3266489909)
+    return _base36(h2 & 0xFFFFFFFF) + _base36(h1 & 0xFFFFFFFF)
+
+
+def normalize_completions_tool_call_id(model: Optional[Model], call_id: str) -> str:
+    """Match TS ``normalizeToolCallId`` in openai-completions.ts.
+
+    Responses IDs are ``call_id|item_id``; both halves must survive so calls
+    that share a call_id stay distinct. Chat Completions also caps ids at 40
+    characters, so longer values collapse to a stable truncated hash.
+    """
+    if "|" in call_id:
+        call_part, item_part = call_id.split("|", 1)
+        call_part = re.sub(r"[^a-zA-Z0-9_-]", "_", call_part)
+        item_part = re.sub(r"[^a-zA-Z0-9_-]", "_", item_part)
+        combined = f"{call_part}_{item_part}" if item_part else call_part
+        if len(combined) <= 40:
+            return combined
+        digest = _short_hash(call_id)[:8]
+        prefix = call_part[:max(1, 40 - len(digest) - 1)]
+        return f"{prefix}_{digest}"
+    if model is not None and model.provider == "openai" and len(call_id) > 40:
+        return call_id[:40]
+    return call_id
+
+
+def convert_messages(system: Optional[SystemMessage], messages: List[Any],
+                     model: Optional[Model] = None) -> List[Dict[str, Any]]:
     """Convert the transcript to OpenAI chat messages."""
     api_messages: List[Dict[str, Any]] = []
     if system is not None:
@@ -118,20 +180,41 @@ def convert_messages(system: Optional[SystemMessage], messages: List[Any]) -> Li
         if text:
             api_messages.append({"role": "system", "content": text})
 
+    pending_images: List[Dict[str, Any]] = []
+
+    def flush_images() -> None:
+        if not pending_images:
+            return
+        api_messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": "Attached image(s) from tool result:"}, *pending_images],
+        })
+        pending_images.clear()
+
     for message in messages:
         if isinstance(message, UserMessage):
+            flush_images()
             api_messages.append({"role": "user", "content": _user_content(message)})
         elif isinstance(message, AssistantMessage):
-            api_messages.append(_assistant_message(message))
+            flush_images()
+            api_messages.append(_assistant_message(message, model))
         elif isinstance(message, ToolResultMessage):
-            text = "\n".join(b.text for b in message.content if isinstance(b, TextContent)) or "(empty result)"
-            api_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": message.tool_call_id,
-                    "content": text,
-                }
-            )
+            text = "\n".join(b.text for b in message.content if isinstance(b, TextContent))
+            images = ([b for b in message.content if isinstance(b, ImageContent)]
+                      if model is not None and "image" in model.input else [])
+            if not text:
+                text = "(see attached image)" if images else "(no tool output)"
+            api_messages.append({
+                "role": "tool",
+                "tool_call_id": normalize_completions_tool_call_id(model, message.tool_call_id),
+                "content": text,
+            })
+            for block in images:
+                pending_images.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{block.mime_type};base64,{block.data}"},
+                })
+    flush_images()
     return api_messages
 
 
@@ -163,7 +246,7 @@ def _user_content(message: UserMessage) -> Any:
     return parts
 
 
-def _assistant_message(message: AssistantMessage) -> Dict[str, Any]:
+def _assistant_message(message: AssistantMessage, model: Optional[Model] = None) -> Dict[str, Any]:
     text_parts: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
     for block in message.content:
@@ -172,7 +255,7 @@ def _assistant_message(message: AssistantMessage) -> Dict[str, Any]:
         elif isinstance(block, ToolCall) and block.raw_item is None:
             tool_calls.append(
                 {
-                    "id": block.id,
+                    "id": normalize_completions_tool_call_id(model, block.id),
                     "type": "function",
                     "function": {"name": block.name, "arguments": json.dumps(block.arguments)},
                 }

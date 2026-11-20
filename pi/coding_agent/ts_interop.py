@@ -131,7 +131,7 @@ def ts_message_to_ours(data: dict):
         for block in data.get("content", []):
             kind = block.get("type")
             if kind == "text":
-                blocks.append(TextContent(text=block.get("text", "")))
+                blocks.append(TextContent(text=block.get("text", ""), text_signature=block.get("textSignature")))
             elif kind == "thinking":
                 blocks.append(ThinkingContent(thinking=block.get("thinking", ""),
                     thinking_signature=block.get("thinkingSignature"), redacted=bool(block.get("redacted"))))
@@ -213,7 +213,10 @@ def our_message_to_ts(message) -> dict:
     blocks = []
     for block in message.content:
         if isinstance(block, TextContent):
-            blocks.append({"type": "text", "text": block.text})
+            entry = {"type": "text", "text": block.text}
+            if block.text_signature:
+                entry["textSignature"] = block.text_signature
+            blocks.append(entry)
         elif isinstance(block, ThinkingContent):
             entry = {"type": "thinking", "thinking": block.thinking}
             if block.thinking_signature:

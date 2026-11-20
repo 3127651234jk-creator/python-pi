@@ -114,6 +114,9 @@ class ContextCompactor:
         # summarization_retry_* family); set by the Agent while a run is active
         # so the events reach the same subscribers as the agent events.
         self.event_sink: Optional[Callable[[Any], Any]] = None
+        # True while a summarization request is in flight (TS
+        # AgentSession.isCompacting); exposed over RPC get_state.
+        self.compacting = False
 
     async def _emit(self, event: Any) -> None:
         if self.event_sink is None:
@@ -170,6 +173,7 @@ class ContextCompactor:
         # earlier work of that turn get their own checkpoint next to the history
         # summary, matching the TypeScript agent's split-turn compaction.
         self.last_usage = None
+        self.compacting = True
         await self._emit(CompactionStartEvent(reason=reason))
         turn_start = -1
         if tail[cut].role != "user":
@@ -206,6 +210,7 @@ class ContextCompactor:
             if sum(estimate_message_tokens(m) for m in result) >= sum(estimate_message_tokens(m) for m in projected):
                 raise RuntimeError("Context compaction could not reduce context; shorten the latest input or tool output")
         except BaseException as exc:
+            self.compacting = False
             await self._emit(CompactionEndEvent(
                 reason=reason, result=None, will_retry=will_retry,
                 aborted=isinstance(exc, AbortError) or "was aborted" in str(exc),
@@ -223,6 +228,7 @@ class ContextCompactor:
                     "tokens_after": sum(estimate_message_tokens(m) for m in result),
                     "usage": usage},
         ))
+        self.compacting = False
         if self.on_summary is not None:
             self.on_summary(summary, usage)
         return result

@@ -55,7 +55,14 @@ def build_request(model, context, options):
                         # item verbatim for stateless chaining.
                         items.append(block.raw_item)
                     else:
-                        items.append({"type": "function_call", "call_id": block.id, "name": block.name, "arguments": json.dumps(block.arguments)})
+                        call_id, _, item_id = block.id.partition("|")
+                        item = {"type": "function_call", "call_id": call_id, "name": block.name,
+                                "arguments": json.dumps(block.arguments)}
+                        # The item id is part of the pairing contract; omit it
+                        # when replaying cross-model or with a foreign prefix.
+                        if same_model and item_id.startswith("fc_"):
+                            item["id"] = item_id
+                        items.append(item)
                 elif isinstance(block, ThinkingContent):
                     if same_model and block.thinking_signature:
                         items.append(json.loads(block.thinking_signature))
@@ -64,7 +71,8 @@ def build_request(model, context, options):
         elif isinstance(message, ToolResultMessage):
             output = [{"type": "input_image", "image_url": f"data:{b.mime_type};base64,{b.data}"} if isinstance(b, ImageContent)
                       else {"type": "input_text", "text": b.text} for b in message.content]
-            items.append({"type": "function_call_output", "call_id": message.tool_call_id, "output": output or "(empty result)"})
+            call_id = message.tool_call_id.split("|", 1)[0]
+            items.append({"type": "function_call_output", "call_id": call_id, "output": output or "(empty result)"})
     body = {"model": model.id, "input": items, "stream": True, "store": False,
             "max_output_tokens": resolve_max_tokens(model, context, options), "include": ["reasoning.encrypted_content"]}
     if system:
@@ -116,7 +124,12 @@ async def stream_openai_responses(model, context, options=None):
             events = blocks.text(("thinking", key), data["delta"], thinking=True)
         elif kind == "response.output_item.added" and data["item"]["type"] == "function_call":
             item = data["item"]
-            events = blocks.tool(("tool", key), item["call_id"], item["name"], item.get("arguments", ""))
+            # Keep both halves: the call_id pairs the output, the item id is
+            # required when this exact call is replayed on the same model.
+            call_id = item["call_id"]
+            item_id = item.get("id")
+            events = blocks.tool(("tool", key), f"{call_id}|{item_id}" if item_id else call_id,
+                                 item["name"], item.get("arguments", ""))
         elif kind == "response.function_call_arguments.delta":
             events = blocks.tool(("tool", key), "", "", data["delta"])
         elif kind == "response.function_call_arguments.done":

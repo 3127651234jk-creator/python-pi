@@ -350,7 +350,7 @@ class RpcServer:
                 data["model"] = model_to_ts(self.agent.model)
             data["thinkingLevel"] = self.agent.thinking_level
             data["isStreaming"] = self.busy()
-            data["isCompacting"] = False
+            data["isCompacting"] = bool(getattr(self.agent.compactor, "compacting", False))
             data["steeringMode"] = self.agent.steering_queue_mode
             data["followUpMode"] = self.agent.follow_up_queue_mode
             if self.session is not None and self.session.session_file:

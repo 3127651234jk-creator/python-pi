@@ -47,6 +47,18 @@ def model_to_ts(model: Model) -> dict:
         "cacheRead": model.costs.cache_read,
         "cacheWrite": model.costs.cache_write,
     }
+    if model.costs.tiers:
+        result["cost"]["tiers"] = [
+            {
+                "inputTokensAbove": tier["input_tokens_above"],
+                "input": tier.get("input", model.costs.input),
+                "output": tier.get("output", model.costs.output),
+                "cacheRead": tier.get("cache_read", model.costs.cache_read),
+                "cacheWrite": tier.get("cache_write", model.costs.cache_write),
+            }
+            for tier in model.costs.tiers
+            if isinstance(tier, dict) and "input_tokens_above" in tier
+        ]
     if model.headers:
         result["headers"] = dict(model.headers)
     result["reasoning"] = model.reasoning
