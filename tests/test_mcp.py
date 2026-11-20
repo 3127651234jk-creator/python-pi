@@ -452,3 +452,149 @@ def test_server_states_reports_disabled_and_invalid_servers(tmp_path):
 
     asyncio.run(check())
 
+
+def test_tool_exposure_overrides_server_exposure(tmp_path, monkeypatch):
+    """toolExposure maps raw tool names/patterns over the server exposure (F-CA-09)."""
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "dev": {"command": "dev", "exposure": "direct",
+                "toolExposure": {"search": "deferred", "secret_*": "codemode"}},
+    }})
+
+    async def scenario():
+        manager = McpManager(config)
+
+        async def open_client(client, namespace, generation, register_name=None):
+            client.tools = [{"name": "search"}, {"name": "other"}, {"name": "secret_key"}]
+            async with manager._state_lock:
+                manager.clients[register_name] = client
+
+        monkeypatch.setattr(manager, "_open_client", open_client)
+        try:
+            await manager.reload()
+            by_raw = {tool.name.split("__")[2].rsplit("_", 1)[0]: tool for tool in manager.tools}
+            assert by_raw["search"].exposure == "deferred" and not by_raw["search"].declared
+            assert by_raw["other"].exposure == "direct" and by_raw["other"].declared
+            assert by_raw["secret_key"].exposure == "codemode" and not by_raw["secret_key"].declared
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_tool_exposure_invalid_mapping_is_rejected(tmp_path):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "bad-list": {"command": "x", "toolExposure": ["search"]},
+        "bad-value": {"command": "x", "toolExposure": {"search": "shown"}},
+        "good": {"command": "x", "toolExposure": {"search": "direct"}},
+    }})
+
+    async def check():
+        manager = McpManager(config)
+        try:
+            await manager.reload()
+            assert manager.errors["bad-list"] == "toolExposure must map tool names to direct, deferred, or codemode"
+            assert manager.errors["bad-value"] == "toolExposure must map tool names to direct, deferred, or codemode"
+            assert "toolExposure" not in manager.errors.get("good", "")
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
+
+
+def test_project_mcp_json_override_rules(tmp_path):
+    """A trusted project's .pi/mcp.json may only override enabled/exposure/toolExposure (F-CA-09)."""
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "dev": {"command": "dev"},
+        "dev2": {"command": "dev2"},
+    }})
+    write_json(config.cwd / ".pi" / "mcp.json", {"mcpServers": {
+        "dev": {"exposure": "deferred"},
+        "ghost": {"enabled": True},
+        "dev2": {"timeout": 30},
+    }})
+
+    async def check():
+        manager = McpManager(config)
+        try:
+            await manager.reload()
+            assert "or a global server to override" in manager.errors["ghost"]
+            assert "an override can only set enabled, exposure, toolExposure" in manager.errors["dev2"]
+            assert "override" not in manager.errors.get("dev", "")
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
+
+
+def test_oauth_login_timeout_limits_the_whole_flow(tmp_path, monkeypatch):
+    """--timeout caps discovery, browser wait, and token exchange together (F-CA-07)."""
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {"dev": {"url": "https://example.test/mcp"}}})
+
+    async def scenario():
+        manager = McpManager(config)
+
+        async def slow_login(server, signal):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(manager, "_oauth_login", slow_login)
+        try:
+            with pytest.raises(ValueError, match="timed out after"):
+                await asyncio.wait_for(manager.oauth_login("dev", timeout=0.05), 5)
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_oauth_login_without_timeout_keeps_waiting(tmp_path, monkeypatch):
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {"dev": {"url": "https://example.test/mcp"}}})
+
+    async def scenario():
+        manager = McpManager(config)
+
+        async def quick_login(server, signal):
+            return
+
+        monkeypatch.setattr(manager, "_oauth_login", quick_login)
+        try:
+            await asyncio.wait_for(manager.oauth_login("dev"), 5)
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_cli_login_arg_parsing():
+    from pi.coding_agent.mcp_cli import _parse_login_args
+
+    assert _parse_login_args(["dev"]) == ("dev", None)
+    assert _parse_login_args(["dev", "--timeout", "30"]) == ("dev", 30.0)
+    assert _parse_login_args(["--timeout", "10", "dev"]) == ("dev", 10.0)
+    with pytest.raises(ValueError, match="--timeout requires"):
+        _parse_login_args(["dev", "--timeout"])
+    with pytest.raises(ValueError, match="usage"):
+        _parse_login_args([])
+
+
+def test_mcp_cli_list_and_login_routing(tmp_path, monkeypatch, capsys):
+    from pi.coding_agent import mcp_cli
+
+    config = Configuration(str(tmp_path), str(tmp_path / "user"))
+    write_json(config.agent_dir / "mcp.json", {"mcpServers": {
+        "remote": {"url": "https://example.test/mcp"},
+        "local": {"command": "dev"},
+    }})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PI_PY_AGENT_DIR", str(tmp_path / "user"))
+    assert mcp_cli.main(["list"]) == 0
+    assert "remote: http" in capsys.readouterr().out
+
+    # Unknown server names fail with a clear error before any browser opens.
+    assert mcp_cli.main(["login", "ghost", "--timeout", "1"]) == 1
+    assert "Unknown MCP server: ghost" in capsys.readouterr().err
+

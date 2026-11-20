@@ -87,6 +87,20 @@ def is_mcp_tool_name(name: str) -> bool:
     return name.startswith("mcp__") or name in RESOURCE_TOOLS
 
 
+def _tool_exposure(config: dict, raw_tool_name: str) -> str:
+    """One tool's exposure: its exact ``toolExposure`` entry, else the first
+    matching wildcard pattern, else the server's ``exposure``."""
+
+    overrides = config.get("toolExposure") or {}
+    exact = overrides.get(raw_tool_name)
+    if exact is not None:
+        return exact
+    for pattern, exposure in overrides.items():
+        if "*" in pattern and tool_pattern_reg_exp(pattern).match(raw_tool_name):
+            return exposure
+    return config.get("exposure", "direct")
+
+
 def _windows_batch_command(command: str, args: List[str]) -> str:
     """Escape both cmd.exe parses when a batch shim forwards arguments with %*."""
     if any("\r" in value or "\n" in value for value in [command, *args]):
@@ -625,7 +639,8 @@ class McpManager:
         paths = [self.config.agent_dir / "mcp.json"]
         if self.config.project_trusted:
             paths.append(self.config.cwd / ".pi/mcp.json")
-        for path in paths:
+        for index, path in enumerate(paths):
+            scope = "global" if index == 0 else "project"
             entries = read_json(path).get("mcpServers", {})
             if not isinstance(entries, dict):
                 self.errors[str(path)] = "mcpServers must be an object"
@@ -636,6 +651,25 @@ class McpManager:
                     self.errors[name] = "Server configuration must be an object"
                     await self._notify_state(name, "failed", "Server configuration must be an object")
                     continue
+                if scope == "project" and "command" not in value and "url" not in value and "type" not in value:
+                    # A project entry without an endpoint overrides a global
+                    # server; only the override keys may be set (TS OVERRIDE_KEYS).
+                    # An invalid override drops the server: Python records one
+                    # error per server, and leaving the global entry to connect
+                    # would overwrite the failure with a later error.
+                    base = servers.get(name)
+                    extra = [key for key in value if key not in ("enabled", "exposure", "toolExposure")]
+                    if base is None:
+                        error = f'{path}: server "{name}" needs "command" or "url", or a global server to override'
+                        self.errors[name] = error
+                        await self._notify_state(name, "failed", error)
+                        continue
+                    if extra:
+                        error = f'{path}: server "{name}": an override can only set enabled, exposure, toolExposure'
+                        self.errors[name] = error
+                        await self._notify_state(name, "failed", error)
+                        servers.pop(name, None)
+                        continue
                 servers[name] = {**servers.get(name, {}), **value}
         # File configuration has precedence over ephemeral extension registrations.
         servers = {**self.extension_servers, **servers}
@@ -660,6 +694,13 @@ class McpManager:
                 timeout = settings.get("timeout", 60)
                 if settings.get("exposure", "direct") not in ("direct", "deferred", "codemode"):
                     raise ValueError("exposure must be direct, deferred, or codemode")
+                tool_exposure = settings.get("toolExposure")
+                if tool_exposure is not None and (
+                        not isinstance(tool_exposure, dict)
+                        or not all(isinstance(pattern, str)
+                                   and value in ("direct", "deferred", "codemode")
+                                   for pattern, value in tool_exposure.items())):
+                    raise ValueError("toolExposure must map tool names to direct, deferred, or codemode")
                 if type(timeout) not in (int, float) or not 0 < timeout <= 86400:
                     raise ValueError("timeout must be between 0 and 86400 seconds")
                 if "command" in settings and (not isinstance(settings["command"], str) or not isinstance(settings.get("args", []), list) or not all(isinstance(arg, str) for arg in settings.get("args", []))):
@@ -1042,7 +1083,7 @@ class McpManager:
             return AgentToolResult(content=content or [TextContent(text=json.dumps(result))],
                 structured_content=result.get("structuredContent"), is_error=bool(result.get("isError")))
         tool = AgentTool(name=tool_name, description=description, parameters=parameters, execute=execute)
-        tool.exposure = self.clients[server].config.get("exposure", "direct")
+        tool.exposure = _tool_exposure(self.clients[server].config, raw)
         tool.declared = tool.exposure == "direct"
         tool._mcp_server = server
         return tool
@@ -1292,32 +1333,44 @@ class McpManager:
             await self.ensure_tools(name, generation)
         return bool(changed)
 
-    async def oauth_login(self, server: str, signal=None) -> None:
+    async def oauth_login(self, server: str, signal=None, timeout: Optional[float] = None) -> None:
         """Run the browser authorization flow, save the grant and connect the server.
 
         Works after the first 401 removed the failed client: the configuration and
         challenge are kept in ``login_servers``/``login_challenges``. ``signal``
         aborts the flow (raising :class:`AbortError`), including an in-flight
         request; a session shutdown cancels the task through ``close()`` instead.
-        The task is tracked per server, so both paths close the callback server
+        ``timeout`` seconds limit the whole sign-in — discovery, registration,
+        the browser wait and the token exchange (TS ``pi mcp login --timeout``,
+        default 300 there); the per-step timeouts still apply inside it. The
+        task is tracked per server, so both paths close the callback server
         and save no credentials.
         """
 
         task = asyncio.current_task()
         self._login_tasks[server] = task
         try:
-            if signal is None:
+            if signal is None and timeout is None:
                 await self._oauth_login(server, None)
                 return
             inner = asyncio.ensure_future(self._oauth_login(server, signal))
-            abort = asyncio.ensure_future(signal.wait())
+            racers = {inner}
+            abort = asyncio.ensure_future(signal.wait()) if signal is not None else None
+            if abort is not None:
+                racers.add(abort)
+            deadline = asyncio.ensure_future(asyncio.sleep(timeout)) if timeout is not None else None
+            if deadline is not None:
+                racers.add(deadline)
             try:
-                await asyncio.wait({inner, abort}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(racers, return_when=asyncio.FIRST_COMPLETED)
             finally:
-                inner.cancel()
-                abort.cancel()
-                await asyncio.gather(inner, abort, return_exceptions=True)
-            signal.throw_if_aborted()
+                for racer in racers:
+                    racer.cancel()
+                await asyncio.gather(*racers, return_exceptions=True)
+            if signal is not None:
+                signal.throw_if_aborted()
+            if deadline is not None and deadline.done() and not deadline.cancelled():
+                raise ValueError(f"MCP sign-in timed out after {timeout} seconds")
             await asyncio.gather(inner)
         finally:
             if self._login_tasks.get(server) is task:
