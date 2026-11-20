@@ -23,7 +23,7 @@ import httpx
 from prompt_toolkit import PromptSession
 
 from ..ai.models import ModelError, resolve_image_model, resolve_model
-from ..ai.providers import generate_images
+from ..ai.providers import generate_images, get_default_stream_fn
 from ..ai.retry import RetryPolicy
 from ..ai.types import AssistantMessage, ImageContent, ImagesContext, SystemMessage, TextContent, TextDeltaEvent, get_message_text
 from ..agent.agent import Agent
@@ -73,7 +73,9 @@ from . import timings
 from .resources import ResourceCatalog
 from .mcp import McpManager, create_tool_name_matcher, is_mcp_tool_name
 from .tool_search import STORE_TYPE as TOOL_SEARCH_STORE_TYPE, create_tool_search_tool
-from .rpc import JsonWriter, RpcServer
+from .bash_mode import execute_bang as run_bang, render_bang_output
+from .program_status import ProgramStatusReporter, program_status_enabled
+from .rpc import JsonWriter, RpcServer, WireJsonWriter
 from .extensions import ExtensionManager
 from .ts_extension import to_jsonable as to_json_value
 from .tui import ExtensionAction, TerminalUI, THEMES, DEFAULT_KEYBINDINGS, load_themes
@@ -132,7 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Disable the built-in tools (read, bash, edit, write, grep, find, ls, powershell)")
     parser.add_argument("--tools", "-t", metavar="TOOLS",
                         help="Comma-separated allowlist of tool names or patterns (*) to enable. "
-                             "Keeps MCP tools unless an entry starts with mcp__")
+                             "Keeps MCP tools unless an entry starts with mcp__. "
+                             "Alternatively, a list of only +name/-name entries modifies the "
+                             "built-in set (e.g. --tools +codemode,-find); it cannot mix with "
+                             "plain names or patterns")
     parser.add_argument("--exclude-tools", "-xt", metavar="TOOLS",
                         help="Comma-separated denylist of tool names or patterns (*) to disable. "
                              "Applies to all tools, MCP tools included")
@@ -241,11 +246,54 @@ def split_tool_entries(value: str) -> List[str]:
     return [entry.strip() for entry in value.split(",") if entry.strip()]
 
 
+def is_tool_modifier(entry: str) -> bool:
+    """Whether a tool selection entry is a ``+name`` or ``-name`` modifier."""
+    return entry.startswith("+") or entry.startswith("-")
+
+
+def get_tool_list_error(entries: List[str]) -> Optional[str]:
+    """Validate a ``--tools`` list: plain names/patterns, or only ``+name``/
+    ``-name`` modifiers with exact names. Returns the problem, or None."""
+    modifiers = [entry for entry in entries if is_tool_modifier(entry)]
+    if not modifiers:
+        return None
+    if len(modifiers) < len(entries):
+        return "tool names cannot be mixed with +name or -name entries"
+    pattern = next((entry for entry in modifiers if "*" in entry), None)
+    if pattern:
+        return f"+name and -name entries take exact tool names, not patterns: {pattern}"
+    return None
+
+
+def apply_tool_modifiers(base: List[str], entries: List[str]) -> List[str]:
+    """Apply ``+name``/``-name`` entries to ``base`` in order: ``+name`` adds a
+    tool, ``-name`` removes one; other entries are ignored."""
+    tools = list(base)
+    for entry in entries:
+        if not is_tool_modifier(entry):
+            continue
+        name = entry[1:]
+        index = tools.index(name) if name in tools else -1
+        if entry.startswith("+") and index == -1 and name:
+            tools.append(name)
+        elif entry.startswith("-") and index != -1:
+            tools.pop(index)
+    return tools
+
+
 def tool_selection_from_args(args: argparse.Namespace) -> Optional[ToolSelection]:
     """The selection for one run, or None when no tool flag was given."""
     if args.tools is None and not args.no_tools and not args.exclude_tools and not getattr(args, "no_builtin_tools", False):
         return None
     allowed = split_tool_entries(args.tools) if args.tools is not None else ([] if args.no_tools else None)
+    if allowed is not None:
+        error = get_tool_list_error(allowed)
+        if error:
+            raise ValueError(error)
+        if allowed and all(is_tool_modifier(entry) for entry in allowed):
+            # Modifier lists are incremental: the built-in tools are the base
+            # set, and each entry adds or removes one tool (TS applyToolModifiers).
+            allowed = apply_tool_modifiers(list(BUILTIN_TOOL_NAMES), allowed)
     excluded = split_tool_entries(args.exclude_tools) if args.exclude_tools else []
     if getattr(args, "no_builtin_tools", False):
         # --no-builtin-tools drops exactly the built-in tools; extension and MCP
@@ -422,10 +470,20 @@ class CliRenderer:
         self.settings = settings or {}
         self.markdown = bool(self.settings.get("markdown", False))
         self.fold = int(self.settings.get("fold_output", 10))
+        # Horizontal padding for transcript content (outputPad setting, default 1).
+        self.output_pad = 0 if self.settings.get("output_pad") == 0 else 1
         self.extensions: Optional[ExtensionManager] = None
         self.tool_args = {}
         self.ui: Optional[TerminalUI] = None
         self.full_screen = False
+
+    def pad(self, text: str) -> str:
+        """Left padding for transcript content lines (outputPad); blank lines
+        stay blank so block spacing is unaffected."""
+        if self.output_pad <= 0 or not text:
+            return text
+        prefix = " " * self.output_pad
+        return "\n".join(prefix + line if line else line for line in text.split("\n"))
 
     def image_width(self) -> int:
         if self.ui is not None:
@@ -470,7 +528,7 @@ class CliRenderer:
                     if self.extensions is not None:
                         text = await self.extensions.transform_markdown(text, "assistant")
                     theme = MONO_THEME if self.settings.get("theme") == "mono" else None
-                    print("\n" + render_markdown(text, theme=theme), flush=True)
+                    print("\n" + self.pad(render_markdown(text, theme=theme)), flush=True)
             for block in event.message.content:
                 if isinstance(block, ImageContent):
                     self.print_image_block(block)
@@ -482,21 +540,24 @@ class CliRenderer:
                 lines = await self.extensions.render_tool(event.tool_name, "call", args,
                     {"args": args, "toolCallId": event.tool_call_id, "expanded": not bool(self.fold),
                      "isPartial": False, "executionStarted": True, "argsComplete": True,
-                     "parentToolCallId": event.parent_tool_call_id}, 80)
+                     "parentToolCallId": event.parent_tool_call_id, "outputPad": self.output_pad}, 80)
                 if lines is not None:
                     print("\n" + "\n".join(indent + line for line in lines), flush=True)
                     return
             shown = args.get("command") or args.get("path") or args.get("pattern") or ""
-            print(f"\n{indent}[{event.tool_name}] {shown}", flush=True)
+            print("\n" + self.pad(f"{indent}[{event.tool_name}] {shown}"), flush=True)
         elif isinstance(event, ToolExecutionEndEvent):
             result = event.result
             indent = "  " if event.parent_tool_call_id else ""
             if self.extensions is not None and result is not None:
+                options = {"args": self.tool_args.pop(event.tool_call_id, {}), "toolCallId": event.tool_call_id,
+                           "expanded": not bool(self.fold), "isPartial": False, "isError": event.is_error,
+                           "executionStarted": True, "argsComplete": True,
+                           "parentToolCallId": event.parent_tool_call_id, "outputPad": self.output_pad}
+                if event.duration_ms is not None:
+                    options["durationMs"] = event.duration_ms
                 lines = await self.extensions.render_tool(event.tool_name, "result", to_json_value(result),
-                    {"args": self.tool_args.pop(event.tool_call_id, {}), "toolCallId": event.tool_call_id,
-                     "expanded": not bool(self.fold), "isPartial": False, "isError": event.is_error,
-                     "executionStarted": True, "argsComplete": True,
-                     "parentToolCallId": event.parent_tool_call_id}, 80)
+                    options, 80)
                 if lines is not None:
                     if lines:
                         print("\n".join(indent + line for line in lines), flush=True)
@@ -505,11 +566,11 @@ class CliRenderer:
             if result is not None and getattr(result, "content", None):
                 text = "\n".join(block.text for block in result.content if isinstance(block, TextContent))
             if event.is_error:
-                print(f"{indent}  error: {text}", flush=True)
+                print(self.pad(f"{indent}  error: {text}"), flush=True)
             elif self.fold and result is not None and text:
                 lines = text.splitlines()
                 for line in lines[: self.fold]:
-                    print(f"{indent}  {line}", flush=True)
+                    print(self.pad(f"{indent}  {line}"), flush=True)
                 if len(lines) > self.fold:
                     print(f"{indent}  [+{len(lines) - self.fold} lines folded; /set fold_output 0 shows all]", flush=True)
             if event.duration_ms is not None and event.tool_name in ("bash", "powershell"):
@@ -594,6 +655,11 @@ async def run_prompt(agent: Agent, text: str, renderer: CliRenderer, session: Op
     finally:
         unsubscribe()
         unsubscribe_render()
+        if extensions is not None:
+            # Extension-facing settle event (TS AgentSession emits it after
+            # every run; the JSON wire event is written by the caller).
+            await extensions.emit("agent_settled",
+                                  {"type": "agent_settled", "aborted": agent.abort_requested})
 
 
 def _session_recorder(session: Optional[SessionManager]):
@@ -681,6 +747,18 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                            initial: Optional[Tuple[str, List[Any]]] = None) -> None:
     loop = asyncio.get_running_loop()
     print(BANNER)
+    reporter = None
+    if program_status_enabled() and sys.stdout.isatty():
+        def emit_status(sequence: str) -> None:
+            try:
+                sys.stdout.write(sequence)
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+        reporter = ProgramStatusReporter(emit_status, lambda: session.name if session else None)
+        agent.subscribe(reporter.handle_event)
+        if ui:
+            ui.program_status = reporter
     if initial is not None and (initial[0] or initial[1]):
         try:
             await run_prompt(agent, initial[0], renderer, session, resources, extensions, mcp, images=initial[1])
@@ -700,6 +778,20 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
             continue
         text = value or ""
         if not text:
+            continue
+        if text.lstrip().startswith("!"):
+            # Shell escape (F-TUI-04): run outside the model; `!!` keeps the
+            # output out of the context. The run lands in the transcript and
+            # the session as a bashExecution message.
+            try:
+                message = await run_bang(text, os.getcwd())
+            except (ValueError, RuntimeError, OSError, FileNotFoundError) as exc:
+                print(f"error: {exc}")
+                continue
+            agent.messages.append(message)
+            if session:
+                session.append_bash_execution(message)
+            print("\n" + renderer.pad(render_bang_output(message)), flush=True)
             continue
         if text.startswith("/"):
             command, _, rest = text.partition(" ")
@@ -776,9 +868,10 @@ async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optiona
                             await mcp.reload()
                             sync_mcp_tools(agent, mcp)
                         elif parts and parts[0] == "login" and len(parts) > 1:
-                            await mcp.oauth_login(parts[1])
+                            server, login_timeout = _mcp_login_args(parts[1:])
+                            await mcp.oauth_login(server, timeout=login_timeout)
                             sync_mcp_tools(agent, mcp)
-                            print(f"credentials saved for MCP server {parts[1]}")
+                            print(f"credentials saved for MCP server {server}")
                         elif parts and parts[0] == "logout" and len(parts) > 1:
                             await mcp.oauth_logout(parts[1])
                             sync_mcp_tools(agent, mcp)
@@ -1862,6 +1955,19 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     renderer = CliRenderer(settings=registry.config.settings)
     agent._tool_search_session = session
 
+    # Prompt cache warming (F-CA-13): off by default; streaming/idle keep the
+    # provider-side cache alive with one-token replays of the last request.
+    warmer = None
+    warming_mode = registry.config.settings.get("cache_warming", "off")
+    if warming_mode in ("streaming", "idle"):
+        from .cache_warmer import CacheWarmer
+
+        warmer = CacheWarmer(get_default_stream_fn())
+        warmer.mode = warming_mode
+        agent.on_real_request = warmer.capture
+        agent.subscribe(lambda event: warmer.on_agent_settled()
+                        if getattr(event, "type", "") == "agent_settled" else None)
+
     # --no-mcp disables built-in MCP support: no servers connect, no MCP tools,
     # and extensions see no MCP manager to register servers on.
     mcp = None if args.no_mcp else McpManager(registry.config)
@@ -1892,7 +1998,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         if codemode_settings.get("enabled") and (selection is None or selection.keeps("codemode")):
             agent.tools.append(create_codemode_tool(
                 agent.tools, session, codemode_settings,
-                execute_tool=execute_nested_tool))
+                execute_tool=execute_nested_tool, model_registry=registry))
         timings.time("extensions")
         if args.evals:
             passed = await run_evals_file(agent, renderer, session, args.evals, mcp)
@@ -1905,14 +2011,14 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             await server.serve()
             return 0
         if args.mode == "json":
-            writer = JsonWriter(output=raw_stdout())
+            writer = WireJsonWriter(output=raw_stdout(), session=session)
             try:
                 await run_prompt(agent, prompt_text, writer, session, resources, extensions, mcp, images=prompt_images)
             except Exception as exc:
                 await writer.write({"type": "run_error", "error": str(exc)})
                 return 1
             finally:
-                await writer.write({"type": "agent_settled"})
+                await writer.write({"type": "agent_settled", "aborted": agent.abort_requested})
             return 0
         if args.print_mode:
             # -p forces one-shot output even without a prompt argument: piped
@@ -1952,6 +2058,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                                    PackageManager(registry.config), initial=(prompt_text, prompt_images or []))
         return 0
     finally:
+        if warmer is not None:
+            await warmer.close()
         await extensions.close()
         if mcp is not None:
             await mcp.close()
@@ -1974,6 +2082,10 @@ def _route_durable_command(argv: List[str]) -> Optional[int]:
         from ..durable.server import main as routed_main
 
         return routed_main(argv[1:])
+    if first == "mcp":
+        from .mcp_cli import main as mcp_main
+
+        return mcp_main(argv[1:])
     return None
 
 

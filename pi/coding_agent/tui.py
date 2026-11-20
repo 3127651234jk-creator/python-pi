@@ -1116,8 +1116,11 @@ class TerminalUI:
                 task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
 
-    async def _run_dialog(self, create_dialog: Callable) -> Any:
+    async def _run_dialog(self, create_dialog: Callable, blocked_message: str = "") -> Any:
         """Give a modal dialog exclusive input while the steering reader waits."""
+        reporter = getattr(self, "program_status", None)
+        if reporter is not None:
+            reporter.set_blocked("dialog", ("question", blocked_message or "Input"))
         suspended = self.session.app.is_running
         if suspended:
             self._suspend_read = True
@@ -1130,6 +1133,8 @@ class TerminalUI:
             with create_app_session(input=self.session.app.input, output=self.session.app.output):
                 return await create_dialog().run()
         finally:
+            if reporter is not None:
+                reporter.set_blocked("dialog", None)
             if suspended:
                 self._suspend_read = False
                 self._resume_event.set()
@@ -1138,7 +1143,8 @@ class TerminalUI:
                      default: Optional[str] = None) -> Optional[str]:
         if not values:
             return None
-        return await self._run_dialog(lambda: _ChoiceDialog(title, values, self.style, default))
+        return await self._run_dialog(lambda: _ChoiceDialog(title, values, self.style, default),
+                                      blocked_message=title)
 
     async def input(self, title: str, default: str = "", password: bool = False,
                     validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
@@ -1146,7 +1152,8 @@ class TerminalUI:
         no history, so password entry never lands in an input history. With
         ``validate`` the dialog rejects an invalid value in place, keeps the
         text and shows the rule's error message."""
-        return await self._run_dialog(lambda: _TextDialog(title, default, password, self.style, validate))
+        return await self._run_dialog(lambda: _TextDialog(title, default, password, self.style, validate),
+                                      blocked_message=title)
 
     async def custom_api_form(self, validate: ValidateForm,
                               save: SaveForm) -> Optional[CustomApiFormResult]:

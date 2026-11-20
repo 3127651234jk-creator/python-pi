@@ -11,13 +11,18 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pi.agent.types import AgentTool
 from pi.coding_agent.cli import (
     ToolSelection,
+    apply_tool_modifiers,
     apply_tool_selection,
     build_parser,
+    get_tool_list_error,
+    is_tool_modifier,
     skill_file_read_tool,
     sync_mcp_tools,
     tool_selection_from_args,
@@ -185,3 +190,43 @@ def test_extension_refresh_tools_honors_selection(tmp_path):
     agent.tools[:] = [tool("read")]
     manager.refresh_tools()
     assert names_of(agent) == ["read"]
+
+
+# ---------------------------------------------------------------------------
+# +name/-name modifiers (F-CA-01)
+# ---------------------------------------------------------------------------
+
+def test_tool_modifier_predicates_and_errors():
+    assert is_tool_modifier("+codemode") and is_tool_modifier("-find")
+    assert not is_tool_modifier("read")
+    assert get_tool_list_error(["read", "+codemode"]) == \
+        "tool names cannot be mixed with +name or -name entries"
+    assert get_tool_list_error(["+mcp__*"]) == \
+        "+name and -name entries take exact tool names, not patterns: +mcp__*"
+    assert get_tool_list_error(["+codemode", "-find"]) is None
+    assert get_tool_list_error(["read", "mcp__radius__*"]) is None
+
+
+def test_apply_tool_modifiers_adds_and_removes_in_order():
+    base = ["read", "bash", "edit"]
+    assert apply_tool_modifiers(base, ["+codemode", "-bash", "-grep", "+read"]) == ["read", "edit", "codemode"]
+    # A lone "+" adds nothing; plain names are ignored.
+    assert apply_tool_modifiers(base, ["+"]) == base
+    assert apply_tool_modifiers(base, ["read"]) == base
+
+
+def test_tools_modifier_list_builds_on_builtin_set():
+    selection = select(["--tools", "+codemode,-find"])
+    assert selection.keeps("codemode")
+    assert selection.keeps("read") and selection.keeps("bash")
+    assert not selection.keeps("find")
+
+
+def test_tools_mixed_modifier_and_plain_name_is_rejected():
+    with pytest.raises(ValueError, match="cannot be mixed"):
+        select(["--tools", "read,+codemode"])
+
+
+def test_tools_modifier_with_pattern_is_rejected():
+    with pytest.raises(ValueError, match="not patterns"):
+        select(["--tools", "+mcp__radius__*"])

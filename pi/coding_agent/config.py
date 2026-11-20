@@ -94,7 +94,8 @@ def validate_settings(settings: dict) -> None:
     allowed = {"provider", "model", "thinking", "session_dir", "compaction", "skills", "prompts", "include_default_resources", "enable_skill_commands"}
     allowed.update({"extensions", "include_default_extensions"})
     allowed.update({"theme", "keybindings"})
-    allowed.update({"packages", "sync_catalog", "markdown", "fold_output", "codemode"})
+    allowed.update({"packages", "sync_catalog", "markdown", "fold_output", "codemode", "output_pad",
+                    "cache_warming"})
     allowed.update({"images"})
     allowed.update({"default_project_trust", "enable_install_telemetry", "cache_retention"})
     allowed.update({"retry"})
@@ -129,6 +130,10 @@ def validate_settings(settings: dict) -> None:
         raise ValueError("images settings must be {auto_resize?: bool, block_images?: bool}")
     if "fold_output" in settings and (type(settings["fold_output"]) is not int or settings["fold_output"] < 0):
         raise ValueError("fold_output must be a nonnegative integer")
+    if "output_pad" in settings and settings["output_pad"] not in (0, 1):
+        raise ValueError("output_pad must be 0 or 1")
+    if "cache_warming" in settings and settings["cache_warming"] not in ("off", "streaming", "idle"):
+        raise ValueError("cache_warming must be off, streaming, or idle")
     if "codemode" in settings:
         codemode = settings["codemode"]
         if not isinstance(codemode, dict) or set(codemode) - {"enabled", "timeout_ms"} or (

@@ -98,6 +98,58 @@ def test_renderer_took_is_shell_only_and_needs_a_duration(capsys):
     assert "Took" not in capsys.readouterr().out
 
 
+def test_renderer_passes_duration_ms_to_extension_renderers():
+    """Extension tool renderers get durationMs in the render context (#10549: F-CA-03)."""
+    seen = []
+
+    class Extensions:
+        async def render_tool(self, tool_name, phase, payload, options=None, width=80):
+            seen.append(dict(options or {}))
+            return ["lines"]
+
+    renderer = CliRenderer()
+    renderer.extensions = Extensions()
+    asyncio.run(renderer(ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="bash",
+        result=AgentToolResult(content=[TextContent(text="out")]), is_error=False, duration_ms=42,
+    )))
+    assert seen[0]["durationMs"] == 42
+    asyncio.run(renderer(ToolExecutionEndEvent(
+        tool_call_id="t2", tool_name="bash",
+        result=AgentToolResult(content=[TextContent(text="out")]), is_error=False,
+    )))
+    assert "durationMs" not in seen[1]
+
+
+def test_renderer_pads_transcript_content():
+    """outputPad indents transcript lines; 0 keeps them flush (F-TUI-03)."""
+    padded = CliRenderer(settings={"output_pad": 1})
+    assert padded.output_pad == 1
+    assert padded.pad("line one\n\nline two") == " line one\n\n line two"
+    flush = CliRenderer(settings={"output_pad": 0})
+    assert flush.output_pad == 0 and flush.pad("line") == "line"
+    default = CliRenderer()
+    assert default.output_pad == 1
+
+
+def test_renderer_passes_output_pad_to_extension_renderers():
+    """Extension tool renderers get outputPad in the render context (#10557: F-TUI-03)."""
+    seen = []
+
+    class Extensions:
+        async def render_tool(self, tool_name, phase, payload, options=None, width=80):
+            seen.append(dict(options or {}))
+            return ["lines"]
+
+    renderer = CliRenderer(settings={"output_pad": 0})
+    renderer.extensions = Extensions()
+    asyncio.run(renderer(ToolExecutionEndEvent(
+        tool_call_id="t", tool_name="bash",
+        result=AgentToolResult(content=[TextContent(text="out")]), is_error=False,
+    )))
+    assert seen[0]["outputPad"] == 0
+
+
 def test_format_duration_matches_the_ts_shell_renderers():
     assert format_duration(0) == "0.0s"
     assert format_duration(1500) == "1.5s"

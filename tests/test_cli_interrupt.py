@@ -52,7 +52,10 @@ def test_json_cancellation_emits_error_and_settled(tmp_path, monkeypatch):
             await aborted.wait()
 
         monkeypatch.setattr(Agent, "prompt", prompt)
-        monkeypatch.setattr(Agent, "abort", lambda self: aborted.set())
+        # The prompt stub replaces the real run loop, so the abort stub marks
+        # the flag the CLI reports through agent_settled.aborted (F-CA-02).
+        monkeypatch.setattr(Agent, "abort",
+                            lambda self: (aborted.set(), setattr(self, "abort_requested", True)))
         running = asyncio.create_task(async_main([
             "--provider", "faux", "--mode", "json", "--no-session",
             "--agent-dir", str(tmp_path / "agent"), "hello",
@@ -67,5 +70,6 @@ def test_json_cancellation_emits_error_and_settled(tmp_path, monkeypatch):
     finally:
         restore_stdout()
     assert [json.loads(line) for line in output.getvalue().splitlines()] == [
-        {"type": "run_error", "error": "Request aborted"}, {"type": "agent_settled"},
+        {"type": "run_error", "error": "Request aborted"},
+        {"type": "agent_settled", "aborted": True},
     ]
