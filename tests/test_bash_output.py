@@ -12,6 +12,40 @@ from pi.coding_agent.tools import bash as bash_module
 from pi.coding_agent.tools.bash import DEFAULT_MAX_BYTES, OutputAccumulator, create_bash_tool
 from pi.coding_agent.tools.truncate import truncate_tail
 from pi.coding_agent.tools.windows_process import WindowsJob
+from pi.util import split_incomplete_ansi_suffix, strip_ansi
+
+
+def test_strip_ansi_removes_sgr_and_osc_sequences():
+    assert strip_ansi("\x1b[31mred\x1b[0m plain") == "red plain"
+    # OSC 8 hyperlink with BEL terminator, and a title with ESC\ terminator.
+    assert strip_ansi("\x1b]8;;http://x\x07link\x1b]8;;\x07") == "link"
+    assert strip_ansi("\x1b]0;title\x1b\\text") == "text"
+    # A chunk ending mid-sequence keeps its text: the split suffix is pending,
+    # and joining with the next chunk yields one complete stripped sequence.
+    complete, pending = split_incomplete_ansi_suffix("ok\x1b[3")
+    assert complete == "ok" and pending == "\x1b[3"
+    assert strip_ansi(complete + pending + "8m done") == "ok done"
+    # An unfinished OSC holds its body; the next chunk's terminator closes it.
+    complete, pending = split_incomplete_ansi_suffix("\x1b]8;;http://x")
+    assert complete == "" and pending == "\x1b]8;;http://x"
+
+
+def test_accumulator_strips_ansi_and_joins_split_sequences():
+    output = OutputAccumulator()
+    try:
+        output.append("\x1b[31mcolored line\n".encode())
+        # A color sequence split across two chunks.
+        output.append(b"second ")
+        output.append(b"\x1b[32")
+        output.append(b"mgreen line\x1b[0m\n")
+        output.close()
+        prefix, truncation, path = output.snapshot()
+        assert truncation.content == "colored line\nsecond green line\n"
+        assert prefix == "colored line\nsecond green line\n"
+    finally:
+        output.close()
+        if os.path.exists(output._log.name):
+            os.unlink(output._log.name)
 
 
 def test_accumulator_bounds_memory_and_preserves_log():

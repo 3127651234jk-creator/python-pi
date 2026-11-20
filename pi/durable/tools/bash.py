@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 from ..env import Context, ExecutionEnv, ShellExecOptions, ShellSpillOptions, ShellOutputWindow
 from ..truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
+from ...util import split_incomplete_ansi_suffix, strip_ansi
 from .base import ToolDiagnostic, ToolExecutionApi, ToolExecutionResult, ToolRegistration, define_tool, require_env
 
 MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1000
@@ -105,11 +106,20 @@ async def _run_command(
     env: ExecutionEnv = require_env(api)
     result = None
     for command in commands:
+        # Strip ANSI escape sequences before the retention window counts the
+        # text; a sequence split across chunks is held back for the next one.
+        pending_ansi = ""
+
+        def on_output(text: str, _context: Any, info: Any) -> None:
+            nonlocal pending_ansi
+            complete, pending_ansi = split_incomplete_ansi_suffix(pending_ansi + text)
+            api.output(strip_ansi(complete), info.skipped)
+
         exec_options = ShellExecOptions(
             cwd=execution["cwd"],
             env=execution["env"],
             inherit_env=execution["inherit_env"],
-            on_output=lambda text, _context, info: api.output(text, info.skipped),
+            on_output=on_output,
             spill=ShellSpillOptions(after_bytes=DEFAULT_MAX_BYTES, after_lines=DEFAULT_MAX_LINES),
         )
         if timeout is not None:

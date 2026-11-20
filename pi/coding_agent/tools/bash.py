@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 
 from ...ai.types import TextContent
 from ...agent.types import AgentTool, AgentToolResult
+from ...util import split_incomplete_ansi_suffix, strip_ansi
 from .windows_process import spawn_windows_command
 from .truncate import (
     DEFAULT_MAX_BYTES,
@@ -106,7 +107,13 @@ def powershell_command(command: str) -> Tuple[list, bool]:
 
 
 class OutputAccumulator:
-    """Collect streamed output; tail-truncate snapshots; persist overflow."""
+    """Collect streamed output; tail-truncate snapshots; persist overflow.
+
+    ANSI escape sequences (SGR colors, OSC hyperlinks/titles) are stripped
+    before any counting or retention, and an escape sequence split across
+    chunks is held back instead of leaking a partial sequence into the text
+    (port of the TS bash-executor's streaming strip, #10504).
+    """
 
     def __init__(self) -> None:
         self._tail = ""
@@ -114,6 +121,7 @@ class OutputAccumulator:
         self._total_bytes = 0
         self._newlines = 0
         self._last_character = ""
+        self._pending_ansi = ""
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._log = tempfile.NamedTemporaryFile(prefix="pi-py-bash-", suffix=".log", delete=False)
         self._closed = False
@@ -124,6 +132,11 @@ class OutputAccumulator:
         self._collect(self._decoder.decode(data))
 
     def _collect(self, text: str) -> None:
+        # Hold a trailing unfinished escape sequence for the next chunk, then
+        # strip what is complete so line/byte budgets count visible text only.
+        text = self._pending_ansi + text
+        complete, self._pending_ansi = split_incomplete_ansi_suffix(text)
+        text = strip_ansi(complete)
         encoded = text.encode("utf-8")
         self._total_bytes += len(encoded)
         self._newlines += text.count("\n")
@@ -149,6 +162,9 @@ class OutputAccumulator:
     def close(self) -> None:
         if not self._closed:
             self._collect(self._decoder.decode(b"", final=True))
+            # A trailing unfinished sequence never completes; drop it instead of
+            # leaking escape bytes into the final snapshot.
+            self._pending_ansi = ""
             self.snapshot()
             self._log.close()
             self._closed = True

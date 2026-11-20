@@ -1,16 +1,64 @@
-"""Shared runtime helpers: abort signal and async event stream.
+"""Shared runtime helpers: abort signal, async event stream, ANSI handling.
 
 Ports of the AbortSignal contract and ``EventStream`` from
-``packages/ai/src/utils/event-stream.ts``, adapted to asyncio.
+``packages/ai/src/utils/event-stream.ts``, and of ``splitIncompleteAnsiSuffix``
+/ ``stripAnsi`` from ``packages/coding-agent/src/utils/ansi.ts`` (itself
+derived from chalk's ansi-regex / strip-ansi, MIT), adapted to asyncio and
+``re``.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator, Callable, Generic, Optional, TypeVar, cast
+import re
+from typing import AsyncIterator, Callable, Generic, Optional, Tuple, TypeVar, cast
 
 T = TypeVar("T")
 U = TypeVar("U")
+
+
+# ---------------------------------------------------------------------------
+# ANSI escape handling (port of packages/coding-agent/src/utils/ansi.ts)
+# ---------------------------------------------------------------------------
+
+# Valid string terminator sequences are BEL, ESC\, and 0x9c.
+_ST = r"(?:\x07|\x1b\\|\x9c)"
+# OSC sequences: ESC ] ... ST.
+_OSC_START = r"\x1b\]"
+# CSI and related: ESC/C1, optional intermediates, optional params (supports ;
+# and :), then final byte.
+_CSI_START = r"[\x1b\x9b][\[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?"
+_CSI_FINAL = r"[\dA-PR-TZcf-nq-uy=><~]"
+
+# Complete sequences; OSC is non-greedy until the first ST.
+_ANSI_PATTERN = re.compile(rf"(?:{_OSC_START}[\s\S]*?{_ST})|{_CSI_START}{_CSI_FINAL}")
+# Unfinished sequence at the very end of the text: OSC without its ST (a
+# trailing ESC may start ESC\), or CSI without its final byte.
+_UNFINISHED_ANSI_AT_END = re.compile(
+    rf"(?:{_OSC_START}(?:[^\x07\x9c\x1b]|\x1b(?!\\))*|{_CSI_START})\Z")
+
+# Longest unfinished sequence held back while streaming. Longer ones are
+# processed as-is.
+MAX_PENDING_ANSI_LENGTH = 256
+
+
+def strip_ansi(value: str) -> str:
+    """Remove ANSI escape sequences (SGR, OSC hyperlinks/titles, CSI) from text."""
+    if "\x1b" not in value and "\x9b" not in value:
+        return value
+    return _ANSI_PATTERN.sub("", value)
+
+
+def split_incomplete_ansi_suffix(value: str) -> Tuple[str, str]:
+    """Split streamed text into the part safe to strip now and a trailing
+    unfinished escape sequence to prepend to the next chunk."""
+    if "\x1b" not in value and "\x9b" not in value:
+        return value, ""
+    window_start = max(0, len(value) - MAX_PENDING_ANSI_LENGTH)
+    match = _UNFINISHED_ANSI_AT_END.search(value, window_start)
+    if match is None:
+        return value, ""
+    return value[:match.start()], value[match.start():]
 
 
 class AbortError(Exception):
