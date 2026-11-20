@@ -67,6 +67,23 @@ def resolve_progress_policy(value: Any = None) -> ProgressPolicy:
     )
 
 
+def resolve_context_retention_ms(value: Any = None) -> float:
+    """Resolve ``settings.contextRetentionMs`` (default 600_000 ms, 0 = drop a
+    cached conversation context as soon as it goes idle). Invalid values raise
+    instead of silently applying the default (the B-AG-02 report-not-swallow
+    pattern)."""
+
+    if value is None:
+        return 600_000.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("context_retention_ms must be a finite non-negative number")
+    if not math.isfinite(value):
+        raise ValueError("context_retention_ms must be finite")
+    if value < 0:
+        raise ValueError("context_retention_ms must not be negative")
+    return float(value)
+
+
 # ---------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------
@@ -140,6 +157,11 @@ class TaskRecord:
     background: bool = False
     abort_requested: bool = False
     memos: Optional[Dict[str, Any]] = None
+    # Lifecycle times (TS startedAt/endedAt, #10549): wall-clock ms of the
+    # first change to running and of the change to a terminal status. Records
+    # written before they existed lack them.
+    started_at: Optional[int] = None
+    ended_at: Optional[int] = None
 
 
 @dataclass
@@ -220,7 +242,7 @@ _RECORD_FIELDS = {
     ConversationRecord: ("id", "parent", "owner"),
     EntryRecord: ("id", "conversation_id", "kind", "model", "data", "head", "edits", "by_task_id"),
     SubmissionRecord: ("id", "conversation_id", "type", "status", "request_id", "entry", "answer", "reason", "detail"),
-    TaskRecord: ("id", "conversation_id", "kind", "version", "input", "owner", "background", "abort_requested", "state", "memos"),
+    TaskRecord: ("id", "conversation_id", "kind", "version", "input", "owner", "background", "abort_requested", "state", "memos", "started_at", "ended_at"),
     DocumentRecord: ("id", "kind", "scope", "created_at", "key", "retired_at", "history", "fork"),
 }
 
@@ -325,6 +347,8 @@ def record_from_dict(data: Dict[str, Any]) -> Any:
             abort_requested=data.get("abort_requested", False),
             state=state,
             memos=data.get("memos"),
+            started_at=data.get("started_at"),
+            ended_at=data.get("ended_at"),
         )
     if "tool_call_id" in data:
         raise ValueError("pi-ai messages are not durable records")

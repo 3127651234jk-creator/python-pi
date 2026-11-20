@@ -21,12 +21,12 @@ class Boundary:
     conversation_id: int
     inbox: DocDraft
     head: Optional[int]
-    steering_mode: str = "all"
-    follow_up_mode: str = "all"
+    steering_mode: str = "one-at-a-time"
+    follow_up_mode: str = "one-at-a-time"
 
 
 async def prepare_boundary(tx: Transaction, conversation_id: int,
-                           steering_mode: str = "all", follow_up_mode: str = "all") -> Boundary:
+                           steering_mode: str = "one-at-a-time", follow_up_mode: str = "one-at-a-time") -> Boundary:
     if steering_mode not in ("all", "one-at-a-time") or follow_up_mode not in ("all", "one-at-a-time"):
         raise ValueError("queue mode must be all or one-at-a-time")
     marker = await tx.latest_head_marker(conversation_id)

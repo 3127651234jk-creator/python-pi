@@ -8,6 +8,7 @@ the conversation bound to the transaction and the task attributed to entries.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,6 +49,36 @@ class TransactionScope:
 
     conversation_id: Optional[int] = None
     task_id: Optional[int] = None
+
+
+def _stamp_task_times(host, value: TaskRecord, candidate: Optional[TaskRecord]) -> TaskRecord:
+    """Lifecycle times (port of TS ``#stampTimes``): ``started_at`` on the
+    first change to running, ``ended_at`` on the change to terminal. Once set,
+    they carry over from the replaced record; records written before they
+    existed lack them."""
+
+    status = value.state.status
+    started_at: Optional[int]
+    if candidate is not None and candidate.started_at is not None:
+        started_at = candidate.started_at
+    elif value.started_at is not None:
+        started_at = value.started_at
+    elif status == "running":
+        started_at = host.now()
+    else:
+        started_at = None
+    ended_at: Optional[int]
+    if candidate is not None and candidate.ended_at is not None:
+        ended_at = candidate.ended_at
+    elif value.ended_at is not None:
+        ended_at = value.ended_at
+    elif status == "terminal":
+        ended_at = host.now()
+    else:
+        ended_at = None
+    if started_at == value.started_at and ended_at == value.ended_at:
+        return value
+    return dataclasses.replace(value, started_at=started_at, ended_at=ended_at)
 
 
 class DocDraft:
@@ -388,6 +419,19 @@ class Transaction:
         # Emit updated submission records for place/settle mutations.
         for record in self._pending_submission_updates.values():
             self._writes.append(write_submission(record))
+
+        # Lifecycle times for task records (port of TS #stampTimes, called per
+        # setTask): ``started_at`` on the first change to running, ``ended_at``
+        # on the change to terminal, carried over from the replaced record.
+        staged_tasks: Dict[int, TaskRecord] = {}
+        for write in self._writes:
+            if write["type"] != "task":
+                continue
+            value = write["value"]
+            stamped = _stamp_task_times(self._host, value, staged_tasks.get(value.id))
+            if stamped is not value:
+                write["value"] = stamped
+            staged_tasks[value.id] = stamped
 
         return list(self._writes)
 

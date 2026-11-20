@@ -31,6 +31,9 @@ from ..types import (
 # The TS storage mints ids in the JS safe-integer range; exhaustion is contractual.
 MAX_SAFE_ID = 2**53 - 1
 
+# ID order of a scan (port of TS ScanOrder).
+ScanOrder = str  # "ascending" | "descending"
+
 
 def _scope_key(scope: Dict[str, Any]) -> str:
     kind = scope["kind"]
@@ -134,14 +137,51 @@ class BaseStorage:
             raise StorageRejected("Invalid storage cursor")
         return after
 
+    @staticmethod
+    def scan_start(requested: Optional[str], cursor: Optional[Dict[str, Any]],
+                   fallback: str) -> Tuple[Optional[str], Optional[int]]:
+        """Resolve a scan's order and position (port of TS scanStart).
+
+        A cursor continues in the order it was created with, whether the query
+        repeats that order or omits it; a different ``order`` throws. A cursor
+        without an order, written before scans had one, continues in the
+        scan's default order.
+        """
+
+        if requested is not None and requested not in ("ascending", "descending"):
+            raise StorageRejected(f"Invalid scan order: {requested}")
+        if cursor is None:
+            return requested or fallback, None
+        after = cursor.get("after")
+        if after is not None and (not isinstance(after, int) or isinstance(after, bool)):
+            raise StorageRejected("Invalid storage cursor")
+        stored = cursor.get("order")
+        if stored is not None and stored not in ("ascending", "descending"):
+            raise StorageRejected("Invalid storage cursor")
+        order = stored or fallback
+        if requested is not None and requested != order:
+            raise StorageRejected(f"The cursor continues a {order} scan; the query asks for {requested}")
+        return order, after
+
+    @staticmethod
+    def _scan_ids(ids: List[int], order: str, after: Optional[int]):
+        """Sorted ``ids`` in scan order, after the cursor's ID when there is one."""
+
+        if order == "ascending":
+            first = 0 if after is None else BaseStorage._upper_bound(ids, after)
+            yield from ids[first:]
+        else:
+            end = len(ids) if after is None else BaseStorage._lower_bound(ids, after)
+            yield from reversed(ids[:end])
+
     @classmethod
-    def _page(cls, values: List[Any], limit: int) -> Page:
+    def _page(cls, values: List[Any], limit: int, order: str = "ascending") -> Page:
         if limit <= 0:
             raise StorageRejected("Invalid storage page limit")
         items = values[:limit]
         if len(values) <= limit:
             return Page(items=list(items))
-        return Page(items=list(items), next={"after": items[-1].id})
+        return Page(items=list(items), next={"after": items[-1].id, "order": order})
 
     def assert_open(self) -> None:
         if self.closed:
@@ -403,16 +443,15 @@ class BaseStorage:
         return self.conversations.get(cid)
 
     def scan_conversations_sync(self, query: Dict[str, Any], limit: int, cursor: Optional[Dict[str, Any]]) -> Page:
+        order, after = self.scan_start(query.get("order"), cursor, "ascending")
         if query.get("owner_task_id") is not None:
             ids = self.conversation_ids_by_owner_task.get(query["owner_task_id"], [])
         elif query.get("owner_conversation_id") is not None:
             ids = self.conversation_ids_by_owner_conversation.get(query["owner_conversation_id"], [])
         else:
             ids = self.conversation_ids
-        after = self._cursor_after(cursor)
-        start = 0 if after is None else self._upper_bound(ids, after)
         values: List[Any] = []
-        for rid in ids[start:]:
+        for rid in self._scan_ids(ids, order, after):
             if len(values) > limit:
                 break
             value = self.conversations[rid]
@@ -421,7 +460,7 @@ class BaseStorage:
             ):
                 continue
             values.append(value)
-        return self._page(values, limit)
+        return self._page(values, limit, order)
 
     def visible_entries(self, cid: int, min_entry_id: int = 0, max_entry_id: int = 1 << 62):
         if cid not in self.conversations:
@@ -441,6 +480,30 @@ class BaseStorage:
             if upper_entry_id < min_entry_id:
                 break
             current_id = conversation.parent["conversation_id"]
+
+    def visible_entries_ascending(self, cid: int, min_entry_id: int = 0, max_entry_id: int = 1 << 62):
+        """Visible entries oldest first: the fork chain's segments from the root forward."""
+
+        if cid not in self.conversations:
+            raise StorageRejected(f"Unknown conversation: {cid}")
+        segments: List[Tuple[int, int]] = []  # (conversation_id, upper bound)
+        current_id = cid
+        upper_entry_id = max_entry_id
+        while True:
+            segments.append((current_id, upper_entry_id))
+            conversation = self.conversations[current_id]
+            if conversation.parent is None:
+                break
+            upper_entry_id = min(upper_entry_id, conversation.parent["at"])
+            if upper_entry_id < min_entry_id:
+                break
+            current_id = conversation.parent["conversation_id"]
+        for segment_id, segment_upper in reversed(segments):
+            ids = self.entry_ids.get(segment_id, [])
+            for rid in ids[self._lower_bound(ids, min_entry_id):]:
+                if rid > segment_upper:
+                    break
+                yield self.entries[rid]
 
     def get_entry_global(self, eid: int) -> Optional[Tuple[Any, int]]:
         entry = self.entries.get(eid)
@@ -470,26 +533,34 @@ class BaseStorage:
             current_id = conversation.parent["conversation_id"]
 
     def scan_entries_sync(self, query: Dict[str, Any], limit: int, cursor: Optional[Dict[str, Any]]) -> Page:
-        after = self._cursor_after(cursor)
+        order, after = self.scan_start(query.get("order"), cursor, "descending")
+        # The cursor narrows the bound on the side the scan moves away from.
+        min_entry_id = query.get("min_entry_id", 0)
         max_entry_id = query.get("max_entry_id", 1 << 62)
-        if after is not None:
+        if after is not None and order == "descending":
             max_entry_id = min(max_entry_id, after - 1)
+        if after is not None and order == "ascending":
+            min_entry_id = max(min_entry_id, after + 1)
         visible: List[Any] = []
-        for entry in self.visible_entries(query["conversation_id"], query.get("min_entry_id", 0), max_entry_id):
+        entries = (
+            self.visible_entries(query["conversation_id"], min_entry_id, max_entry_id)
+            if order == "descending"
+            else self.visible_entries_ascending(query["conversation_id"], min_entry_id, max_entry_id)
+        )
+        for entry in entries:
             visible.append(entry)
             if len(visible) > limit:
                 break
-        return self._page(visible, limit)
+        return self._page(visible, limit, order)
 
     def get_task(self, tid: int) -> Optional[Any]:
         return self.tasks.get(tid)
 
     def scan_tasks_sync(self, query: Dict[str, Any], limit: int, cursor: Optional[Dict[str, Any]]) -> Page:
+        order, after = self.scan_start(query.get("order"), cursor, "ascending")
         ids = self.task_ids if query.get("status") is None else self.task_ids_by_status[query["status"]]
-        after = self._cursor_after(cursor)
-        start = 0 if after is None else self._upper_bound(ids, after)
         values: List[Any] = []
-        for rid in ids[start:]:
+        for rid in self._scan_ids(ids, order, after):
             if len(values) > limit:
                 break
             value = self.tasks[rid]
@@ -502,24 +573,23 @@ class BaseStorage:
             if query.get("background") is not None and value.background != query["background"]:
                 continue
             values.append(value)
-        return self._page(values, limit)
+        return self._page(values, limit, order)
 
     def get_submission(self, sid: int) -> Optional[Any]:
         return self.submissions.get(sid)
 
     def scan_submissions_sync(self, query: Dict[str, Any], limit: int, cursor: Optional[Dict[str, Any]]) -> Page:
+        order, after = self.scan_start(query.get("order"), cursor, "ascending")
         ids = self.submission_ids if query.get("status") is None else self.submission_ids_by_status[query["status"]]
-        after = self._cursor_after(cursor)
-        start = 0 if after is None else self._upper_bound(ids, after)
         values: List[Any] = []
-        for rid in ids[start:]:
+        for rid in self._scan_ids(ids, order, after):
             if len(values) > limit:
                 break
             value = self.submissions[rid]
             if query.get("conversation_id") is not None and value.conversation_id != query["conversation_id"]:
                 continue
             values.append(value)
-        return self._page(values, limit)
+        return self._page(values, limit, order)
 
     def get_submission_by_request(self, cid: int, request_id: str) -> Optional[Any]:
         rid = self.submission_ids_by_request.get((cid, request_id))

@@ -14,8 +14,9 @@ from pi.ai.models import Model
 from pi.ai.providers import faux
 from pi.ai.retry import RetryPolicy
 from pi.ai.types import AssistantMessage, TextContent, Usage, UserMessage
-from pi.agent.types import AgentToolResult
+from pi.agent.types import AgentTool, AgentToolResult
 from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
+from pi.durable.extensions import Extension
 from pi.durable.harness import Harness, TaskRuntime
 from pi.durable.session import create_session
 from pi.durable.storage import JsonlStorage
@@ -443,3 +444,158 @@ def test_durable_generation_does_not_retry_quota_error(tmp_path):
             faux.reset_script_index()
 
     asyncio.run(scenario())
+
+
+def test_task_records_carry_lifecycle_times(tmp_path):
+    """Tasks stamp startedAt on the first running write and endedAt on the
+    terminal write (F-AG-07, #10549); the Session clock is injectable."""
+
+    async def scenario():
+        storage = JsonlStorage(str(tmp_path / "s.jsonl"))
+        session = create_session(storage, now=lambda: 12345)
+        harness = Harness(session, make_model())
+        cid = await harness.create_conversation()
+        task_id = await harness.submit_input(cid, "hello")
+        await harness.run_pending_tasks()
+        record = await harness._get_task(task_id)
+        assert record.started_at == 12345
+        assert record.ended_at == 12345
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_task_lifecycle_times_survive_resume_and_predate_writes(tmp_path):
+    """Resumed tasks keep their start stamp (carry-over, not restamp); records
+    written before the fields existed read back without them."""
+
+    async def scenario():
+        from pi.durable.types import TaskRecord, write_task
+
+        path = str(tmp_path / "s.jsonl")
+        clock = {"now": 5000}
+        storage = JsonlStorage(path)
+        session = create_session(storage, now=lambda: clock["now"])
+        harness = Harness(session, make_model())
+        cid = await harness.create_conversation()
+
+        async def phase_wait(task, runtime, harness):
+            clock["now"] = 6000
+            await runtime.commit(lambda tx, current: TaskState(
+                status="waiting", on=[], policy="allSettled", checkpoint={"phase": "resume"}))
+
+        async def phase_resume(task, runtime, harness):
+            clock["now"] = 7000
+            await runtime.commit(lambda tx, current: TaskState(
+                status="terminal", outcome=TaskOutcome(status="completed")))
+
+        definition = define_task(name="pi.wait", version=1, initial=lambda input: {"phase": "wait"},
+                                 phases={"wait": phase_wait, "resume": phase_resume})
+        harness.register_definition(definition)
+
+        async def submit_wait(tx):
+            record = await tx.create_task(definition, {}, {"ownership": {"kind": "conversation"},
+                                                           "conversation_id": cid})
+            return record.id
+
+        task_id = await harness.session.commit(submit_wait, TransactionScope(conversation_id=cid))
+        await harness.run_pending_tasks()
+        record = await harness._get_task(task_id)
+        # started_at is stamped at the reserve (clock 5000) and carried over to
+        # the terminal write (clock 7000); a restamp would have made it 7000.
+        assert record.started_at == 5000
+        assert record.ended_at == 7000
+
+        # A record written before the fields existed (raw storage commit)
+        # reads back without them.
+        raw = TaskRecord(
+            id=await storage.mint_id(), conversation_id=cid, kind="legacy", version=1, input={},
+            state=TaskState(status="pending", checkpoint={"phase": "p"}))
+        await storage.commit([write_task(raw)])
+        legacy = await storage.task(raw.id)
+        assert legacy.started_at is None and legacy.ended_at is None
+        await storage.close()
+
+        # Reopen: stamped records replay with their times.
+        reopened = create_session(JsonlStorage(path))
+        again = await reopened.storage.task(task_id)
+        assert again.started_at == 5000 and again.ended_at == 7000
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
+def test_durable_tool_result_and_assistant_carry_durations(tmp_path, monkeypatch):
+    """pi.tool's visible pi.tool-result entry times execute(), and assistant
+    entries carry the ai-layer response duration (F-AG-08, #10549)."""
+
+    monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+        {"toolCalls": [{"id": "c1", "name": "echo", "arguments": {}}]},
+        {"text": "final"},
+    ]))
+    faux.reset_script_index()
+    try:
+        async def scenario():
+            session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
+            harness = Harness(session, make_model())
+
+            async def execute(call_id, params, signal=None, on_update=None):
+                await asyncio.sleep(0.02)
+                return AgentToolResult(content=[TextContent(text="echoed")])
+
+            harness.register_tools({"echo": AgentTool(name="echo", description="echo", execute=execute)})
+            cid = await harness.create_conversation()
+            await harness.submit_input(cid, "run the tool")
+            await harness.run_pending_tasks()
+
+            transcript = await harness.transcript(cid)
+            kinds = [entry.kind for entry in transcript]
+            # The second generation re-baselines idempotently: no new pi.system.
+            assert kinds == ["pi.user", "pi.system", "pi.assistant", "pi.tool-result", "pi.assistant"]
+            tool_result = transcript[3].model[0]
+            assert tool_result.duration_ms is not None and tool_result.duration_ms >= 15
+            tool_call = transcript[2].model[0]
+            final = transcript[4].model[0]
+            # Both responses went through the ai-layer wrapper (faux), which
+            # stamps the final assistant message.
+            assert isinstance(tool_call.duration_ms, int) and tool_call.duration_ms >= 0
+            assert isinstance(final.duration_ms, int) and final.duration_ms >= 0
+            await session.close()
+
+        asyncio.run(scenario())
+    finally:
+        os.environ.pop("FAUX_SCRIPT", None)
+        faux.reset_script_index()
+
+
+def test_durable_blocked_tool_result_has_no_duration(tmp_path, monkeypatch):
+    """A hook-blocked call never executed, so its result carries no duration."""
+
+    monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+        {"toolCalls": [{"id": "c1", "name": "echo", "arguments": {}}]},
+        {"text": "done"},
+    ]))
+    faux.reset_script_index()
+    try:
+        async def scenario():
+            session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
+            extension = Extension("guard", hooks={"before_tool": lambda call, api, runtime: {"block": "denied"}})
+            harness = Harness(session, make_model(), extensions=[extension])
+
+            async def execute(*args):
+                raise AssertionError("blocked tool must not run")
+
+            harness.register_tools({"echo": AgentTool(name="echo", description="echo", execute=execute)})
+            cid = await harness.create_conversation()
+            await harness.submit_input(cid, "hello")
+            await harness.run_pending_tasks()
+            transcript = await harness.transcript(cid)
+            tool_result = next(entry for entry in transcript if entry.kind == "pi.tool-result")
+            message = tool_result.model[0]
+            assert message.is_error is True and message.duration_ms is None
+            await session.close()
+
+        asyncio.run(scenario())
+    finally:
+        os.environ.pop("FAUX_SCRIPT", None)
+        faux.reset_script_index()

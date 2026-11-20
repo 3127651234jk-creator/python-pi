@@ -333,8 +333,9 @@ def test_compaction_still_cuts_when_the_system_entry_exceeds_keep_recent(tmp_pat
         async def summarize_stream(model, messages, *args, **kwargs):
             return answer_message("summary")
 
-        # tasks.py binds _stream_once at import time, so patch its module global.
-        monkeypatch.setattr("pi.durable.tasks._stream_once", summarize_stream)
+        # tasks.py resolves _stream_once through the harness module, so patch
+        # its definition site.
+        monkeypatch.setattr("pi.durable.harness._stream_once", summarize_stream)
         compact_id = await harness.submit_compact_task(cid)
         await harness.run_pending_tasks()
         record = await harness._get_task(compact_id)
@@ -375,8 +376,9 @@ def test_compaction_summary_skips_omitted_entries(tmp_path, monkeypatch):
             requests.append(list(messages))
             return answer_message("summary")
 
-        # tasks.py binds _stream_once at import time, so patch its module global.
-        monkeypatch.setattr("pi.durable.tasks._stream_once", capture)
+        # tasks.py resolves _stream_once through the harness module, so patch
+        # its definition site.
+        monkeypatch.setattr("pi.durable.harness._stream_once", capture)
         compact_id = await harness.submit_compact_task(cid)
         await harness.run_pending_tasks()
         compact_record = await harness._get_task(compact_id)

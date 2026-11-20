@@ -82,6 +82,7 @@ def create_storage_conformance(options: StorageConformanceOptions) -> List[Stora
         case("paginates conversations by opaque cursor in ascending ID order", _case_conversation_cursor),
         case("filters and pages conversations by durable owner edges", _case_owner_edges),
         case("scans deep fork history newest-first through every ancestor cap", _case_fork_history),
+        case("scans tables in either ID order and continues a cursor in its order", _case_scan_order),
         case("replaces complete task records and pages filtered task scans", _case_task_replace),
         case("stores owners and scans waiting and completing tasks by status", _case_task_status),
         case(
@@ -438,6 +439,39 @@ async def _case_fork_history(storage) -> None:
     assert_obj.strict_equal(historical_marker.head, root_first)
     assert_obj.strict_equal(await storage.find_latest_head_marker(grandchild_id, root_first), None)
 
+    # Oldest first: the root's segment, then each fork's, each capped at the
+    # next fork point (1.1.0 ScanOrder, #10546).
+    ascending_query = {"conversation_id": grandchild_id, "order": "ascending"}
+    first_up = await storage.scan_entries(ascending_query, 2)
+    assert_obj.deep_equal([item.id for item in first_up.items], [root_first, root_fork_point])
+    second_up = await storage.scan_entries(ascending_query, 2, first_up.next)
+    assert_obj.deep_equal([item.id for item in second_up.items], [child_fork_point, grandchild_head])
+    # A cursor carries its order; the query may omit it.
+    third_up = await storage.scan_entries({"conversation_id": grandchild_id}, 2, second_up.next)
+    assert_obj.deep_equal([item.id for item in third_up.items], [grandchild_tail])
+    assert_obj.strict_equal(third_up.next, None)
+    assert_obj.deep_equal(
+        [
+            item.id
+            for item in (
+                await storage.scan_entries(
+                    {
+                        "conversation_id": grandchild_id,
+                        "order": "ascending",
+                        "min_entry_id": root_fork_point,
+                        "max_entry_id": child_fork_point,
+                    },
+                    10,
+                )
+            ).items
+        ],
+        [root_fork_point, child_fork_point],
+    )
+    await assert_obj.rejects(
+        storage.scan_entries({"conversation_id": grandchild_id, "order": "descending"}, 2, first_up.next),
+        "cursor",
+    )
+
     active_first = await storage.scan_entries(
         {"conversation_id": grandchild_id, "min_entry_id": current_marker.head}, 1
     )
@@ -482,6 +516,59 @@ async def _case_fork_history(storage) -> None:
     await assert_obj.rejects(
         storage.scan_entries({"conversation_id": 999_999}, 10), "Unknown conversation"
     )
+
+
+async def _case_scan_order(storage) -> None:
+    """Every ordered table scans in either ID order; a cursor continues in its order."""
+
+    assert_obj = _A
+    root_id = await _create_root(storage)
+    conversation_ids = [root_id]
+    task_ids: List[int] = []
+    submission_ids: List[int] = []
+    for _index in range(3):
+        conversation_id = await storage.mint_id()
+        task_id = await storage.mint_id()
+        submission_id = await storage.mint_id()
+        await storage.commit(
+            [
+                write_conversation(ConversationRecord(id=conversation_id)),
+                write_task(_pending_task(task_id, root_id)),
+                write_submission(_submission(submission_id, root_id)),
+            ]
+        )
+        conversation_ids.append(conversation_id)
+        task_ids.append(task_id)
+        submission_ids.append(submission_id)
+
+    async def all_ids(scan, order) -> List[int]:
+        found: List[int] = []
+        page = await scan(order, None)
+        found.extend(item.id for item in page.items)
+        while page.next is not None:
+            # A cursor carries its order; the query may omit it.
+            import json as _json
+
+            page = await scan(None, _json.loads(_json.dumps(page.next)))
+            found.extend(item.id for item in page.items)
+        return found
+
+    scans = [
+        (lambda order, cursor: storage.scan_conversations({"order": order}, 2, cursor), conversation_ids),
+        (lambda order, cursor: storage.scan_tasks({"order": order}, 2, cursor), task_ids),
+        (lambda order, cursor: storage.scan_submissions({"order": order}, 2, cursor), submission_ids),
+    ]
+    for scan, ids in scans:
+        reversed_ids = list(reversed(ids))
+        assert_obj.deep_equal(await all_ids(scan, None), ids)
+        assert_obj.deep_equal(await all_ids(scan, "ascending"), ids)
+        assert_obj.deep_equal(await all_ids(scan, "descending"), reversed_ids)
+        descending = await scan("descending", None)
+        assert_obj.deep_equal(
+            [item.id for item in (await scan("descending", descending.next)).items],
+            reversed_ids[2:4],
+        )
+        await assert_obj.rejects(scan("ascending", descending.next), "cursor")
 
 
 async def _case_task_replace(storage) -> None:

@@ -19,8 +19,9 @@ from ..ai.types import ImageContent, SystemMessage, TextContent, ToolResultMessa
 from ..agent.types import AgentToolResult
 from ..agent.compaction import is_context_overflow
 from ..ai.estimate import estimate_message_tokens
+from . import harness as harness_module
 from .entries import COMPACTION_ENTRY, TOOL_RESULT_ENTRY
-from .harness import Harness, TaskRuntime, _stream_once
+from .harness import Harness, TaskRuntime
 from .live import LiveDoc, ensure_tool_slot, finish_slot, tool_slot
 from .output import OutputLimits, Progress, bound_output
 from .prompt import context_edits, entry_messages
@@ -116,13 +117,17 @@ def tool_definition() -> TaskDefinition:
             progress.mark()
 
         try:
+            duration_ms: Optional[int] = None
             if blocked:
+                # A hook-blocked call never executed, so it carries no duration.
                 result = AgentToolResult(content=[TextContent(text=str(blocked))], is_error=True)
             else:
+                started = time.perf_counter()
                 try:
                     result = await tool.execute(call_id, arguments, None, on_update)
                 except Exception as exc:
                     result = AgentToolResult(content=[TextContent(text=str(exc))], is_error=True)
+                duration_ms = max(0, round((time.perf_counter() - started) * 1000))
             replacement = await harness.run_hooks("after_tool", runtime, call, result)
             if replacement is not None:
                 result = replacement
@@ -145,7 +150,8 @@ def tool_definition() -> TaskDefinition:
                 details = ai_to_json({"details": details})["details"]
             except (TypeError, ValueError):
                 details = str(details)
-        stored = {"blocks": blocks, "is_error": bool(result.is_error), "details": details}
+        stored = {"blocks": blocks, "is_error": bool(result.is_error), "details": details,
+                  "duration_ms": duration_ms}
         try:
             await runtime.commit(
                 lambda tx, current: TaskState(status="running",
@@ -174,6 +180,9 @@ def tool_definition() -> TaskDefinition:
                 timestamp=int(time.time() * 1000),
                 details=stored.get("details"),
                 usage=Usage(),
+                # The execute() time measured in the execute phase (None for a
+                # hook-blocked call that never ran).
+                duration_ms=stored.get("duration_ms"),
             )
             entry = await tx.append_entry(current.conversation_id,
                 {"kind": TOOL_RESULT_ENTRY.kind, "model": [message]})
@@ -219,7 +228,7 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
     """
 
     async def prepare(task, runtime: TaskRuntime, harness: Harness) -> None:
-        entries = await harness.transcript(task.conversation_id)
+        entries = await harness.context_entries(task.conversation_id)
         # Derive the model context exactly as generation prepare does: context
         # edits (omit/replace) decide what an entry contributes, so a stale
         # baseline a rebaseline suppressed never inflates the token estimate or
@@ -279,7 +288,7 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
                         "tokens": total, "attempt": 1}))
 
     async def summarize(task, runtime: TaskRuntime, harness: Harness) -> None:
-        entries = await harness.transcript(task.conversation_id)
+        entries = await harness.context_entries(task.conversation_id)
         edits = context_edits(entries)
         messages: List[Any] = []
         for entry in entries:
@@ -292,7 +301,9 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
         digest = digest[: chunk_budget * 4]
         request = [SystemMessage(content=SUMMARIZATION_PROMPT, timestamp=0),
                    _as_user("Conversation data:\n" + digest)]
-        response = await _stream_once(harness.model, request, harness)
+        # Resolved through the harness module so tests patching
+        # ``pi.durable.harness._stream_once`` cover summarization too.
+        response = await harness_module._stream_once(harness.model, request, harness)
         # Transient stream drops retry with backoff before the compaction fails.
         if response.stop_reason == "error" and not is_context_overflow(response):
             policy = harness.retry

@@ -9,6 +9,7 @@ replicated-state layer) is not ported; snapshots cover the read surface.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .documents import DocDefinition, materialize_document, resolve_address
@@ -27,6 +28,9 @@ class SessionHost:
     def storage(self):
         return self._session.storage
 
+    def now(self) -> int:
+        return self._session.now()
+
     async def load_document(self, definition: DocDefinition, address: Dict[str, Any]):
         return await self._session._load_document(definition, address)
 
@@ -37,8 +41,10 @@ class SessionHost:
 class Session:
     """Owner of one mutation line, its records, and its tracked documents."""
 
-    def __init__(self, storage) -> None:
+    def __init__(self, storage, now: Optional[Callable[[], int]] = None) -> None:
         self.storage = storage
+        # Wall-clock ms source for task lifecycle stamps (TS createSession {now}).
+        self._now = now
         self._commit_listeners: List[Callable[[CommitPublication], None]] = []
         self._creation_hooks: List[Callable] = []
         self._close_listeners: List[Callable[[], None]] = []
@@ -51,6 +57,10 @@ class Session:
         self._poison: Optional[BaseException] = None
         self._document_cache: Dict[str, Optional[Any]] = {}
         self.host = SessionHost(self)
+
+    def now(self) -> int:
+        source = self._now
+        return int(source()) if source is not None else int(time.time() * 1000)
 
     # -- hooks for subclasses (Harness stages built-in documents) --------------
 
@@ -234,6 +244,13 @@ class Session:
         if self._closing or self._closed:
             raise RuntimeError("Session is closed")
 
+    async def read_on_line(self, read):
+        """Run one read with exclusive access to the line (port of readOnLine):
+        the result is consistent with the commit order, and entries at or below
+        a tail captured here are immutable afterwards."""
+        async with self._line_lock:
+            return await read()
+
 
 def _address_key_id(address: Dict[str, Any]) -> str:
     from .documents import _address_id
@@ -241,6 +258,6 @@ def _address_key_id(address: Dict[str, Any]) -> str:
     return _address_id(address)
 
 
-def create_session(storage) -> Session:
+def create_session(storage, now: Optional[Callable[[], int]] = None) -> Session:
     """Open a Session kernel over one storage backend."""
-    return Session(storage)
+    return Session(storage, now=now)

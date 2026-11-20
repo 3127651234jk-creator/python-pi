@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import inspect
 import json
 import logging
@@ -28,6 +29,7 @@ from ..ai.types import AssistantMessage, SystemMessage, Tool, ToolCall, Transcri
 from ..ai.providers import get_default_stream_fn
 from ..ai.utils import normalize_context
 from ..agent.compaction import is_context_overflow
+from .context import ContextRange, ContextView, read_context_from
 from .entries import ASSISTANT_ENTRY, USER_ENTRY
 from .errors import StorageRejected, error_message
 from .extensions import AgentDoc, ProviderDoc, Extension, HookApi, Registry, invoke
@@ -45,6 +47,7 @@ from .types import (
     TaskState,
     define_task,
     record_to_dict,
+    resolve_context_retention_ms,
     resolve_progress_policy,
 )
 
@@ -61,6 +64,14 @@ class TaskRuntime:
     @property
     def aborted(self) -> bool:
         return self.signal.is_set()
+
+    async def context(self, conversation_id: int, at: Optional[int] = None) -> ContextView:
+        """Model context of one conversation during task execution, cut off at
+        the visible entry ``at`` when given (TS 1.1.0 options shape
+        ``context(conversationId, {at})``; the cached scan layer is shared with
+        generation's own reads)."""
+
+        return await self._harness.context(conversation_id, at)
 
     async def sleep(self, until_ms: int) -> None:
         """Sleep until the wall-clock deadline ``until_ms``; wakes early on abort.
@@ -107,35 +118,14 @@ class TaskRuntime:
             if next_state.status == "terminal":
                 # Terminal outcomes stage as completing; the scheduler finalizes
                 # them once no ordinary owned work below is live (spec 5.5).
-                replaced = TaskRecord(
-                    id=current.id,
-                    conversation_id=current.conversation_id,
-                    kind=current.kind,
-                    version=current.version,
-                    input=current.input,
-                    owner=current.owner,
-                    background=current.background,
-                    abort_requested=current.abort_requested,
-                    state=TaskState(status="completing", outcome=next_state.outcome),
-                    memos=current.memos,
-                )
+                replaced = dataclasses.replace(
+                    current, state=TaskState(status="completing", outcome=next_state.outcome))
                 from .types import write_task
 
                 tx._writes.append(write_task(replaced))
                 tx._mark_table_write()
                 return None
-            replaced = TaskRecord(
-                id=current.id,
-                conversation_id=current.conversation_id,
-                kind=current.kind,
-                version=current.version,
-                input=current.input,
-                owner=current.owner,
-                background=current.background,
-                abort_requested=current.abort_requested,
-                state=next_state,
-                memos=current.memos,
-            )
+            replaced = dataclasses.replace(current, state=next_state)
             from .types import write_task
 
             tx._writes.append(write_task(replaced))
@@ -176,10 +166,17 @@ class Harness:
                  on_report: Optional[Callable[[BaseException], None]] = None,
                  registry: Optional[Registry] = None, extensions: Optional[List[Extension]] = None,
                  conversation_created: Optional[Callable] = None,
-                 steering_mode: str = "all", follow_up_mode: str = "all") -> None:
+                 steering_mode: str = "one-at-a-time", follow_up_mode: str = "one-at-a-time",
+                 now: Optional[Callable[[], int]] = None,
+                 context_retention_ms: Optional[float] = None) -> None:
         self.session = session
         self.model = model
         self.retry = retry
+        # Wall-clock ms source for timers (TS HarnessOptions.now); the Session
+        # keeps its own injection for task lifecycle stamps.
+        self.now = now or (lambda: int(time.time() * 1000))
+        # Per-conversation context cache retention (TS settings.contextRetentionMs).
+        self.context_retention_ms = resolve_context_retention_ms(context_retention_ms)
         # Accepts a ProgressPolicy or the settings mapping (validated field by field).
         self.progress = resolve_progress_policy(progress)
         self.on_report = on_report or self._report_progress_error
@@ -205,6 +202,10 @@ class Harness:
         # Tool progress waiters survive from the execute phase to the settle
         # transaction, which is the commit that makes the result visible.
         self._progress_waiters: Dict[int, List[asyncio.Future]] = {}
+        # Per-conversation context cache (F-AG-09): the last read range plus
+        # its derived view, reused while the head marker stays put.
+        self._context_cache: Dict[int, ContextRange] = {}
+        self._context_expiry_tasks: Dict[int, asyncio.Task] = {}
 
     @staticmethod
     def _report_progress_error(error: BaseException) -> None:
@@ -388,6 +389,77 @@ class Harness:
 
         return await self.session.commit(change, _scope_for_conversation(conversation_id))
 
+    async def context(self, conversation_id: int, at: Optional[int] = None) -> ContextView:
+        """Committed model context of one conversation (port of TS
+        ``Conversation.context(context, {at})``, #10512): the active transcript
+        and its derived messages, cut off at the visible entry ``at`` when
+        given — the same view ``fork(at)`` would start with, without creating
+        a conversation. Reuses the per-conversation cached scan range."""
+
+        view, context_range = await read_context_from(
+            self.session, self.session.storage, conversation_id, at,
+            self._context_cache.get(conversation_id))
+        self._remember_context_range(conversation_id, context_range)
+        return view
+
+    async def context_entries(self, conversation_id: int, at: Optional[int] = None) -> List[Any]:
+        """Raw active-context entries, oldest first — the transcript range the
+        context view derives from, read through the same cached scan layer
+        (generation/compaction entry scans)."""
+
+        view, context_range = await read_context_from(
+            self.session, self.session.storage, conversation_id, at,
+            self._context_cache.get(conversation_id))
+        self._remember_context_range(conversation_id, context_range)
+        return [] if context_range is None else list(context_range.entries)
+
+    def _remember_context_range(self, conversation_id: int, context_range: Optional[ContextRange]) -> None:
+        if context_range is None:
+            self._context_cache.pop(conversation_id, None)
+            return
+        self._context_cache[conversation_id] = context_range
+        # A fresh read refreshes the entry: drop any pending idle expiry.
+        task = self._context_expiry_tasks.pop(conversation_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _settle_context_idle(self) -> None:
+        """Expire cached context ranges of idle conversations (port of TS
+        #settleIdle): busy conversations keep theirs, retention 0 drops at
+        once, otherwise a timer drops the range after the retention window."""
+
+        if not self._context_cache:
+            return
+        live = set()
+        for status in ("pending", "running", "waiting", "completing"):
+            for record in await _scan_all(self.session.storage.scan_tasks, {"status": status}):
+                if record.conversation_id is not None:
+                    live.add(record.conversation_id)
+        for conversation_id in list(self._context_cache):
+            if conversation_id in live:
+                continue
+            delay = self.context_retention_ms / 1000
+            if delay <= 0:
+                self._context_cache.pop(conversation_id, None)
+                continue
+            if conversation_id in self._context_expiry_tasks:
+                continue
+
+            async def expire(conversation_id: int = conversation_id) -> None:
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
+                self._context_expiry_tasks.pop(conversation_id, None)
+                self._context_cache.pop(conversation_id, None)
+
+            self._context_expiry_tasks[conversation_id] = asyncio.ensure_future(expire())
+
+    def _cancel_context_expiry(self) -> None:
+        for task in self._context_expiry_tasks.values():
+            task.cancel()
+        self._context_expiry_tasks.clear()
+
     async def live(self, conversation_id: int) -> Dict[str, Any]:
         """Committed live state: the generated partial and running tool slots."""
 
@@ -497,18 +569,7 @@ class Harness:
             current = await tx.task(task_id)
             if current is None or current.state.status in ("completing", "terminal"):
                 return
-            marked = TaskRecord(
-                id=current.id,
-                conversation_id=current.conversation_id,
-                kind=current.kind,
-                version=current.version,
-                input=current.input,
-                owner=current.owner,
-                background=current.background,
-                abort_requested=True,
-                state=current.state,
-                memos=current.memos,
-            )
+            marked = dataclasses.replace(current, abort_requested=True)
             tx._writes.append(write_task(marked))
             tx._mark_table_write()
 
@@ -541,17 +602,22 @@ class Harness:
 
         executed = 0
         await self._recover_running_tasks()
-        while not self._stop.is_set():
-            progressed = False
-            progressed = await self._resume_waiting_tasks() or progressed
-            progressed = await self._finalize_completing() or progressed
-            batch = await self._pending_batch(max(1, concurrency))
-            if batch:
-                results = await asyncio.gather(*[self._run_claimed(task) for task in batch])
-                executed += sum(results)
-                progressed = True
-            if not progressed:
-                break
+        self._cancel_context_expiry()
+        try:
+            while not self._stop.is_set():
+                progressed = False
+                progressed = await self._resume_waiting_tasks() or progressed
+                progressed = await self._finalize_completing() or progressed
+                batch = await self._pending_batch(max(1, concurrency))
+                if batch:
+                    results = await asyncio.gather(*[self._run_claimed(task) for task in batch])
+                    executed += sum(results)
+                    progressed = True
+                if not progressed:
+                    break
+        finally:
+            # Idle expiry runs even when the drain unwinds through an error.
+            await self._settle_context_idle()
         return executed
 
     async def _run_claimed(self, task: TaskRecord) -> int:
@@ -596,18 +662,8 @@ class Harness:
 
             records = await _scan_all(tx.scan_tasks, {"status": "running"})
             for record in records:
-                replaced = TaskRecord(
-                    id=record.id,
-                    conversation_id=record.conversation_id,
-                    kind=record.kind,
-                    version=record.version,
-                    input=record.input,
-                    owner=record.owner,
-                    background=record.background,
-                    abort_requested=record.abort_requested,
-                    state=TaskState(status="pending", checkpoint=record.state.checkpoint),
-                    memos=record.memos,
-                )
+                replaced = dataclasses.replace(
+                    record, state=TaskState(status="pending", checkpoint=record.state.checkpoint))
                 tx._writes.append(write_task(replaced))
                 tx._mark_table_write()
             return len(records)
@@ -696,18 +752,8 @@ class Harness:
                 raise RuntimeError(
                     f"Task {current.kind} stored by version {current.version} needs migration"
                 )
-            replaced = TaskRecord(
-                id=current.id,
-                conversation_id=current.conversation_id,
-                kind=current.kind,
-                version=current.version,
-                input=input_value,
-                owner=current.owner,
-                background=current.background,
-                abort_requested=current.abort_requested,
-                state=TaskState(status="running", checkpoint=checkpoint),
-                memos=current.memos,
-            )
+            replaced = dataclasses.replace(
+                current, state=TaskState(status="running", checkpoint=checkpoint))
             tx._writes.append(write_task(replaced))
             tx._mark_table_write()
             return replaced
@@ -765,18 +811,8 @@ class Harness:
             for record in completing:
                 if record.id in live_owner_ids:
                     continue
-                terminal = TaskRecord(
-                    id=record.id,
-                    conversation_id=record.conversation_id,
-                    kind=record.kind,
-                    version=record.version,
-                    input=record.input,
-                    owner=record.owner,
-                    background=record.background,
-                    abort_requested=record.abort_requested,
-                    state=TaskState(status="terminal", outcome=record.state.outcome),
-                    memos=record.memos,
-                )
+                terminal = dataclasses.replace(
+                    record, state=TaskState(status="terminal", outcome=record.state.outcome))
                 tx._writes.append(write_task(terminal))
                 tx._mark_table_write()
                 finalized += 1
@@ -812,36 +848,16 @@ class Harness:
                         continue
                     if failed:
                         outcome = TaskOutcome(status="aborted", reason=f"join failed: task {failed[0].id}")
-                        replaced = TaskRecord(
-                            id=record.id,
-                            conversation_id=record.conversation_id,
-                            kind=record.kind,
-                            version=record.version,
-                            input=record.input,
-                            owner=record.owner,
-                            background=record.background,
-                            abort_requested=record.abort_requested,
-                            state=TaskState(status="terminal", outcome=outcome),
-                            memos=record.memos,
-                        )
+                        replaced = dataclasses.replace(
+                            record, state=TaskState(status="terminal", outcome=outcome))
                         replacements.append(replaced)
                         resumed += 1
                         continue
                 if len(terminal_tasks) != len(ids):
                     continue
                 # allSettled: resume at the stored checkpoint.
-                replaced = TaskRecord(
-                    id=record.id,
-                    conversation_id=record.conversation_id,
-                    kind=record.kind,
-                    version=record.version,
-                    input=record.input,
-                    owner=record.owner,
-                    background=record.background,
-                    abort_requested=record.abort_requested,
-                    state=TaskState(status="pending", checkpoint=record.state.checkpoint),
-                    memos=record.memos,
-                )
+                replaced = dataclasses.replace(
+                    record, state=TaskState(status="pending", checkpoint=record.state.checkpoint))
                 replacements.append(replaced)
                 resumed += 1
             for replaced in replacements:
@@ -885,18 +901,8 @@ async def _cleanup_live_for_terminal(tx, current: TaskRecord) -> None:
 async def _stage_terminal(tx, current: TaskRecord, outcome: TaskOutcome) -> None:
     from .types import write_task
 
-    replaced = TaskRecord(
-        id=current.id,
-        conversation_id=current.conversation_id,
-        kind=current.kind,
-        version=current.version,
-        input=current.input,
-        owner=current.owner,
-        background=current.background,
-        abort_requested=current.abort_requested,
-        state=TaskState(status="completing", outcome=outcome),
-        memos=current.memos,
-    )
+    replaced = dataclasses.replace(
+        current, state=TaskState(status="completing", outcome=outcome))
     tx._writes.append(write_task(replaced))
     tx._mark_table_write()
 
@@ -919,7 +925,7 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         input_value = task.input
         conversation_id = task.conversation_id
         attempt = int((task.state.checkpoint or {}).get("attempt") or 1)
-        entries = await harness.transcript(conversation_id)
+        entries = await harness.context_entries(conversation_id)
         # Desired prompt state: extension sections + the instructions pseudo
         # section, and the declared tools. Planned as positional pi.system
         # entries so the prompt lives in the transcript (fork/audit visible).
