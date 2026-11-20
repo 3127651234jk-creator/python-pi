@@ -14,7 +14,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from ..estimate import estimate_context_tokens
-from ..models import Model
+from ..models import Model, resolve_sampling_params
+from ..utils import normalize_provider_error_body
 from ..types import (
     AssistantMessage,
     AssistantMessageDiagnostic,
@@ -66,6 +67,9 @@ class SimpleStreamOptions:
     # model headers, before the provider's auth lock. Consumed by providers
     # that need it (openai_responses today); others ignore it.
     headers: Optional[Dict[str, str]] = None
+    # Arbitrary request-body keys (port of StreamOptions.samplingParams); merged
+    # over Model.params and the per-thinking-level params by apply_model_params.
+    sampling_params: Optional[Dict[str, Any]] = None
     # Hooks, sync or awaitable (port of TS StreamOptions onPayload/onResponse/
     # onProviderStreamEvent): inspect or replace the request payload, observe
     # the raw HTTP response, and observe raw provider events pre-conversion.
@@ -120,12 +124,16 @@ def thinking_budget(level: Optional[ThinkingLevel]) -> Optional[int]:
 
 
 def apply_model_params(body: Dict[str, Any], model: Model, options: Optional[SimpleStreamOptions]) -> None:
-    """Merge model-specific request parameters (``Model.params``) into a payload.
+    """Merge model-specific request parameters into a payload.
 
-    Provider-level options that the caller explicitly set (temperature,
-    max_tokens, reasoning effort) keep precedence; every other parameter key is
-    applied verbatim, letting models.json tune vendor-specific fields
-    (``top_k``, ``presence_penalty``, ``frequency_penalty``, ...).
+    Layers (port of ``resolveSamplingParams``): flat ``Model.params``, then the
+    model's per-thinking-level params for the effective level (each level's
+    entries override the flat params per key), then the per-request
+    ``options.sampling_params``. Provider-level options that the caller
+    explicitly set (temperature, max_tokens, reasoning effort) keep precedence
+    over all of them; every other parameter key is applied verbatim, letting
+    models.json tune vendor-specific fields (``top_k``, ``presence_penalty``,
+    ``frequency_penalty``, ...).
     """
 
     explicit = set()
@@ -136,7 +144,12 @@ def apply_model_params(body: Dict[str, Any], model: Model, options: Optional[Sim
             explicit.update(("max_tokens", "max_output_tokens", "max_completion_tokens"))
         if options.reasoning is not None:
             explicit.update(("reasoning", "reasoning_effort", "thinking"))
-    for key, value in (model.params or {}).items():
+    merged = resolve_sampling_params(
+        model,
+        options.reasoning if options is not None else None,
+        options.sampling_params if options is not None else None,
+    ) or {}
+    for key, value in merged.items():
         if key not in explicit:
             body[key] = value
 
@@ -350,7 +363,7 @@ async def _drive_provider_stream(
                     error_message, response_diagnostic = on_response_error(
                         response.status_code, response.reason_phrase, str(req.url), body)
                 else:
-                    detail = body.strip()[:2000] or "(empty response body)"
+                    detail = normalize_provider_error_body(body) or "(empty response body)"
                     error_message = f"HTTP {response.status_code} from {model.provider}: {detail}"
                 stop_reason = "error"
             else:
@@ -401,7 +414,7 @@ async def _drive_provider_stream(
         if response is not None:
             await response.aclose()
 
-    if stop_reason in ("stop", "length", "toolUse", "deferred") and not done_emitted:
+    if stop_reason in ("stop", "length", "toolUse") and not done_emitted:
         final = state.snapshot()
         final.stop_reason = stop_reason  # type: ignore[assignment]
         _apply_cost(final, model)
@@ -421,7 +434,7 @@ async def _drive_provider_stream(
 
 
 def _terminated(reason: str) -> bool:
-    return reason in ("stop", "length", "toolUse", "deferred")
+    return reason in ("stop", "length", "toolUse")
 
 
 def _apply_cost(message: AssistantMessage, model: Model) -> None:

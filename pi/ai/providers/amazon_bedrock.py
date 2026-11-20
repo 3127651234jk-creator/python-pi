@@ -104,6 +104,24 @@ def _apply_model_params(body: dict, model, options, max_tokens: Optional[int] = 
                 fields["top_k"] = top_k
 
 
+def _supports_adaptive_thinking(model_id: str) -> bool:
+    """Bedrock Claude families that run adaptive thinking with a native
+    xhigh/max effort (Claude 5+; haiku-5 included)."""
+    lowered = model_id.lower()
+    return any(marker in lowered for marker in ("haiku-5", "opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5"))
+
+
+def _map_thinking_effort(model, level) -> str:
+    """Port of mapThinkingLevelToEffort: native xhigh for the effort families,
+    then the model's thinking_level_map, then the static fallback ladder."""
+    if level == "xhigh" and _supports_adaptive_thinking(model.id):
+        return "xhigh"
+    mapped = (model.thinking_level_map or {}).get(level)
+    if isinstance(mapped, str):
+        return mapped
+    return {"minimal": "low", "low": "low", "medium": "medium"}.get(level, "high")
+
+
 def build_request(model, context, options):
     system, messages = normalize_context(context)
     cache_point = None
@@ -148,10 +166,17 @@ def build_request(model, context, options):
                         max_tokens=max_tokens if options and options.max_tokens else None)
     if model.reasoning and options.reasoning not in (None, "off"):
         if "anthropic." in model.id:
-            budget = min(thinking_budget(options.reasoning), body["inferenceConfig"]["maxTokens"] - 1024)
-            if budget < 1024:
-                raise ValueError("Bedrock thinking requires an output budget of at least 2048 tokens")
-            body.setdefault("additionalModelRequestFields", {})["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            if _supports_adaptive_thinking(model.id):
+                # Claude Haiku 5.5+ effort families on Bedrock: adaptive
+                # thinking with a native xhigh/max effort instead of a budget.
+                fields = body.setdefault("additionalModelRequestFields", {})
+                fields["thinking"] = {"type": "adaptive"}
+                fields["output_config"] = {"effort": _map_thinking_effort(model, options.reasoning)}
+            else:
+                budget = min(thinking_budget(options.reasoning), body["inferenceConfig"]["maxTokens"] - 1024)
+                if budget < 1024:
+                    raise ValueError("Bedrock thinking requires an output budget of at least 2048 tokens")
+                body.setdefault("additionalModelRequestFields", {})["thinking"] = {"type": "enabled", "budget_tokens": budget}
             body["inferenceConfig"].pop("temperature", None)
         else:
             openai_fields = _openai_reasoning_fields(model, options.reasoning)

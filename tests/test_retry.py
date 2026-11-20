@@ -15,6 +15,7 @@ from pi.ai.retry import (
     retry_delay_ms,
 )
 from pi.ai.types import AssistantMessage, TextContent, Usage
+from pi.ai.utils import normalize_provider_error_body
 from pi.util import AbortSignal
 
 OPENAI_EXPLICIT_RETRY_MESSAGE = (
@@ -404,3 +405,33 @@ def test_classifies_assistant_error_messages():
     assert is_retryable_assistant_error(error_message("520 status code (no body)")) is True
     assert is_retryable_assistant_error(error_message("524 status code (no body)")) is True
     assert is_retryable_assistant_error(faux_assistant_message("not an error")) is False
+
+
+# ---------------------------------------------------------------------------
+# Provider error body normalization (F-AI-11)
+# ---------------------------------------------------------------------------
+
+def test_normalize_provider_error_body_prefers_error_message():
+    body = '{"error": {"message": "Server busy, try again", "code": 503}}'
+    assert normalize_provider_error_body(body) == "Server busy, try again"
+    assert normalize_provider_error_body('{"message": "plain message"}') == "plain message"
+    assert normalize_provider_error_body('{"detail": "gateway says no"}') == "gateway says no"
+    assert normalize_provider_error_body('{"error": "string error"}') == "string error"
+
+
+def test_normalize_provider_error_body_strips_html_and_truncates():
+    assert normalize_provider_error_body(
+        "<html><body><h1>503</h1> Service <b>unavailable</b></body></html>"
+    ) == "503 Service unavailable"
+    long = "x" * 5000
+    normalized = normalize_provider_error_body(long)
+    assert normalized.startswith("x" * 4000)
+    assert normalized.endswith("... [truncated 1000 chars]")
+    assert normalize_provider_error_body("") == ""
+
+
+def test_normalized_error_text_stays_retryable():
+    """A gateway body keeps its retryable marker after normalization."""
+    body = '{"error": {"message": "servers are currently busy"}}'
+    composed = f"HTTP 503 from gateway: {normalize_provider_error_body(body)}"
+    assert is_retryable_assistant_error(error_message(composed))

@@ -12,7 +12,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
-StopReason = Literal["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"]
+StopReason = Literal["pending", "stop", "length", "toolUse", "error", "aborted"]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 EMPTY_USAGE = {
@@ -205,6 +205,10 @@ class AssistantMessage:
     # A failed attempt superseded by an auto-retry: kept in raw history and
     # session logs, omitted from model projections.
     retried: bool = False
+    # Monotonic-clock wall time of this response in milliseconds, stamped by
+    # the default stream wrapper when the stream terminates. Responses that
+    # started elsewhere (e.g. session-replayed messages) have none.
+    duration_ms: Optional[int] = None
 
 
 def format_thrown_value(value: Any) -> str:
@@ -307,6 +311,76 @@ class ToolResultMessage:
 
 
 Message = Union[SystemMessage, UserMessage, AssistantMessage, ToolResultMessage]
+
+
+# ---------------------------------------------------------------------------
+# Classifier models (port of the TS Classifier* types, packages/ai/src/types.ts)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClassifierChoiceQuestion:
+    type: str = field(default="choice", init=False)
+    instructions: str = ""
+    criteria: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ClassifierScoreQuestion:
+    type: str = field(default="score", init=False)
+    instructions: str = ""
+    criteria: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ClassifierBoolQuestion:
+    type: str = field(default="bool", init=False)
+    instructions: str = ""
+    criteria: Dict[str, str] = field(default_factory=dict)
+
+
+ClassifierQuestion = Union[ClassifierChoiceQuestion, ClassifierScoreQuestion, ClassifierBoolQuestion]
+
+
+@dataclass
+class ClassifierContext:
+    state: Dict[str, Any]
+    questions: Dict[str, ClassifierQuestion]
+    # Images judged together with state; only image-capable classifier models accept them.
+    images: Optional[List[ImageContent]] = None
+
+
+@dataclass
+class ClassifierChoiceAnswer:
+    type: str = field(default="choice", init=False)
+    choice: str = ""
+    probabilities: Dict[str, float] = field(default_factory=dict)
+    confidence: float = 0.0
+
+
+@dataclass
+class ClassifierScoreAnswer:
+    type: str = field(default="score", init=False)
+    score: float = 0.0
+    confidence: float = 0.0
+
+
+@dataclass
+class ClassifierBoolAnswer:
+    type: str = field(default="bool", init=False)
+    probability: float = 0.0
+
+
+@dataclass
+class ClassifierResult:
+    api: str
+    provider: str
+    model: str
+    answers: Dict[str, Any] = field(default_factory=dict)
+    # Token usage at the model's catalog price, when the service reports counts.
+    usage: Optional[Usage] = None
+    stop_reason: str = "stop"
+    error_message: Optional[str] = None
+    timestamp: int = 0
 AssistantContent = Union[TextContent, ThinkingContent, ToolCall]
 ToolResultContent = Union[TextContent, ImageContent]
 UserContent = Union[TextContent, ImageContent, AudioContent, VideoContent]

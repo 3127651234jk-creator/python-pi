@@ -91,6 +91,7 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             diagnostics=[_diagnostic_from_json(item) for item in (data.get("diagnostics") or [])
                          if isinstance(item, dict)] or None,
             retried=bool(data.get("retried", False)),
+            duration_ms=data.get("duration_ms"),
         )
     if role == "toolResult":
         blocks = [_block_from_json(block) for block in data.get("content", [])]
@@ -105,6 +106,18 @@ def message_from_json(data: Dict[str, Any]) -> Any:
             usage=usage_from_json(usage_data) if usage_data else None,
             nested_calls=nested_calls_from_json(data.get("nested_calls")),
             duration_ms=data.get("duration_ms"),
+        )
+    if role == "bashExecution":
+        # The user-facing `!`/`!!` shell escape (pi.agent owns the transcript
+        # type; the lazy import keeps the ai layer free of the agent package).
+        from ..agent.types import BashExecutionMessage
+
+        return BashExecutionMessage(
+            command=data.get("command", ""), output=data.get("output", ""),
+            exit_code=data.get("exit_code"), cancelled=bool(data.get("cancelled", False)),
+            truncated=bool(data.get("truncated", False)),
+            full_output_path=data.get("full_output_path"), timestamp=data.get("timestamp", 0),
+            exclude_from_context=bool(data.get("exclude_from_context", False)),
         )
     raise ValueError(f"Unknown message role: {role!r}")
 

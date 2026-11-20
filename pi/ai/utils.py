@@ -7,6 +7,7 @@ and ``validateToolArguments`` from ``packages/ai/src``.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 import platform
 import time
 import re
@@ -35,6 +36,62 @@ def pi_user_agent() -> str:
     it in their header defaults, so model or caller headers can override it."""
     system = platform.system().lower()
     return f"pi ({'win32' if system == 'windows' else system} {platform.release()}; {platform.machine()})"
+
+
+# The originator Codex-compatible endpoints expect (TS LoginOptions.agentName
+# can rebrand it; models.json's "originator" header overrides it per model).
+PI_ORIGINATOR = "pi"
+
+
+# ---------------------------------------------------------------------------
+# Provider HTTP error body normalization (port of
+# packages/ai/src/utils/error-body.ts, adapted to raw HTTP bodies)
+# ---------------------------------------------------------------------------
+
+MAX_PROVIDER_ERROR_BODY_CHARS = 4000
+
+_HTML_TAG = re.compile(r"<[^>]*>")
+
+
+def truncate_error_text(text: str, max_chars: int = MAX_PROVIDER_ERROR_BODY_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"... [truncated {len(text) - max_chars} chars]"
+
+
+def normalize_provider_error_body(body: str, max_chars: int = MAX_PROVIDER_ERROR_BODY_CHARS) -> str:
+    """Compact reason from a provider HTTP >= 400 error body.
+
+    JSON objects yield the first usable of ``error.message``, a string
+    ``error``, ``message``, and ``detail`` (gateways disagree on the field);
+    HTML bodies are stripped to text; anything else is kept verbatim. Every
+    result is trimmed and truncated, so retry pattern matching sees the same
+    text regardless of which provider surfaced the failure.
+    """
+    text = (body or "").strip()
+    if not text:
+        return ""
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            candidates = (
+                error.get("message") if isinstance(error, dict) else None,
+                error if isinstance(error, str) else None,
+                parsed.get("message"),
+                parsed.get("detail"),
+            )
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    return truncate_error_text(candidate.strip(), max_chars)
+    elif text.startswith("<"):
+        plain = " ".join(_HTML_TAG.sub(" ", text).split())
+        if plain:
+            return truncate_error_text(plain, max_chars)
+    return truncate_error_text(text, max_chars)
 
 
 def is_llm_message(message: Any) -> bool:

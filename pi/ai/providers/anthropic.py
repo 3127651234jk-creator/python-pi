@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-from ..models import Model
+from ..models import Model, clamp_thinking_level
 from ..types import (
     AssistantMessage,
     AudioContent,
@@ -94,25 +94,40 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
         _tag_last_message(body["messages"], cache_control)
 
     reasoning: Optional[ThinkingLevel] = options.reasoning if options else None
-    budget = thinking_budget(reasoning) if model.reasoning else None
-    if budget is not None:
-        # The bump is clamped to the context window like the TS adapter clamps
-        # after adjustMaxTokensForThinking; the budget shrinks to keep the
-        # required answer room under a tight ceiling.
-        body["max_tokens"] = clamp_max_tokens_to_context(
-            model, context, max(body["max_tokens"], budget + 4096)
-        )
-        thinking_tokens = min(budget, max(MIN_MAX_TOKENS, body["max_tokens"] - 1024))
-        # Anthropic rejects budgets below 1024. When the clamped ceiling cannot
-        # host a valid budget, answer without thinking instead of sending an
-        # invalid request (the TS adapter sends budget 0 here, which also 400s).
-        if thinking_tokens >= 1024:
-            body["thinking"] = {"type": "enabled", "budget_tokens": thinking_tokens}
+    if model.reasoning and reasoning not in (None, "off") and _supports_adaptive_thinking(model):
+        # Claude Haiku 5.5+ effort models: adaptive thinking — Claude decides
+        # when and how much to think, and the effort (natively xhigh/max here)
+        # scales the response. No token budget, so no max_tokens bump.
+        effort = clamp_thinking_level(model, reasoning)
+        if effort != "off":
+            body["thinking"] = {"type": "adaptive"}
+            body["output_config"] = {"effort": effort}
+    else:
+        budget = thinking_budget(reasoning) if model.reasoning else None
+        if budget is not None:
+            # The bump is clamped to the context window like the TS adapter clamps
+            # after adjustMaxTokensForThinking; the budget shrinks to keep the
+            # required answer room under a tight ceiling.
+            body["max_tokens"] = clamp_max_tokens_to_context(
+                model, context, max(body["max_tokens"], budget + 4096)
+            )
+            thinking_tokens = min(budget, max(MIN_MAX_TOKENS, body["max_tokens"] - 1024))
+            # Anthropic rejects budgets below 1024. When the clamped ceiling cannot
+            # host a valid budget, answer without thinking instead of sending an
+            # invalid request (the TS adapter sends budget 0 here, which also 400s).
+            if thinking_tokens >= 1024:
+                body["thinking"] = {"type": "enabled", "budget_tokens": thinking_tokens}
 
     if options and options.temperature is not None and "thinking" not in body:
         body["temperature"] = options.temperature
     apply_model_params(body, model, options)
     return body
+
+
+def _supports_adaptive_thinking(model: Model) -> bool:
+    """Whether the model uses adaptive thinking with an effort instead of a
+    token budget (Claude Haiku 5.5 and newer effort-model families)."""
+    return "haiku-5" in model.id.lower()
 
 
 def _cache_control(retention: Optional[str]) -> Optional[Dict[str, str]]:

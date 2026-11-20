@@ -138,8 +138,14 @@ class Model:
     # Provider-specific thinking-level mapping (pi level -> provider level or None),
     # carried verbatim from catalogs such as the Radius gateway /v1/config response.
     thinking_level_map: Optional[Dict[str, Optional[str]]] = None
+    # Per-thinking-level sampling parameters (port of Model.samplingParamsByThinkingLevel):
+    # pi level -> request-body keys merged over ``params`` by OpenAI-compatible adapters.
+    sampling_params_by_thinking_level: Optional[Dict[str, Dict[str, Any]]] = None
     # Chat Completions compatibility overrides, using the TS catalog keys.
     compat: Dict[str, object] = field(default_factory=dict)
+    # Advertised prompt-cache TTLs per retention ("5m"/"1h" -> seconds); absent
+    # metadata stops cache warming (the request intent alone is not proof).
+    prompt_cache: Optional[Dict[str, int]] = None
 
     def calculate_cost(self, usage) -> Dict[str, float]:
         m = 1_000_000.0
@@ -187,6 +193,65 @@ class ModelError(Exception):
     pass
 
 
+# Port of EXTENDED_THINKING_LEVELS / getSupportedThinkingLevels / clampThinkingLevel
+# from packages/ai/src/models.ts.
+THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def supported_thinking_levels(model: Model) -> List[str]:
+    """Port of ``getSupportedThinkingLevels``: levels the model can actually run."""
+    if not model.reasoning:
+        return ["off"]
+    mapping = model.thinking_level_map or {}
+    levels: List[str] = []
+    for level in THINKING_LEVELS:
+        mapped = mapping.get(level)
+        if mapped is None:
+            # Explicitly mapped away, or (xhigh/max) never offered unless named.
+            if level in mapping or level in ("xhigh", "max"):
+                continue
+        levels.append(level)
+    return levels
+
+
+def clamp_thinking_level(model: Model, level: Optional[str]) -> str:
+    """Snap a requested thinking level to one the model actually supports.
+
+    Non-reasoning models only support ``off``; reasoning models support every
+    extended level except those mapped away by ``thinking_level_map``, and
+    ``xhigh``/``max`` only when the map names them. A too-high request steps
+    down to the nearest supported level.
+    """
+    requested = level if level in THINKING_LEVELS else "off"
+    available = supported_thinking_levels(model)
+    if requested in available:
+        return requested
+    index = THINKING_LEVELS.index(requested)
+    for candidate in THINKING_LEVELS[index:] + list(reversed(THINKING_LEVELS[:index])):
+        if candidate in available:
+            return candidate
+    return available[0] if available else "off"
+
+
+def resolve_sampling_params(
+    model: Model,
+    thinking_level: Optional[str],
+    request_params: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Merge the model's flat params, per-level params, and per-request params.
+
+    Port of ``resolveSamplingParams`` (simple-options.ts): level params override
+    the flat ``Model.params`` per key, per-request params override both. Returns
+    None when no layer has anything to apply.
+    """
+    flat = model.params or None
+    level_params = (model.sampling_params_by_thinking_level or {}).get(
+        clamp_thinking_level(model, thinking_level if thinking_level else "off"))
+    if flat or level_params or request_params:
+        return {**(flat or {}), **(level_params or {}), **(request_params or {})}
+    return None
+
+
 # A handful of well-known models; anything else uses the provider defaults.
 _CATALOG: Dict[str, Dict] = {
     "anthropic/claude-sonnet-4-5-20250929": {
@@ -209,6 +274,20 @@ _CATALOG: Dict[str, Dict] = {
         "context_window": 200_000,
         "max_tokens": 64_000,
         "costs": ModelCost(input=1.0, output=5.0, cache_read=0.1, cache_write=1.25),
+    },
+    # Claude Haiku 5.5 (until catalogs include it). Prompts over 100k input
+    # tokens are billed at 5x for the whole request; adaptive thinking with a
+    # native xhigh/max effort replaces budget thinking.
+    "anthropic/claude-haiku-5-5": {
+        "name": "Claude Haiku 5.5",
+        "reasoning": True,
+        "thinking_level_map": {"off": None, "minimal": None, "low": "low", "medium": "medium",
+                               "high": "high", "xhigh": "xhigh", "max": "max"},
+        "context_window": 1_000_000,
+        "max_tokens": 128_000,
+        "costs": ModelCost(input=0.1, output=0.5, cache_read=0.01, cache_write=0.125,
+                           tiers=[{"input_tokens_above": 100_000, "input": 0.5, "output": 2.5,
+                                   "cache_read": 0.05, "cache_write": 0.625}]),
     },
     "openai/gpt-4o": {
         "name": "GPT-4o",
@@ -309,6 +388,7 @@ def resolve_model(
         input=entry.get("input", ["text"]),
         input_limits=parse_input_limits(entry.get("input_limits")),
         costs=entry.get("costs", ModelCost()),
+        thinking_level_map=entry.get("thinking_level_map"),
     )
 
 

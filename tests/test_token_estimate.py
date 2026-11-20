@@ -13,7 +13,7 @@ from pi.ai.estimate import (
     estimate_message_tokens,
     estimate_text_tokens,
 )
-from pi.ai.models import Model
+from pi.ai.models import Model, clamp_thinking_level, resolve_sampling_params
 from pi.ai.providers import amazon_bedrock, anthropic, google, openai_completions, openai_responses
 from pi.ai.providers.base import SimpleStreamOptions, clamp_max_tokens_to_context, resolve_max_tokens
 from pi.ai.types import (
@@ -277,6 +277,62 @@ def test_bedrock_params_cannot_override_the_clamped_budget():
     # Without an explicit option, model params still supply the budget.
     body = amazon_bedrock.build_request(model, TranscriptContext([]), SimpleStreamOptions())
     assert body["inferenceConfig"]["maxTokens"] == 4096
+
+
+# ---------------------------------------------------------------------------
+# Sampling params by thinking level (F-AI-09, #9776)
+# ---------------------------------------------------------------------------
+
+def test_resolve_sampling_params_merges_level_over_flat_and_request_over_level():
+    model = small_model(reasoning=True,
+                        params={"top_k": 5, "presence_penalty": 0.1},
+                        sampling_params_by_thinking_level={
+                            "low": {"top_k": 9, "top_p": 0.9},
+                            "high": {"top_p": 0.5},
+                        })
+    # Flat params only.
+    assert resolve_sampling_params(model, None) == {"top_k": 5, "presence_penalty": 0.1}
+    # Level entries override the flat keys per key; other flat keys survive.
+    assert resolve_sampling_params(model, "low") == {"top_k": 9, "presence_penalty": 0.1, "top_p": 0.9}
+    # Per-request params override both layers.
+    assert resolve_sampling_params(model, "high", {"top_k": 1}) == {"top_k": 1, "presence_penalty": 0.1, "top_p": 0.5}
+    # No layers at all -> None.
+    bare = small_model()
+    assert resolve_sampling_params(bare, "high") is None
+
+
+def test_clamp_thinking_level_snaps_to_supported_levels():
+    non_reasoning = small_model()
+    assert clamp_thinking_level(non_reasoning, "high") == "off"
+    assert clamp_thinking_level(non_reasoning, "not-a-level") == "off"
+    reasoning = small_model(reasoning=True)
+    assert clamp_thinking_level(reasoning, "xhigh") == "high"  # xhigh needs an explicit map entry
+    assert clamp_thinking_level(reasoning, "high") == "high"
+    mapped = small_model(reasoning=True, thinking_level_map={"off": None, "low": "enabled", "xhigh": "ultra"})
+    # Unmapped regular levels stay available; "off" and "max" are gone.
+    assert clamp_thinking_level(mapped, "medium") == "medium"
+    assert clamp_thinking_level(mapped, "max") == "xhigh"
+    # A level explicitly mapped to null steps up to the nearest supported one.
+    without_medium = small_model(reasoning=True, thinking_level_map={"medium": None})
+    assert clamp_thinking_level(without_medium, "medium") == "high"
+
+
+def test_openai_completions_request_applies_level_sampling_params():
+    model = small_model(api="openai-completions", reasoning=True,
+                        params={"top_k": 5},
+                        sampling_params_by_thinking_level={"high": {"top_k": 42, "top_p": 0.7}})
+    # reasoning=None: flat params only.
+    body = openai_completions.build_request(model, TranscriptContext([]), SimpleStreamOptions())
+    assert body["top_k"] == 5 and "top_p" not in body
+    # reasoning="high": the high-level entries replace the flat keys.
+    body = openai_completions.build_request(model, TranscriptContext([]),
+                                            SimpleStreamOptions(reasoning="high"))
+    assert body["top_k"] == 42 and body["top_p"] == 0.7
+    # Explicitly requested temperature still wins over the merged params.
+    model_with_temp = small_model(api="openai-completions", params={"temperature": 0.9})
+    body = openai_completions.build_request(model_with_temp, TranscriptContext([]),
+                                            SimpleStreamOptions(temperature=0.2))
+    assert body["temperature"] == 0.2
 
 
 def test_compaction_clamp_message_uses_the_shared_divisor():

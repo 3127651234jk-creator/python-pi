@@ -8,13 +8,14 @@ from typing import Any, Dict, Optional
 
 from .. import types
 from ..json_io import to_json, message_from_json
-from ..utils import repair_tool_results
+from ..utils import normalize_provider_error_body, repair_tool_results
 from .base import SimpleStreamOptions, run_provider_stream
 
 
 WIRE_NAMES = {
     "mime_type": "mimeType", "tools_added": "toolsAdded", "tools_removed": "toolsRemoved",
     "tool_call_id": "toolCallId", "tool_name": "toolName", "is_error": "isError",
+    "parent_tool_call_id": "parentToolCallId", "duration_ms": "durationMs",
     "thinking_signature": "thinkingSignature", "thought_signature": "thoughtSignature",
     "text_signature": "textSignature", "provider_thinking_level": "providerThinkingLevel",
     "stop_reason": "stopReason", "response_id": "responseId", "response_model": "responseModel",
@@ -58,7 +59,9 @@ def create_response_error(model, url: str, status: int, status_text: str, body: 
     error = error_body["error"] if error_body else None
     message = error.get("message") if isinstance(error, dict) and isinstance(error.get("message"), str) else None
     code = error.get("code") if isinstance(error, dict) and isinstance(error.get("code"), str) else None
-    suffix = message if message is not None else body
+    # Non-error-object bodies go through the shared normalizer so the surfaced
+    # text matches what every other adapter shows for the same failure.
+    suffix = message if message is not None else normalize_provider_error_body(body)
     code_suffix = f" ({code})" if code else ""
     details: Dict[str, Any] = {"version": 1, "provider": model.provider, "model": model.id, "url": url,
                                "status": status, "statusText": status_text}

@@ -6,7 +6,7 @@ import os
 from urllib.parse import urlencode
 
 from ..types import UserMessage, AssistantMessage, ToolResultMessage, ToolCall, TextContent, ImageContent, AudioContent, VideoContent, ThinkingContent, get_system_message_text, get_message_text
-from ..utils import normalize_context, pi_user_agent
+from ..utils import PI_ORIGINATOR, normalize_context, pi_user_agent
 from .base import SimpleStreamOptions, apply_model_params, resolve_max_tokens, run_provider_stream, usage_from_counts
 from .blocks import BlockEvents
 from .copilot import copilot_headers
@@ -182,7 +182,7 @@ async def stream_openai_responses(model, context, options=None):
         # overriding. A None caller value deletes the header, like TS.
         merged = {"content-type": "application/json"}
         if codex:
-            merged.update({"originator": "pi", "user-agent": pi_user_agent(),
+            merged.update({"originator": PI_ORIGINATOR, "user-agent": pi_user_agent(),
                            "openai-beta": "responses=experimental"})
         merged.update({name.lower(): value for name, value in model.headers.items()})
         for name, value in (options.headers or {}).items():
