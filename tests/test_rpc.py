@@ -3,16 +3,26 @@ import io
 import json
 import os
 import queue
+from types import SimpleNamespace
 
 import pytest
 from pi.ai.providers import STREAM_FNS
 from pi.ai.providers.base import make_partial
-from pi.ai.types import StreamErrorEvent, SystemMessage, TextContent, UserMessage
+from pi.ai.types import (
+    AssistantMessage,
+    StreamErrorEvent,
+    SystemMessage,
+    TextContent,
+    Usage,
+    UserMessage,
+    get_message_text,
+)
 
 from pi.agent.agent import Agent
 from pi.agent.types import AgentToolResult, ToolExecutionEndEvent
-from pi.ai.models import resolve_model
+from pi.ai.models import Model, resolve_model
 from pi.ai.providers.faux import reset_script_index
+from pi.ai.retry import RetryPolicy
 from pi.coding_agent.config import Configuration
 from pi.coding_agent.model_registry import ModelRegistry
 from pi.coding_agent.rpc import JsonWriter, RpcServer
@@ -54,6 +64,363 @@ def test_rpc_validation_state_and_events():
         assert records[2]["data"]["disposition"] == "started"
         assert records[-1]["type"] == "agent_settled"
         assert any(record["type"] == "message_update" for record in records)
+    asyncio.run(check())
+
+
+def test_rpc_auto_retry_events_do_not_crash_the_run():
+    """A retryable provider error maps to auto_retry_* wire events, not run_error (F-CA-11)."""
+
+    async def check():
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"error": "terminated"}, {"text": "recovered"}])
+        reset_script_index()
+        try:
+            output = io.StringIO()
+            agent = Agent(resolve_model("faux"), retry=RetryPolicy(base_delay_ms=0))
+            server = RpcServer(agent, JsonWriter(output))
+            await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+            await server.task
+            records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+            assert records[-1]["type"] == "agent_settled"
+            assert not any(record["type"] == "run_error" for record in records)
+            start = next(record for record in records if record["type"] == "auto_retry_start")
+            assert start == {"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                             "delayMs": 0, "errorMessage": "terminated"}
+            end = next(record for record in records if record["type"] == "auto_retry_end")
+            assert end["success"] is True
+            assert end["attempt"] == 1
+            assert "finalError" not in end
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            reset_script_index()
+
+    asyncio.run(check())
+
+
+def test_rpc_agent_settled_reports_abort():
+    """agent_settled carries the run's abort state (F-CA-02, #10607)."""
+
+    async def check():
+        os.environ["FAUX_SCRIPT"] = json.dumps(
+            [{"toolCalls": [{"id": "t1", "name": "aborter", "arguments": {}}]}, {"text": "unused"}])
+        reset_script_index()
+        try:
+            output = io.StringIO()
+            agent = Agent(resolve_model("faux"), tools=[_aborting_tool()])
+            server = RpcServer(agent, JsonWriter(output))
+            await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+            await server.task
+            records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+            settled = records[-1]
+            assert settled["type"] == "agent_settled"
+            assert settled["aborted"] is True
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            reset_script_index()
+
+    asyncio.run(check())
+
+
+def test_rpc_agent_settled_normal_run_not_aborted():
+    async def check():
+        output = io.StringIO()
+        agent = Agent(resolve_model("faux"))
+        server = RpcServer(agent, JsonWriter(output))
+        reset_script_index()
+        await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+        await server.task
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        assert records[-1] == {"type": "agent_settled", "aborted": False}
+
+    asyncio.run(check())
+
+
+def test_rpc_agent_settled_notifies_extensions():
+    async def check():
+        output = io.StringIO()
+        seen = []
+
+        class Extensions:
+            async def process_input(self, text):
+                return text
+
+            async def emit(self, name, event):
+                seen.append((name, event))
+
+        agent = Agent(resolve_model("faux"))
+        server = RpcServer(agent, JsonWriter(output), extensions=Extensions())
+        reset_script_index()
+        await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+        await server.task
+        assert seen == [("agent_settled", {"type": "agent_settled", "aborted": False})]
+
+    asyncio.run(check())
+
+
+def _aborting_tool():
+    from pi.agent.types import AgentTool
+
+    async def execute(tool_call_id, params, signal=None, on_update=None):
+        signal.abort()
+        return AgentToolResult(content=[TextContent(text="ran")], details={})
+
+    return AgentTool(
+        name="aborter",
+        label="aborter",
+        description="abort the run",
+        parameters={"type": "object", "properties": {}},
+        execute=execute,
+    )
+
+
+def test_rpc_wire_session_event_shapes():
+    """Session-level events map to the TS AgentSessionEvent JSON shapes (F-CA-12)."""
+    from pi.agent.types import (
+        CompactionEndEvent,
+        CompactionStartEvent,
+        SummarizationRetryAttemptStartEvent,
+        SummarizationRetryFinishedEvent,
+        SummarizationRetryScheduledEvent,
+    )
+
+    assert event_to_ts(CompactionStartEvent(reason="overflow")) == {
+        "type": "compaction_start", "reason": "overflow"}
+    end = event_to_ts(CompactionEndEvent(
+        reason="manual", result={"summary": "s", "tokens_before": 10, "tokens_after": 2}, will_retry=True))
+    assert end == {"type": "compaction_end", "reason": "manual",
+                   "result": {"summary": "s", "tokensBefore": 10, "estimatedTokensAfter": 2},
+                   "aborted": False, "willRetry": True}
+    failed = event_to_ts(CompactionEndEvent(reason="threshold", error_message="boom"))
+    assert "result" not in failed and failed["errorMessage"] == "boom"
+    assert event_to_ts(SummarizationRetryScheduledEvent(
+        attempt=1, max_attempts=3, delay_ms=2000, error_message="terminated")) == {
+        "type": "summarization_retry_scheduled", "attempt": 1, "maxAttempts": 3,
+        "delayMs": 2000, "errorMessage": "terminated"}
+    assert event_to_ts(SummarizationRetryAttemptStartEvent(source="compaction", reason="overflow")) == {
+        "type": "summarization_retry_attempt_start", "source": "compaction", "reason": "overflow"}
+    assert event_to_ts(SummarizationRetryFinishedEvent()) == {"type": "summarization_retry_finished"}
+
+
+def test_rpc_agent_end_carries_will_retry():
+    """agent_end.willRetry mirrors the agent's retry decision (F-CA-12)."""
+
+    async def check():
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"error": "terminated"}, {"text": "recovered"}])
+        reset_script_index()
+        try:
+            output = io.StringIO()
+            agent = Agent(resolve_model("faux"), retry=RetryPolicy(base_delay_ms=0))
+            server = RpcServer(agent, JsonWriter(output))
+            await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+            await server.task
+            records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+            ends = [record for record in records if record["type"] == "agent_end"]
+            assert [end["willRetry"] for end in ends] == [True, False]
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            reset_script_index()
+
+    asyncio.run(check())
+
+
+def test_rpc_message_persist_emits_entry_appended(tmp_path):
+    async def check():
+        session = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+        session.start_new()
+        output = io.StringIO()
+        agent = Agent(resolve_model("faux"))
+        server = RpcServer(agent, JsonWriter(output), session=session)
+        reset_script_index()
+        await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+        await server.task
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        appended = [record for record in records if record["type"] == "entry_appended"]
+        # One entry per persisted message: the user prompt arrives through the
+        # session before the run, the assistant/toolResults during it.
+        assert len(appended) >= 2
+        assert appended[0]["entry"]["type"] == "message"
+        assert appended[0]["entry"]["message"]["role"] == "user"
+        ids = {record["entry"]["id"] for record in appended}
+        assert ids == {entry.id for entry in session.entries}
+
+    asyncio.run(check())
+
+
+def test_rpc_thinking_level_and_session_name_broadcast():
+    async def check():
+        session = SessionManager(session_dir="unused", cwd=None)
+        session.start_new()
+        output = io.StringIO()
+        agent = Agent(resolve_model("faux"))
+        server = RpcServer(agent, JsonWriter(output), session=session)
+        await server.dispatch({"id": "t", "type": "set_thinking_level", "level": "high"})
+        await server.dispatch({"id": "n", "type": "set_session_name", "name": "deep dive"})
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        assert {"type": "thinking_level_changed", "level": "high"} in records
+        assert {"type": "session_info_changed", "name": "deep dive"} in records
+
+    asyncio.run(check())
+
+
+def test_rpc_queue_update_broadcasts_on_mid_run_consumption():
+    """Draining the steering queue mid-run emits queue_update (F-CA-12)."""
+
+    async def check():
+        os.environ["FAUX_SCRIPT"] = json.dumps([
+            {"toolCalls": [{"id": "t1", "name": "steerer", "arguments": {}}]},
+            {"text": "done"},
+        ])
+        reset_script_index()
+        try:
+            output = io.StringIO()
+
+            def make_tool():
+                from pi.agent.types import AgentTool
+
+                async def execute(tool_call_id, params, signal=None, on_update=None):
+                    server.agent.steer("mid-run note")
+                    return AgentToolResult(content=[TextContent(text="steered")], details={})
+
+                return AgentTool(name="steerer", label="steerer", description="steer the run",
+                                 parameters={"type": "object", "properties": {}}, execute=execute)
+
+            agent = Agent(resolve_model("faux"), tools=[make_tool()])
+            server = RpcServer(agent, JsonWriter(output))
+            await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+            await server.task
+            records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+            updates = [record for record in records if record["type"] == "queue_update"]
+            # The tool enqueued (no broadcast) and the next turn drained it (broadcast).
+            assert updates == [{"type": "queue_update", "steering": [], "followUp": []}]
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            reset_script_index()
+
+    asyncio.run(check())
+
+
+def test_rpc_manual_compaction_emits_events(tmp_path):
+    async def check():
+        session = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+        session.start_new()
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"text": "part one"}, {"text": "part two"}])
+        reset_script_index()
+        try:
+            output = io.StringIO()
+            model = Model(id="faux", name="Faux", api="faux", provider="faux", base_url="",
+                          context_window=3000, max_tokens=1024)
+            agent = Agent(model)
+            agent.messages = [UserMessage(content="a" * 700, timestamp=0),
+                              UserMessage(content="b" * 700, timestamp=1)]
+            server = RpcServer(agent, JsonWriter(output), session=session, registry=object())
+            await server.dispatch({"id": "c", "type": "compact"})
+            records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+            starts = [record for record in records if record["type"] == "compaction_start"]
+            ends = [record for record in records if record["type"] == "compaction_end"]
+            assert starts == [{"type": "compaction_start", "reason": "manual"}]
+            assert len(ends) == 1
+            assert ends[0]["aborted"] is False and ends[0]["willRetry"] is False
+            assert ends[0]["result"]["summary"] == "part two"
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            reset_script_index()
+
+    asyncio.run(check())
+
+
+def test_rpc_set_auto_retry_toggles_policy():
+    async def check():
+        output = io.StringIO()
+        agent = Agent(resolve_model("faux"))
+        server = RpcServer(agent, JsonWriter(output))
+        assert agent.retry is None
+        await server.dispatch({"id": "on", "type": "set_auto_retry", "enabled": True})
+        assert agent.retry is not None and agent.retry.enabled and agent.compactor.retry is agent.retry
+        await server.dispatch({"id": "off", "type": "set_auto_retry", "enabled": False})
+        assert agent.retry.enabled is False
+        await server.dispatch({"id": "bad", "type": "set_auto_retry", "enabled": "yes"})
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        by_id = {record.get("id"): record for record in records}
+        assert by_id["on"]["success"] and by_id["off"]["success"]
+        assert not by_id["bad"]["success"]
+
+    asyncio.run(check())
+
+
+def test_rpc_abort_retry_cancels_pending_backoff():
+    async def check():
+        os.environ["FAUX_SCRIPT"] = json.dumps([{"error": "terminated"}, {"text": "recovered"}])
+        reset_script_index()
+        try:
+            output = io.StringIO()
+            agent = Agent(resolve_model("faux"), retry=RetryPolicy(base_delay_ms=60_000))
+            server = RpcServer(agent, JsonWriter(output))
+            await server.dispatch({"id": "prompt", "type": "prompt", "message": "hello"})
+            for _ in range(200):
+                if any('"auto_retry_start"' in line for line in output.getvalue().splitlines()):
+                    break
+                await asyncio.sleep(0.01)
+            await server.dispatch({"id": "abort", "type": "abort_retry"})
+            await asyncio.wait_for(server.task, 5)
+            records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+            ends = [record for record in records if record["type"] == "auto_retry_end"]
+            assert ends and ends[-1]["success"] is False and ends[-1]["finalError"] == "Retry cancelled"
+            assert not any("recovered" in line for line in output.getvalue().splitlines())
+            assert records[-1] == {"type": "agent_settled", "aborted": False}
+        finally:
+            os.environ.pop("FAUX_SCRIPT", None)
+            reset_script_index()
+
+    asyncio.run(check())
+
+
+def test_rpc_new_session_forks_from_parent(tmp_path):
+    async def check():
+        parent = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+        parent.start_new()
+        parent.append(UserMessage(content="parent question", timestamp=0))
+        parent.append(AssistantMessage(content=[TextContent(text="parent answer")], api="faux",
+                                       provider="faux", model="faux", usage=Usage(),
+                                       stop_reason="stop", timestamp=1))
+        output = io.StringIO()
+        agent = Agent(resolve_model("faux"))
+        server = RpcServer(agent, JsonWriter(output), session=SessionManager(
+            session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path)))
+        await server.dispatch({"id": "n", "type": "new_session", "parentSession": parent.session_file})
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        reply = records[-1]
+        assert reply["id"] == "n" and reply["success"] and reply["data"] == {"cancelled": False}
+        texts = [get_message_text(m.content) for m in agent.messages if m.role in ("user", "assistant")]
+        assert texts == ["parent question", "parent answer"]
+        assert server.session.session_file != parent.session_file
+        assert server.session.leaf_id == parent.leaf_id
+
+    asyncio.run(check())
+
+
+def test_rpc_get_commands_includes_prompts_and_skills():
+    async def check():
+        output = io.StringIO()
+
+        class FakeResources:
+            class config:
+                cwd = "/proj"
+
+            prompts = {"hi": SimpleNamespace(name="hi", description="Hi there",
+                                             path="/proj/.pi/prompts/hi.md")}
+            skills = {"greet": SimpleNamespace(name="greet", description="Greets",
+                                               path="/proj/.pi/skills/greet")}
+
+        server = RpcServer(Agent(resolve_model("faux")), JsonWriter(output), resources=FakeResources())
+        await server.dispatch({"id": "c", "type": "get_commands"})
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        commands = records[-1]["data"]["commands"]
+        assert {"name": "hi", "description": "Hi there", "source": "prompt",
+                "sourceInfo": {"path": "/proj/.pi/prompts/hi.md", "source": "local",
+                               "scope": "project", "origin": "top-level"}} in commands
+        assert {"name": "skill:greet", "description": "Greets", "source": "skill",
+                "sourceInfo": {"path": "/proj/.pi/skills/greet", "source": "local",
+                               "scope": "project", "origin": "top-level"}} in commands
+
     asyncio.run(check())
 
 
@@ -259,7 +626,6 @@ def test_rpc_queue_model_and_error_commands(tmp_path):
                         {"id": "g", "type": "get_state"},
                         {"id": "c", "type": "clear_queue"},
                         {"id": "u", "type": "nope"},
-                        {"id": "b", "type": "bash", "command": "dir"},
                         {"id": "m", "type": "set_model", "provider": "faux", "modelId": "faux"}):
             await server.dispatch(command)
         records = [json.loads(line) for line in output.getvalue().splitlines()]
@@ -268,12 +634,11 @@ def test_rpc_queue_model_and_error_commands(tmp_path):
         assert by_id["fu"]["data"] == {"disposition": "queued"}
         assert by_id["lv"]["data"] == {"level": "minimal"}
         assert by_id["g"]["data"]["pendingMessageCount"] == 2
-        assert by_id["g"]["data"]["steeringMode"] == "all"
+        assert by_id["g"]["data"]["steeringMode"] == "one-at-a-time"
         assert by_id["c"]["data"] == {"steering": ["later"], "followUp": ["after"]}
         updates = [record for record in records if record["type"] == "queue_update"]
         assert updates[0]["steering"] == ["later"] and updates[0]["followUp"] == []
         assert by_id["u"]["error"] == "Unknown command: nope"
-        assert "not supported" in by_id["b"]["error"]
         assert "No model registry" in by_id["m"]["error"]
     asyncio.run(check())
 

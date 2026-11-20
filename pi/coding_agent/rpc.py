@@ -10,15 +10,18 @@ Wire protocol (authoritative: ``packages/coding-agent/src/modes/rpc``):
 - Agent activity streams as TS-shaped events (``rpc_wire.event_to_ts``);
   ``message_update`` carries ``{usage, assistantMessageEvent}`` with the
   cumulative partial snapshot stripped, and every run ends with
-  ``agent_settled``. Queue changes also emit ``queue_update``.
+  ``agent_settled`` (with ``aborted``). Every queue change — including
+  consumption mid-run — emits ``queue_update``; session persistence emits
+  ``entry_appended``; compaction (manual and auto) emits
+  ``compaction_start``/``compaction_end`` and the ``summarization_retry_*``
+  family; renames and thinking-level switches emit
+  ``session_info_changed``/``thinking_level_changed``.
 - Extension UI requests are remapped to the TS method/field names
   (``extension_ui_request`` on stdout, ``extension_ui_response`` on stdin).
 
-Known limitations versus TS: ``bash``/``abort_bash``, ``set_auto_retry``/
-``abort_retry`` and ``new_session.parentSession`` are rejected with explicit
-errors (no Python runtime support); TS session-level events
-(``entry_appended``, ``compaction_start/end``, ``auto_retry_*``) are not
-emitted; the Python agent loop consumes the stream's terminal ``done``/``error``
+Known limitations versus TS: the ``bash`` command returns the final result
+(no live ``bash_execution_update`` streaming); the Python agent loop consumes
+the stream's terminal ``done``/``error``
 events, so those never appear as ``message_update`` inner events (the final
 message arrives through ``message_end``); ``steeringMode``/``followUpMode``
 both reflect the single Python ``queue_mode``; extension commands carry
@@ -33,15 +36,18 @@ import json
 import os
 import sys
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import httpx
 
 from ..ai.json_io import to_json
 from ..ai.models import ModelError
+from ..ai.retry import RetryPolicy
 from ..ai.types import AssistantMessage, ImageContent, SystemMessage, TextContent, get_message_text
 from ..agent.agent import Agent
+from ..util import AbortSignal
 from ..agent.compaction import compact_agent, restore_compaction
+from .bash_mode import execute_bang as run_bang
 from .catalog_sync import fetch_catalog, save_cache
 from .extensions import ExtensionManager
 from .model_registry import ModelRegistry
@@ -75,6 +81,21 @@ class JsonWriter:
 
     async def __call__(self, event):
         await self.write(event)
+
+
+class WireJsonWriter(JsonWriter):
+    """JSON-mode writer: agent events leave as TS wire shapes (event_to_ts)
+    instead of raw dataclass dicts, and session persistence emits
+    ``entry_appended`` like the RPC event stream does."""
+
+    def __init__(self, output=None, session: Optional[SessionManager] = None) -> None:
+        super().__init__(output)
+        self.session = session
+
+    async def __call__(self, event):
+        await self.write(event_to_ts(event))
+        if self.session is not None and getattr(event, "type", None) == "message_end":
+            await self.write({"type": "entry_appended", "entry": entry_to_ts(self.session.entries[-1])})
 
 
 def _images_from_command(raw) -> Optional[list]:
@@ -133,6 +154,10 @@ class RpcServer:
         self.task = None
         self.extensions = extensions
         self.ui_futures: dict = {}
+        # Abort signal of the running `bash` command (abort_bash cancels it).
+        self._bash_signal: Optional[AbortSignal] = None
+        # Queue drains inside a running prompt broadcast queue_update too.
+        self.agent.on_queue_update = self.emit_queue_update
 
     # -- extension UI protocol ------------------------------------------------
 
@@ -163,7 +188,11 @@ class RpcServer:
     async def run_prompt(self, text, images=None):
         async def event(event):
             if self.session and event.type == "message_end":
+                await self.writer.write(event_to_ts(event))
                 self.session.append(event.message)
+                await self.writer.write({"type": "entry_appended",
+                                         "entry": entry_to_ts(self.session.entries[-1])})
+                return
             await self.writer.write(event_to_ts(event))
         unsubscribe = self.agent.subscribe(event)
         try:
@@ -172,7 +201,10 @@ class RpcServer:
             await self.writer.write({"type": "run_error", "error": str(exc)})
         finally:
             unsubscribe()
-            await self.writer.write({"type": "agent_settled"})
+            settled = {"type": "agent_settled", "aborted": self.agent.abort_requested}
+            if self.extensions is not None:
+                await self.extensions.emit("agent_settled", dict(settled))
+            await self.writer.write(settled)
 
     def busy(self):
         return self.task is not None and not self.task.done()
@@ -273,7 +305,10 @@ class RpcServer:
             mode = command["mode"]
             if mode not in ("all", "one-at-a-time"):
                 raise ValueError("mode must be all or one-at-a-time")
-            self.agent.queue_mode = mode
+            if kind == "set_steering_mode":
+                self.agent.steering_queue_mode = mode
+            else:
+                self.agent.follow_up_queue_mode = mode
         elif kind == "get_state":
             data = {}
             if self.agent.model is not None:
@@ -281,8 +316,8 @@ class RpcServer:
             data["thinkingLevel"] = self.agent.thinking_level
             data["isStreaming"] = self.busy()
             data["isCompacting"] = False
-            data["steeringMode"] = self.agent.queue_mode
-            data["followUpMode"] = self.agent.queue_mode
+            data["steeringMode"] = self.agent.steering_queue_mode
+            data["followUpMode"] = self.agent.follow_up_queue_mode
             if self.session is not None and self.session.session_file:
                 data["sessionFile"] = self.session.session_file
                 data["sessionId"] = _session_id(self.session.session_file)
@@ -326,6 +361,7 @@ class RpcServer:
             if level not in _THINKING_LEVELS:
                 raise ValueError("Invalid thinking level")
             self.agent.thinking_level = level
+            await self.writer.write({"type": "thinking_level_changed", "level": level})
         elif kind == "cycle_thinking_level":
             self._require_idle()
             index = _THINKING_LEVELS.index(self.agent.thinking_level) \
@@ -333,6 +369,7 @@ class RpcServer:
             level = _THINKING_LEVELS[(index + 1) % len(_THINKING_LEVELS)]
             self.agent.thinking_level = level
             response["data"] = {"level": level}
+            await self.writer.write({"type": "thinking_level_changed", "level": level})
         elif kind == "get_available_models":
             registry = self._require_registry()
             response["data"] = {"models": [model_to_ts(model) for model in registry.models.values()]}
@@ -363,7 +400,18 @@ class RpcServer:
             self._require_registry()
             if self.busy():
                 raise ValueError("Cannot compact while the agent is streaming")
-            result = await compact_agent(self.agent, self.session, command.get("customInstructions", ""))
+            await self.writer.write({"type": "compaction_start", "reason": "manual"})
+            try:
+                result = await compact_agent(self.agent, self.session, command.get("customInstructions", ""))
+            except Exception as exc:
+                await self.writer.write({"type": "compaction_end", "reason": "manual",
+                                         "aborted": isinstance(exc, asyncio.CancelledError),
+                                         "willRetry": False,
+                                         "errorMessage": str(exc) or exc.__class__.__name__})
+                raise
+            await self.writer.write({"type": "compaction_end", "reason": "manual",
+                                     "result": compaction_to_ts(result),
+                                     "aborted": False, "willRetry": False})
             response["data"] = compaction_to_ts(result)
         elif kind == "set_auto_compaction":
             self._require_idle()
@@ -371,17 +419,57 @@ class RpcServer:
             if not isinstance(enabled, bool):
                 raise ValueError("enabled must be a boolean")
             self.agent.compactor.settings.enabled = enabled
-        elif kind in ("set_auto_retry", "abort_retry", "bash", "abort_bash"):
-            raise ValueError(f"{kind} is not supported by the Python RPC server")
+        elif kind == "set_auto_retry":
+            enabled = command.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be a boolean")
+            if self.agent.retry is None:
+                if enabled:
+                    # Retry was off (no policy); enabling installs the defaults.
+                    self.agent.retry = RetryPolicy()
+                    self.agent.compactor.retry = self.agent.retry
+            else:
+                self.agent.retry.enabled = enabled
+        elif kind == "abort_retry":
+            self.agent.abort_retry()
+        elif kind == "bash":
+            payload_command = command.get("command")
+            if not isinstance(payload_command, str) or not payload_command:
+                raise ValueError("bash requires a command string")
+            signal = AbortSignal()
+            self._bash_signal = signal
+            try:
+                message = await run_bang(payload_command, os.getcwd(), signal,
+                                         exclude_from_context=bool(command.get("excludeFromContext")))
+            finally:
+                self._bash_signal = None
+            self.agent.messages.append(message)
+            if self.session:
+                self.session.append_bash_execution(message)
+                await self.writer.write({"type": "entry_appended",
+                                         "entry": entry_to_ts(self.session.entries[-1])})
+            data: Dict[str, Any] = {"output": message.output, "exitCode": message.exit_code,
+                                    "cancelled": message.cancelled, "truncated": message.truncated}
+            if message.full_output_path is not None:
+                data["fullOutputPath"] = message.full_output_path
+            response["data"] = data
+        elif kind == "abort_bash":
+            if self._bash_signal is not None:
+                self._bash_signal.abort()
         elif kind == "new_session":
             self._require_idle()
-            if command.get("parentSession") is not None:
-                raise ValueError("parentSession is not supported by the Python RPC server")
-            self.agent.messages = [m for m in self.agent.messages if isinstance(m, SystemMessage)]
-            if self.session:
-                self.session.start_new()
-                for message in self.agent.messages:
-                    self.session.append(message)
+            parent = command.get("parentSession")
+            if parent is not None:
+                if not isinstance(parent, str) or not parent:
+                    raise ValueError("parentSession must be a session path")
+                session = self._require_session()
+                self.agent.messages = session.fork_from(parent)
+            else:
+                self.agent.messages = [m for m in self.agent.messages if isinstance(m, SystemMessage)]
+                if self.session:
+                    self.session.start_new()
+                    for message in self.agent.messages:
+                        self.session.append(message)
             restore_compaction(self.agent.compactor, self.agent.messages,
                                self.session.latest_custom("compaction") if self.session else None)
             response["data"] = {"cancelled": False}
@@ -410,6 +498,21 @@ class RpcServer:
                             "origin": "top-level",
                         }
                     commands.append(record)
+            if self.resources:
+                agent_dir = str(self.extensions.config.agent_dir) if self.extensions else None
+                cwd = str(self.resources.config.cwd)
+
+                def source_info(path) -> dict:
+                    text = str(path)
+                    scope = "user" if (agent_dir and text.startswith(agent_dir)) else "project"
+                    return {"path": text, "source": "local", "scope": scope, "origin": "top-level"}
+
+                for template in self.resources.prompts.values():
+                    commands.append({"name": template.name, "description": template.description,
+                                     "source": "prompt", "sourceInfo": source_info(template.path)})
+                for skill in self.resources.skills.values():
+                    commands.append({"name": f"skill:{skill.name}", "description": skill.description,
+                                     "source": "skill", "sourceInfo": source_info(skill.path)})
             response["data"] = {"commands": commands}
         elif kind == "sync_models":
             self._require_idle()
@@ -460,6 +563,7 @@ class RpcServer:
                 if not name:
                     raise ValueError("Session name cannot be empty")
                 session.rename(name)
+                await self.writer.write({"type": "session_info_changed", "name": session.name})
             else:
                 output_path = command.get("outputPath")
                 if output_path is not None and not isinstance(output_path, str):

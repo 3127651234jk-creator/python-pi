@@ -185,9 +185,37 @@ def event_to_ts(event) -> dict:
             result["parentToolCallId"] = event.parent_tool_call_id
         return result
     if kind == "agent_end":
-        # The Python loop has no retry engine, so willRetry is always false.
         return {"type": "agent_end", "messages": [message_to_ts(item) for item in event.messages],
-                "willRetry": False}
+                "willRetry": bool(getattr(event, "will_retry", False))}
+    if kind == "compaction_start":
+        return {"type": kind, "reason": event.reason}
+    if kind == "compaction_end":
+        result: Dict[str, Any] = {"type": kind, "reason": event.reason}
+        if event.result is not None:
+            result["result"] = compaction_to_ts(event.result)
+        result["aborted"] = event.aborted
+        result["willRetry"] = event.will_retry
+        if event.error_message is not None:
+            result["errorMessage"] = event.error_message
+        return result
+    if kind == "summarization_retry_scheduled":
+        return {"type": kind, "attempt": event.attempt, "maxAttempts": event.max_attempts,
+                "delayMs": event.delay_ms, "errorMessage": event.error_message}
+    if kind == "summarization_retry_attempt_start":
+        result = {"type": kind, "source": event.source}
+        if event.source == "compaction":
+            result["reason"] = event.reason
+        return result
+    if kind == "summarization_retry_finished":
+        return {"type": kind}
+    if kind == "auto_retry_start":
+        return {"type": kind, "attempt": event.attempt, "maxAttempts": event.max_attempts,
+                "delayMs": event.delay_ms, "errorMessage": event.error_message}
+    if kind == "auto_retry_end":
+        result: Dict[str, Any] = {"type": kind, "success": event.success, "attempt": event.attempt}
+        if event.final_error is not None:
+            result["finalError"] = event.final_error
+        return result
     raise ValueError(f"Unknown agent event: {kind!r}")
 
 
