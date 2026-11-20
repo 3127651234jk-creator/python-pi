@@ -35,12 +35,28 @@ async def execute_bang(text: str, cwd: str, signal: Optional[AbortSignal] = None
                        exclude_from_context: Optional[bool] = None) -> BashExecutionMessage:
     """Run one ``!`` / ``!!`` command; raises ValueError on an empty command.
 
-    ``exclude_from_context`` forces the ``!!`` semantics explicitly (the RPC
-    ``bash`` command carries the flag separately from the command text)."""
-    excluded = text.startswith("!!") if exclude_from_context is None else exclude_from_context
-    command = text[2:].strip() if text.startswith("!!") else text[1:].strip()
+    Leading whitespace is accepted. ``exclude_from_context`` forces the ``!!``
+    semantics explicitly; the RPC ``bash`` command uses ``execute_shell``
+    because its payload is a raw command without a bang prefix."""
+    stripped = text.lstrip()
+    excluded = stripped.startswith("!!") if exclude_from_context is None else exclude_from_context
+    command = stripped[2:].strip() if stripped.startswith("!!") else stripped[1:].strip()
+    return await _execute(command, cwd, signal, excluded, bang=True)
+
+
+async def execute_shell(command: str, cwd: str, signal: Optional[AbortSignal] = None,
+                        exclude_from_context: bool = False) -> BashExecutionMessage:
+    """Run a raw shell command (RPC ``bash``; no ``!``/``!!`` prefix)."""
+
+    return await _execute(command.strip(), cwd, signal, exclude_from_context, bang=False)
+
+
+async def _execute(command: str, cwd: str, signal: Optional[AbortSignal], excluded: bool,
+                   bang: bool) -> BashExecutionMessage:
     if not command:
-        raise ValueError("usage: ! <command>  (or !! <command> to keep the output out of context)")
+        if bang:
+            raise ValueError("usage: ! <command>  (or !! <command> to keep the output out of context)")
+        raise ValueError("bash requires a command string")
     tool = create_bash_tool(cwd)
     timestamp = int(time.time() * 1000)
     try:

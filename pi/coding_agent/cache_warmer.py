@@ -105,23 +105,25 @@ def replay_safe(options: Any, model: Model) -> Optional[str]:
 def decide(model: Model, prompt_tokens: int, idle: bool) -> CacheWarmingDecision:
     """The economic decision: warm when p * miss_cost - warm_cost clears the
     threshold; zero prices are not mistaken for free (unknown stops)."""
+    phase = "idle" if idle else "streaming"
     input_price = _per_million(model.costs, "input")
     cache_read_price = _per_million(model.costs, "cache_read")
     cache_write_price = _per_million(model.costs, "cache_write")
     output_price = _per_million(model.costs, "output")
-    if min(input_price or 0, output_price or 0) is None or cache_read_price is None:
-        return CacheWarmingDecision(phase="idle", economics_available=False, action="stop")
-    hit = prompt_tokens * (cache_read_price or 0.0) / 1_000_000
-    miss = prompt_tokens * ((cache_write_price if cache_write_price else input_price) or 0.0) / 1_000_000
-    warm_cost = hit + (output_price or 0.0) * WARM_OUTPUT_TOKENS / 1_000_000
+    if input_price is None or output_price is None or cache_read_price is None:
+        return CacheWarmingDecision(phase=phase, economics_available=False, action="stop")
+    hit = prompt_tokens * cache_read_price / 1_000_000
+    miss = prompt_tokens * (cache_write_price if cache_write_price else input_price) / 1_000_000
+    warm_cost = hit + output_price * WARM_OUTPUT_TOKENS / 1_000_000
     miss_cost = max(0.0, miss - hit)
     probability = IDLE_CONTINUATION_PROBABILITY if idle else 1.0
     expected_savings = probability * miss_cost - warm_cost
     action = "warm" if expected_savings >= DECISION_THRESHOLD_USD else "stop"
     return CacheWarmingDecision(
-        phase="idle" if idle else "streaming",
+        phase=phase,
         warm_cost=warm_cost, miss_cost=miss_cost, continuation_probability=probability,
-        expected_savings=expected_savings, economics_available=True, action=action)
+        expected_savings=expected_savings,
+        economics_available=prompt_tokens > 0 and (hit > 0 or miss > 0), action=action)
 
 
 class CacheWarmer:
@@ -137,6 +139,9 @@ class CacheWarmer:
         self.mode: str = "streaming"
         self.status: CacheWarmingStatus = CacheWarmingStatus(state="inactive", reason="no request")
         self.request: Optional[CacheWarmRequest] = None
+        # Phase of the latest run (TS ActiveRun.phase): a run is streaming
+        # until its agent_end arrives, then idle.
+        self.phase: str = "streaming"
         self.started_at: Optional[float] = None
         self._generation = 0
         self._timer: Optional[Any] = None
@@ -154,8 +159,9 @@ class CacheWarmer:
         self.request = CacheWarmRequest(
             model=model, context=copy.deepcopy(context), options=copy.deepcopy(options),
             request_id=self._generation, generation=self._generation, started_at=self.clock())
-        if self.started_at is None:
-            self.started_at = self.request.started_at
+        # Each real request starts a new run with its own lifetime window.
+        self.phase = "streaming"
+        self.started_at = self.request.started_at
         self._cancel_timer()
         self._cancel_refresh()
         self._schedule()
@@ -167,6 +173,7 @@ class CacheWarmer:
         if self.mode == "streaming":
             self._stop("streaming mode does not keep the cache warm after the run")
             return
+        self.phase = "idle"
         if self.started_at is not None and self.clock() - self.started_at > MAX_IDLE_SECONDS:
             self._stop("idle warm window expired")
             return
@@ -176,14 +183,16 @@ class CacheWarmer:
         self._cancel_timer()
         self._cancel_refresh()
         self.request = None
+        self.phase = "streaming"
         self.started_at = None
         self.status = CacheWarmingStatus(state="inactive", reason="cancelled")
 
     async def close(self) -> None:
         self._closed = True
+        refresh = self._refresh_task
         self.cancel()
-        if self._refresh_task is not None:
-            await asyncio.gather(self._refresh_task, return_exceptions=True)
+        if refresh is not None:
+            await asyncio.gather(refresh, return_exceptions=True)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -219,7 +228,7 @@ class CacheWarmer:
         if prompt_tokens is None:
             self.status = CacheWarmingStatus(state="inactive", reason="no usable usage on the last response")
             return
-        decision = decide(self.request.model, prompt_tokens, idle=self.mode == "idle")
+        decision = decide(self.request.model, prompt_tokens, idle=self.phase == "idle")
         if self.decision_hook is not None:
             outcome = self.decision_hook(decision)
             if asyncio.iscoroutine(outcome):
@@ -254,7 +263,7 @@ class CacheWarmer:
         if self.clock() > self.status.next_warm_at + max(slack, MIN_TTL_SECONDS * LATE_SLACK_FRACTION):
             self._stop("warm window passed while the loop was stalled")
             return
-        window = MAX_IDLE_SECONDS if self.mode == "idle" else MAX_ACTIVE_SECONDS
+        window = MAX_IDLE_SECONDS if self.phase == "idle" else MAX_ACTIVE_SECONDS
         if self.clock() - self.request.started_at > window:
             self._stop("warm window expired")
             return

@@ -597,7 +597,6 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
                 record.cost = result.usage.cost.get("total", 0.0)
             return _classifier_result_to_script(result)
         raise ValueError(f"Unknown models namespace call: {name}")
-        return _result_text(outcome.result)
 
     async def execute(call_id: str, params: dict, signal=None, on_update=None) -> AgentToolResult:
         code = params.get("code")

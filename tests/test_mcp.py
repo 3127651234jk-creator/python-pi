@@ -6,6 +6,7 @@ import time
 import httpx
 import pytest
 
+from pi.coding_agent.cli import _mcp_login_args
 from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.mcp import McpClient, McpManager, create_tool_name_matcher, is_mcp_tool_name
 
@@ -579,6 +580,16 @@ def test_mcp_cli_login_arg_parsing():
         _parse_login_args(["dev", "--timeout"])
     with pytest.raises(ValueError, match="usage"):
         _parse_login_args([])
+
+
+def test_interactive_mcp_login_reuses_the_cli_parser():
+    """`/mcp login` must resolve --timeout through the shared parser, not a
+    missing helper (the command used to fail with NameError)."""
+
+    assert _mcp_login_args(["dev"]) == ("dev", None)
+    assert _mcp_login_args(["dev", "--timeout", "30"]) == ("dev", 30.0)
+    with pytest.raises(ValueError, match="usage"):
+        _mcp_login_args([])
 
 
 def test_mcp_cli_list_and_login_routing(tmp_path, monkeypatch, capsys):

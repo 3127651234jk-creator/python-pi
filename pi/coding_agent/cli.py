@@ -72,6 +72,7 @@ from ..agent.compaction import CompactionSettings
 from . import timings
 from .resources import ResourceCatalog
 from .mcp import McpManager, create_tool_name_matcher, is_mcp_tool_name
+from .mcp_cli import _parse_login_args as _mcp_login_args
 from .tool_search import STORE_TYPE as TOOL_SEARCH_STORE_TYPE, create_tool_search_tool
 from .bash_mode import execute_bang as run_bang, render_bang_output
 from .program_status import ProgramStatusReporter, program_status_enabled
@@ -1965,8 +1966,11 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         warmer = CacheWarmer(get_default_stream_fn())
         warmer.mode = warming_mode
         agent.on_real_request = warmer.capture
+        # The agent settles on its final agent_end; a retryable failure sets
+        # will_retry and is not a settle (F-CA-13, port of agent_settled).
         agent.subscribe(lambda event: warmer.on_agent_settled()
-                        if getattr(event, "type", "") == "agent_settled" else None)
+                        if getattr(event, "type", "") == "agent_end"
+                        and not getattr(event, "will_retry", False) else None)
 
     # --no-mcp disables built-in MCP support: no servers connect, no MCP tools,
     # and extensions see no MCP manager to register servers on.

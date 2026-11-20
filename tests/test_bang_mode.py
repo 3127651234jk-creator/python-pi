@@ -19,11 +19,13 @@ from pi.coding_agent.rpc import JsonWriter, RpcServer
 from pi.coding_agent.session import SessionManager
 
 
-def stub_bash_tool(monkeypatch, output="hello", exit_code=0):
+def stub_bash_tool(monkeypatch, output="hello", exit_code=0, commands=None):
     """Replace the shared runner with a canned AgentToolResult."""
 
     def fake_create(cwd):
         async def execute(call_id, params, signal=None, on_update=None):
+            if commands is not None:
+                commands.append(params["command"])
             return AgentToolResult(content=[TextContent(text=output)],
                                    structured_content={"output": output, "truncated": False,
                                                        "exit_code": exit_code})
@@ -71,7 +73,8 @@ def test_render_marks_excluded_header():
 
 def test_rpc_bash_records_and_returns_result(tmp_path, monkeypatch):
     """The RPC `bash` command runs, records a session entry, and returns the shape."""
-    stub_bash_tool(monkeypatch, output="listed", exit_code=0)
+    commands = []
+    stub_bash_tool(monkeypatch, output="listed", exit_code=0, commands=commands)
 
     async def check():
         session = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
@@ -79,6 +82,7 @@ def test_rpc_bash_records_and_returns_result(tmp_path, monkeypatch):
         output = io.StringIO()
         server = RpcServer(Agent(resolve_model("faux")), JsonWriter(output), session=session)
         await server.dispatch({"id": "b", "type": "bash", "command": "ls -la"})
+        await server._bash_task
         records = [json.loads(line) for line in output.getvalue().splitlines() if line]
         reply = next(record for record in records if record.get("id") == "b")
         assert reply["success"]
@@ -86,6 +90,8 @@ def test_rpc_bash_records_and_returns_result(tmp_path, monkeypatch):
         appended = next(record for record in records if record.get("type") == "entry_appended")
         assert appended["entry"]["message"]["role"] == "bashExecution"
         assert [m.role for m in server.agent.messages] == ["bashExecution"]
+        # The RPC payload is a raw command: no bang prefix character is eaten.
+        assert commands == ["ls -la"]
 
     asyncio.run(check())
 
@@ -97,12 +103,60 @@ def test_rpc_bash_exclude_from_context(monkeypatch):
         output = io.StringIO()
         server = RpcServer(Agent(resolve_model("faux")), JsonWriter(output))
         await server.dispatch({"id": "b", "type": "bash", "command": "top", "excludeFromContext": True})
+        await server._bash_task
         await server.dispatch({"id": "x", "type": "abort_bash"})
         message = server.agent.messages[0]
         assert message.exclude_from_context is True
         assert default_convert_to_llm(server.agent.messages) == []
 
     asyncio.run(check())
+
+
+def test_rpc_abort_bash_reaches_a_running_command(monkeypatch):
+    """dispatch() does not block on bash, so abort_bash can cancel it."""
+    observed = {}
+
+    async def slow_shell(command, cwd, signal=None, exclude_from_context=False):
+        observed["signal"] = signal
+        while not signal.aborted:
+            await asyncio.sleep(0.01)
+        return BashExecutionMessage(command=command, output="", exit_code=None, cancelled=True, timestamp=0)
+
+    monkeypatch.setattr("pi.coding_agent.rpc.execute_shell", slow_shell)
+
+    async def check():
+        output = io.StringIO()
+        server = RpcServer(Agent(resolve_model("faux")), JsonWriter(output))
+        await server.dispatch({"id": "b", "type": "bash", "command": "sleep 10"})
+        task = server._bash_task
+        for _ in range(100):
+            if "signal" in observed:
+                break
+            await asyncio.sleep(0.01)
+        assert "signal" in observed
+        await server.dispatch({"id": "a", "type": "abort_bash"})
+        await asyncio.wait_for(task, 2)
+        assert observed["signal"].aborted is True
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+        bash_reply = next(record for record in records if record.get("id") == "b")
+        assert bash_reply["data"]["cancelled"] is True
+
+    asyncio.run(check())
+
+
+def test_bang_accepts_leading_whitespace(monkeypatch):
+    commands = []
+    stub_bash_tool(monkeypatch, commands=commands)
+
+    async def run():
+        hidden = await execute_bang("  !! echo secret", "/tmp")
+        visible = await execute_bang(" ! echo hello", "/tmp")
+        return hidden, visible
+
+    hidden, visible = asyncio.run(run())
+    assert hidden.exclude_from_context is True and hidden.command == "echo secret"
+    assert visible.exclude_from_context is False and visible.command == "echo hello"
+    assert commands == ["echo secret", "echo hello"]
 
 
 def test_rpc_bash_empty_command_is_rejected(monkeypatch):

@@ -137,6 +137,20 @@ class ProgramStatusReporter:
             elif getattr(event, "reason", None) == "manual":
                 self.resting_status = (ProgramStatus(state="error", message=first_line(event.error_message))
                                        if getattr(event, "error_message", None) else ProgramStatus(state="done"))
+        elif event_type == "agent_end":
+            # The agent's final end is the settle point unless a retry
+            # supersedes it; Python has no separate agent_settled agent event.
+            if getattr(event, "will_retry", False):
+                return
+            self.run_active = False
+            messages = getattr(event, "messages", None) or []
+            final = next(
+                (message for message in reversed(messages)
+                 if getattr(message, "role", None) == "assistant"),
+                None,
+            )
+            aborted = final is not None and getattr(final, "stop_reason", None) == "aborted"
+            self.resting_status = ProgramStatus(state="idle") if aborted else self.run_result
         elif event_type == "agent_settled":
             self.run_active = False
             aborted = bool(getattr(event, "aborted", False))

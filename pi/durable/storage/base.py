@@ -153,7 +153,7 @@ class BaseStorage:
         if cursor is None:
             return requested or fallback, None
         after = cursor.get("after")
-        if after is not None and (not isinstance(after, int) or isinstance(after, bool)):
+        if not isinstance(after, int) or isinstance(after, bool):
             raise StorageRejected("Invalid storage cursor")
         stored = cursor.get("order")
         if stored is not None and stored not in ("ascending", "descending"):

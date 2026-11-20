@@ -418,10 +418,27 @@ class Harness:
             self._context_cache.pop(conversation_id, None)
             return
         self._context_cache[conversation_id] = context_range
-        # A fresh read refreshes the entry: drop any pending idle expiry.
-        task = self._context_expiry_tasks.pop(conversation_id, None)
-        if task is not None:
-            task.cancel()
+        # A read does not extend the idle window: the pending expiry (if any)
+        # keeps running, as TS keeps the run's idleSince across reads.
+
+    def _schedule_context_expiry(self, conversation_id: int) -> None:
+        """Schedule this conversation's idle expiry unless one is pending."""
+
+        if conversation_id in self._context_expiry_tasks:
+            return
+        delay = self.context_retention_ms / 1000
+        if delay <= 0:
+            return
+
+        async def expire() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            self._context_expiry_tasks.pop(conversation_id, None)
+            self._context_cache.pop(conversation_id, None)
+
+        self._context_expiry_tasks[conversation_id] = asyncio.ensure_future(expire())
 
     async def _settle_context_idle(self) -> None:
         """Expire cached context ranges of idle conversations (port of TS
@@ -438,22 +455,10 @@ class Harness:
         for conversation_id in list(self._context_cache):
             if conversation_id in live:
                 continue
-            delay = self.context_retention_ms / 1000
-            if delay <= 0:
+            if self.context_retention_ms <= 0:
                 self._context_cache.pop(conversation_id, None)
                 continue
-            if conversation_id in self._context_expiry_tasks:
-                continue
-
-            async def expire(conversation_id: int = conversation_id) -> None:
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
-                    return
-                self._context_expiry_tasks.pop(conversation_id, None)
-                self._context_cache.pop(conversation_id, None)
-
-            self._context_expiry_tasks[conversation_id] = asyncio.ensure_future(expire())
+            self._schedule_context_expiry(conversation_id)
 
     def _cancel_context_expiry(self) -> None:
         for task in self._context_expiry_tasks.values():

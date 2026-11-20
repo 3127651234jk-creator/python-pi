@@ -98,7 +98,10 @@ def test_economics_threshold_and_idle_probability():
     assert decide(model, 1_000_000, idle=True).action == "warm"
     assert decide(model, 200_000, idle=False).action == "warm"
     # Zero prices are not free: a fully zero catalog stops warming.
-    assert decide(make_model(costs=ModelCost()), 1_000_000, idle=False).action == "stop"
+    decision = decide(make_model(costs=ModelCost()), 1_000_000, idle=False)
+    assert decision.action == "stop"
+    assert decision.economics_available is False
+    assert decide(model, 1_000_000, idle=False).economics_available is True
 
 
 def test_unknown_ttl_and_unsafe_replay_stay_inactive():
@@ -150,6 +153,39 @@ def test_streaming_settled_stops_and_cancel_clears():
         warmer.cancel()
         clock.advance(300)
         assert warmer.request is None and warmer.status.state == "inactive"
+        await warmer.close()
+
+    asyncio.run(scenario())
+
+
+def test_idle_mode_uses_streaming_probability_until_settled():
+    """During a run the decision uses p=1.0; only agent_end switches to idle."""
+
+    async def scenario():
+        warmer, _, _ = make_warmer()
+        capture_request(warmer)
+        assert warmer.status.decision.phase == "streaming"
+        assert warmer.status.decision.continuation_probability == 1.0
+        warmer.on_agent_settled()
+        assert warmer.status.decision.phase == "idle"
+        assert warmer.status.decision.continuation_probability == 0.15
+        await warmer.close()
+
+    asyncio.run(scenario())
+
+
+def test_idle_window_restarts_per_run():
+    """started_at is per run: an expired run must not disable later runs."""
+
+    async def scenario():
+        warmer, clock, _ = make_warmer()
+        capture_request(warmer)
+        clock.advance(31 * 60)
+        warmer.on_agent_settled()
+        assert warmer.request is None  # this run's 30-minute window expired
+        capture_request(warmer)
+        warmer.on_agent_settled()
+        assert warmer.request is not None  # a new request starts a new window
         await warmer.close()
 
     asyncio.run(scenario())

@@ -20,7 +20,7 @@ from .types import ContextEdit, EntryRecord
 
 SCAN_PAGE_SIZE = 256
 # Assistant responses that never enter the model context (TS EXCLUDED_STOP_REASONS).
-EXCLUDED_STOP_REASONS = frozenset({"aborted", "error"})
+EXCLUDED_STOP_REASONS = frozenset({"aborted", "error", "deferred"})
 MISSING_RESULT_TEXT = "Tool result unavailable: history ends before this call completed."
 
 

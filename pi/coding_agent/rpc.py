@@ -47,7 +47,7 @@ from ..ai.types import AssistantMessage, ImageContent, SystemMessage, TextConten
 from ..agent.agent import Agent
 from ..util import AbortSignal
 from ..agent.compaction import compact_agent, restore_compaction
-from .bash_mode import execute_bang as run_bang
+from .bash_mode import execute_shell
 from .catalog_sync import fetch_catalog, save_cache
 from .extensions import ExtensionManager
 from .model_registry import ModelRegistry
@@ -156,6 +156,9 @@ class RpcServer:
         self.ui_futures: dict = {}
         # Abort signal of the running `bash` command (abort_bash cancels it).
         self._bash_signal: Optional[AbortSignal] = None
+        # Background task of the running `bash` command, so the command
+        # dispatcher stays free to process abort_bash and other requests.
+        self._bash_task: Optional[asyncio.Task] = None
         # Queue drains inside a running prompt broadcast queue_update too.
         self.agent.on_queue_update = self.emit_queue_update
 
@@ -216,6 +219,38 @@ class RpcServer:
         await self.writer.write({"type": "queue_update",
                                  "steering": self.queue_texts(self.agent._steering_queue),
                                  "followUp": self.queue_texts(self.agent._follow_up_queue)})
+
+    async def _run_bash(self, command: str, signal: AbortSignal,
+                        exclude_from_context: bool, response: dict) -> None:
+        """Execute one RPC ``bash`` command and write its response.
+
+        Runs as a background task so ``abort_bash`` can reach the signal while
+        the shell command is still running.
+        """
+
+        try:
+            message = await execute_shell(command, os.getcwd(), signal,
+                                          exclude_from_context=exclude_from_context)
+            self.agent.messages.append(message)
+            if self.session:
+                self.session.append_bash_execution(message)
+                await self.writer.write({"type": "entry_appended",
+                                         "entry": entry_to_ts(self.session.entries[-1])})
+            data: Dict[str, Any] = {"output": message.output, "exitCode": message.exit_code,
+                                    "cancelled": message.cancelled, "truncated": message.truncated}
+            if message.full_output_path is not None:
+                data["fullOutputPath"] = message.full_output_path
+            response["data"] = data
+        except Exception as exc:  # noqa: BLE001 - reported to the client as a command failure
+            response.pop("data", None)
+            response.update(success=False, error=str(exc))
+        finally:
+            if self._bash_signal is signal:
+                self._bash_signal = None
+        try:
+            await self.writer.write(response)
+        finally:
+            self._bash_task = None
 
     def _require_idle(self) -> None:
         if self.busy():
@@ -434,25 +469,18 @@ class RpcServer:
             self.agent.abort_retry()
         elif kind == "bash":
             payload_command = command.get("command")
-            if not isinstance(payload_command, str) or not payload_command:
+            if not isinstance(payload_command, str) or not payload_command.strip():
                 raise ValueError("bash requires a command string")
+            if self._bash_task is not None and not self._bash_task.done():
+                raise ValueError("a bash command is already running")
             signal = AbortSignal()
             self._bash_signal = signal
-            try:
-                message = await run_bang(payload_command, os.getcwd(), signal,
-                                         exclude_from_context=bool(command.get("excludeFromContext")))
-            finally:
-                self._bash_signal = None
-            self.agent.messages.append(message)
-            if self.session:
-                self.session.append_bash_execution(message)
-                await self.writer.write({"type": "entry_appended",
-                                         "entry": entry_to_ts(self.session.entries[-1])})
-            data: Dict[str, Any] = {"output": message.output, "exitCode": message.exit_code,
-                                    "cancelled": message.cancelled, "truncated": message.truncated}
-            if message.full_output_path is not None:
-                data["fullOutputPath"] = message.full_output_path
-            response["data"] = data
+            # Run outside the dispatcher: abort_bash and other commands must be
+            # processed while the shell command is still running.
+            self._bash_task = asyncio.create_task(
+                self._run_bash(payload_command, signal,
+                               bool(command.get("excludeFromContext")), response))
+            return True
         elif kind == "abort_bash":
             if self._bash_signal is not None:
                 self._bash_signal.abort()
@@ -642,6 +670,15 @@ class RpcServer:
                 dispatcher.cancel()
             await asyncio.gather(*(task for task in (drain, dispatcher) if task is not None),
                                  return_exceptions=True)
+            if self._bash_task is not None and not self._bash_task.done():
+                # Input ended while a shell command was running: stop it and let
+                # its response (or failure) reach the client before shutdown.
+                if self._bash_signal is not None:
+                    self._bash_signal.abort()
+                try:
+                    await asyncio.wait_for(self._bash_task, 5)
+                except asyncio.TimeoutError:
+                    pass
             if self.busy():
                 self.agent.abort()
                 try:

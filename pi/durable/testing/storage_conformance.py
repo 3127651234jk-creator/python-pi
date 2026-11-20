@@ -569,6 +569,8 @@ async def _case_scan_order(storage) -> None:
             reversed_ids[2:4],
         )
         await assert_obj.rejects(scan("ascending", descending.next), "cursor")
+        # A cursor must carry the last ID it returned.
+        await assert_obj.rejects(scan(None, {}), "cursor")
 
 
 async def _case_task_replace(storage) -> None:
