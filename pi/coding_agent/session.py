@@ -97,6 +97,19 @@ def _from_dict(data: dict) -> Any:
             nested_calls=nested_calls_from_json(data.get("nested_calls")),
             duration_ms=data.get("duration_ms"),
         )
+    if role == "bashExecution":
+        from ..agent.types import BashExecutionMessage
+
+        return BashExecutionMessage(
+            command=data.get("command", ""),
+            output=data.get("output", ""),
+            exit_code=data.get("exit_code"),
+            cancelled=bool(data.get("cancelled", False)),
+            truncated=bool(data.get("truncated", False)),
+            full_output_path=data.get("full_output_path"),
+            timestamp=data.get("timestamp", 0),
+            exclude_from_context=bool(data.get("exclude_from_context", False)),
+        )
     raise ValueError(f"Unknown message role: {role!r}")
 
 
@@ -179,6 +192,11 @@ class SessionManager:
         self.entries.append(entry)
         self.leaf_id = entry.id
         return entry.id
+
+    def append_bash_execution(self, message) -> str:
+        """Persist one ``!`` / ``!!`` shell run (role ``bashExecution``)."""
+
+        return self.append(message)
 
     def messages(self) -> List[Message]:
         branch = self.get_branch()

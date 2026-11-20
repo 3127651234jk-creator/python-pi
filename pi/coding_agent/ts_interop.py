@@ -20,6 +20,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from ..ai.json_io import usage_from_json
+from ..agent.types import BashExecutionMessage
 from ..ai.types import (
     AssistantMessage,
     ImageContent,
@@ -142,7 +143,8 @@ def ts_message_to_ours(data: dict):
             stop_reason=data.get("stopReason", "stop"), timestamp=timestamp,
             response_model=data.get("responseModel"), response_id=data.get("responseId"),
             thinking_level=data.get("thinkingLevel"), error_message=data.get("errorMessage"),
-            raw_stop_reason=data.get("rawStopReason"), end_turn=data.get("endTurn"))
+            raw_stop_reason=data.get("rawStopReason"), end_turn=data.get("endTurn"),
+            duration_ms=data.get("durationMs"))
     if role == "toolResult":
         blocks = [ImageContent(data=b["data"], mime_type=b.get("mimeType", "image/png"))
                   if b.get("type") == "image" else TextContent(text=b.get("text", ""))
@@ -153,6 +155,15 @@ def ts_message_to_ours(data: dict):
             details=data.get("details"), usage=_ts_usage(usage) if usage else None,
             nested_calls=_nested_calls_from_ts(data.get("nestedCalls")),
             duration_ms=data.get("durationMs"))
+    if role == "bashExecution":
+        from ..agent.types import BashExecutionMessage
+
+        return BashExecutionMessage(
+            command=data.get("command", ""), output=data.get("output", ""),
+            exit_code=data.get("exitCode"), cancelled=bool(data.get("cancelled", False)),
+            truncated=bool(data.get("truncated", False)),
+            full_output_path=data.get("fullOutputPath"), timestamp=timestamp,
+            exclude_from_context=bool(data.get("excludeFromContext", False)))
     raise ValueError(f"Unknown TS message role: {role!r}")
 
 
@@ -175,6 +186,15 @@ def our_message_to_ts(message) -> dict:
         return {"role": "user", "timestamp": message.timestamp, "content": [
             {"type": "image", "data": b.data, "mimeType": b.mime_type} if isinstance(b, ImageContent)
             else {"type": "text", "text": b.text} for b in message.content]}
+    if isinstance(message, BashExecutionMessage):
+        result = {"role": "bashExecution", "command": message.command, "output": message.output,
+                  "exitCode": message.exit_code, "cancelled": message.cancelled,
+                  "truncated": message.truncated, "timestamp": message.timestamp}
+        if message.full_output_path is not None:
+            result["fullOutputPath"] = message.full_output_path
+        if message.exclude_from_context:
+            result["excludeFromContext"] = True
+        return result
     if isinstance(message, ToolResultMessage):
         result = {"role": "toolResult", "toolCallId": message.tool_call_id, "toolName": message.tool_name,
                   "content": [{"type": "image", "data": b.data, "mimeType": b.mime_type} if isinstance(b, ImageContent)
@@ -215,6 +235,8 @@ def our_message_to_ts(message) -> dict:
         value = getattr(message, ours)
         if value is not None:
             result[ts] = value
+    if message.duration_ms is not None:
+        result["durationMs"] = message.duration_ms
     return result
 
 

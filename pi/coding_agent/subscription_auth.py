@@ -11,6 +11,7 @@ import secrets
 import re
 import time
 import uuid
+from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -335,13 +336,16 @@ def chatgpt_manual_result(value, state):
     return chatgpt_callback_result(params, state)
 
 
-async def login_openai_chatgpt(notify, prompt, device_id):
+async def login_openai_chatgpt(notify, prompt, device_id, agent_name: Optional[str] = None):
+    """Sign in with ChatGPT; ``agent_name`` is the LoginOptions.agentName hint
+    the host app can set so the provider shows its name instead of "Pi"."""
     if not UUID_PATTERN.match(device_id or ""):
         raise ValueError("Sign in with ChatGPT requires a device ID (UUID) for this installation")
     verifier, challenge = generate_pkce()
     state = secrets.token_urlsafe(32)
     authorize = CHATGPT_AUTHORIZE_URL + "?" + urlencode({
-        "client_id": CHATGPT_DYNAMIC_CLIENT_ID, "agent_name_hint": "Pi", "ext_agent_host_id": f"urn:uuid:{device_id.lower()}",
+        "client_id": CHATGPT_DYNAMIC_CLIENT_ID, "agent_name_hint": agent_name or "Pi",
+        "ext_agent_host_id": f"urn:uuid:{device_id.lower()}",
         "response_type": "code", "redirect_uri": CHATGPT_REDIRECT_URI, "resource": CHATGPT_RESOURCE, "scope": CHATGPT_SCOPE,
         "state": state, "code_challenge": challenge, "code_challenge_method": "S256", "nonce": secrets.token_urlsafe(32)})
     # A fixed port: without this server the callback would reach whatever else holds the port (another pending
