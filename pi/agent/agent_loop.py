@@ -33,7 +33,7 @@ from ..ai.utils import (
     with_tool_changes,
 )
 from ..util import AbortError, AbortSignal
-from ..ai.types import TextContent
+from ..ai.types import TextContent, UserMessage
 from .types import (
     AfterToolCallResult,
     AgentContext,
@@ -41,6 +41,7 @@ from .types import (
     AgentTool,
     AgentToolResult,
     BeforeToolCallResult,
+    bash_execution_to_text,
 )
 
 EmitFn = Callable[[Any], Any]
@@ -434,6 +435,7 @@ def _build_stream_options(config: AgentLoopConfig, api_key: Optional[str], signa
         reasoning=config.reasoning,
         telemetry_context=config.telemetry_context,
         cache_retention=getattr(config, "cache_retention", None),
+        on_provider_stream_event=getattr(config, "on_provider_stream_event", None),
     )
 
 
@@ -1023,17 +1025,23 @@ def default_convert_to_llm(messages: List[Any], block_images: bool = False) -> L
     """Pass through the four LLM roles, filtering UI-only custom messages and
     failed attempts superseded by an auto-retry.
 
+    ``!``-mode bash executions project to user text like the TS convertToLlm
+    (bashExecutionToText); runs made with ``!!`` stay out of the context.
+
     With ``block_images`` set, image blocks in user and toolResult messages are
     swapped for a text placeholder (defense-in-depth for the block_images
     setting). The filter runs at the stream boundary so setting changes take
     effect on the next request without touching stored history.
     """
-    converted = [
-        m
-        for m in messages
-        if getattr(m, "role", None) in ("system", "user", "assistant", "toolResult")
-        and not getattr(m, "retried", False)
-    ]
+    converted = []
+    for m in messages:
+        role = getattr(m, "role", None)
+        if role == "bashExecution":
+            if getattr(m, "exclude_from_context", False):
+                continue
+            converted.append(UserMessage(content=bash_execution_to_text(m), timestamp=m.timestamp))
+        elif role in ("system", "user", "assistant", "toolResult") and not getattr(m, "retried", False):
+            converted.append(m)
     if not block_images:
         return converted
     return [

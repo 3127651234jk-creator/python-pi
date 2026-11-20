@@ -183,6 +183,9 @@ class AgentLoopConfig:
     # supersede; such attempts are flagged before message_end so subscribers
     # persist them as retried (raw history, omitted from model projections).
     should_omit_error: Optional[Callable[[Any], bool]] = None
+    # Observes raw provider events after parsing, pre-conversion (port of TS
+    # AgentLoopConfig.onProviderStreamEvent); forwarded into stream options.
+    on_provider_stream_event: Optional[Callable[[Any], Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +202,9 @@ class AgentStartEvent:
 class AgentEndEvent:
     type: str = field(default="agent_end", init=False)
     messages: List[Any] = field(default_factory=list)
+    # Set at emit time by the Agent: whether the failing final assistant turn
+    # would be retried (TS agent-session computes willRetry after agent_end).
+    will_retry: bool = False
 
 
 @dataclass
@@ -284,6 +290,55 @@ class AutoRetryEndEvent:
     final_error: Optional[str] = None
 
 
+@dataclass
+class CompactionStartEvent:
+    """A context compaction is about to summarize (threshold/overflow/manual)."""
+
+    type: str = field(default="compaction_start", init=False)
+    reason: str = "threshold"
+
+
+@dataclass
+class CompactionEndEvent:
+    """A context compaction finished; aborted or failed runs carry no result."""
+
+    type: str = field(default="compaction_end", init=False)
+    reason: str = "threshold"
+    result: Optional[dict] = None
+    aborted: bool = False
+    # Whether the interrupted turn continues after this compaction
+    # (true for the overflow-recovery path).
+    will_retry: bool = False
+    error_message: Optional[str] = None
+
+
+@dataclass
+class SummarizationRetryScheduledEvent:
+    """A compaction summarization call hit a transient error and will back off."""
+
+    type: str = field(default="summarization_retry_scheduled", init=False)
+    attempt: int = 0
+    max_attempts: int = 0
+    delay_ms: int = 0
+    error_message: str = ""
+
+
+@dataclass
+class SummarizationRetryAttemptStartEvent:
+    """A compaction summarization call starts again after backoff."""
+
+    type: str = field(default="summarization_retry_attempt_start", init=False)
+    source: str = "compaction"
+    reason: str = "threshold"
+
+
+@dataclass
+class SummarizationRetryFinishedEvent:
+    """The compaction summarization retry cycle ended."""
+
+    type: str = field(default="summarization_retry_finished", init=False)
+
+
 AgentEvent = Union[
     AgentStartEvent,
     AgentEndEvent,
@@ -297,4 +352,43 @@ AgentEvent = Union[
     ToolExecutionEndEvent,
     AutoRetryStartEvent,
     AutoRetryEndEvent,
+    CompactionStartEvent,
+    CompactionEndEvent,
+    SummarizationRetryScheduledEvent,
+    SummarizationRetryAttemptStartEvent,
+    SummarizationRetryFinishedEvent,
 ]
+
+
+@dataclass
+class BashExecutionMessage:
+    """A user-executed shell command from the ``!`` / ``!!`` input mode (port
+    of the TS BashExecutionMessage). Runs made with ``!!`` are excluded from
+    the model projection."""
+
+    role: str = field(default="bashExecution", init=False)
+    command: str = ""
+    output: str = ""
+    exit_code: Optional[int] = None
+    cancelled: bool = False
+    truncated: bool = False
+    full_output_path: Optional[str] = None
+    timestamp: int = 0
+    exclude_from_context: bool = False
+
+
+def bash_execution_to_text(message: BashExecutionMessage) -> str:
+    """User-side text of one bash execution for the LLM context (port of
+    bashExecutionToText)."""
+    text = f"Ran `{message.command}`\n"
+    if message.output:
+        text += f"```\n{message.output}\n```"
+    else:
+        text += "(no output)"
+    if message.cancelled:
+        text += "\n\n(command cancelled)"
+    elif message.exit_code not in (None, 0):
+        text += f"\n\nCommand exited with code {message.exit_code}"
+    if message.truncated and message.full_output_path:
+        text += f"\n\n[Output truncated. Full output: {message.full_output_path}]"
+    return text

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -32,7 +33,7 @@ from pi.agent.types import (
     ToolExecutionStartEvent,
 )
 from pi.ai.models import Model
-from pi.ai.providers import faux
+from pi.ai.providers import STREAM_FNS, faux, get_default_stream_fn
 from pi.ai.providers.base import make_partial
 from pi.ai.retry import RetryPolicy
 from pi.ai.types import (
@@ -657,6 +658,68 @@ def test_retried_attempt_round_trips_through_session(tmp_path):
         assert loaded[1].retried is True
         assert [m.role for m in default_convert_to_llm(loaded)] == ["user", "assistant"]
         assert loaded[-1].content[0].text == "recovered"
+
+    asyncio.run(scenario())
+
+
+def test_assistant_message_gets_duration_ms():
+    """The default stream wrapper stamps the final response's wall time (#10549, F-AI-01)."""
+
+    async def scenario():
+        use_script([{"text": "answered"}])
+        agent = Agent(model=make_model())
+        messages = await agent.prompt("hello")
+        assert isinstance(messages[-1].duration_ms, int)
+        assert messages[-1].duration_ms >= 0
+
+        # Failed responses are stamped on their terminal event too.
+        use_script([{"error": "terminated"}])
+        failed = await agent.prompt("hello")
+        assert failed[-1].stop_reason == "error"
+        assert isinstance(failed[-1].duration_ms, int)
+
+    asyncio.run(scenario())
+
+
+def test_stream_wrapper_keeps_existing_or_predated_durations():
+    """Responses that carry a duration or started elsewhere are left untimed."""
+
+    async def scenario():
+        from pi.ai.types import TranscriptContext
+
+        model = Model(id="timed", name="t", api="timed-test", provider="test", base_url="")
+        pre_stamped = make_partial(model, 0)
+        pre_stamped.stop_reason = "stop"
+        pre_stamped.duration_ms = 123
+
+        async def scripted(model, context, options=None):
+            yield DoneEvent(reason="stop", message=pre_stamped)
+
+        STREAM_FNS["timed-test"] = scripted
+        try:
+            events = []
+            stream = get_default_stream_fn()
+            async for event in stream(model, TranscriptContext([])):
+                events.append(event)
+            assert events[0].message.duration_ms == 123  # existing value survives
+        finally:
+            STREAM_FNS.pop("timed-test", None)
+
+        # A message whose timestamp predates the wrapper (deferred fetch) stays None.
+        later = make_partial(model, int(time.time() * 1000) - 10_000)
+        later.stop_reason = "stop"
+
+        async def old_message(model, context, options=None):
+            yield DoneEvent(reason="stop", message=later)
+
+        STREAM_FNS["timed-test"] = old_message
+        try:
+            stream = get_default_stream_fn()
+            async for event in stream(model, TranscriptContext([])):
+                pass
+            assert later.duration_ms is None
+        finally:
+            STREAM_FNS.pop("timed-test", None)
 
     asyncio.run(scenario())
 

@@ -2,18 +2,27 @@
 
 from dataclasses import asdict, dataclass, replace
 import hashlib
+import inspect
 import json
 from typing import Any, Callable, List, Optional, Tuple
 
 from ..ai.estimate import CHARS_PER_TOKEN, estimate_message_tokens
 from ..ai.models import Model
 from ..ai.providers import SimpleStreamOptions
-from ..ai.retry import RetryPolicy, retry_assistant_call
+from ..ai.retry import RetryCallbacks, RetryPolicy, retry_assistant_call
 from ..ai.types import (
     AssistantMessage, DoneEvent, Message, StreamErrorEvent, SystemMessage,
     TextContent, ToolCall, TranscriptContext, Usage, UserMessage, combine_usage,
 )
 from ..ai.utils import normalize_context
+from ..util import AbortError
+from .types import (
+    CompactionEndEvent,
+    CompactionStartEvent,
+    SummarizationRetryAttemptStartEvent,
+    SummarizationRetryFinishedEvent,
+    SummarizationRetryScheduledEvent,
+)
 
 
 @dataclass
@@ -101,8 +110,20 @@ class ContextCompactor:
         # Shared with the agent's auto-retry policy: transient stream drops in
         # the summarization call retry instead of failing the compaction.
         self.retry: Optional[RetryPolicy] = None
+        # Session-level event outlet (compaction_start/end and the
+        # summarization_retry_* family); set by the Agent while a run is active
+        # so the events reach the same subscribers as the agent events.
+        self.event_sink: Optional[Callable[[Any], Any]] = None
 
-    async def project(self, messages, model: Model, options, stream, force=False):
+    async def _emit(self, event: Any) -> None:
+        if self.event_sink is None:
+            return
+        result = self.event_sink(event)
+        if inspect.isawaitable(result):
+            await result
+
+    async def project(self, messages, model: Model, options, stream, force=False, reason: str = "threshold",
+                      will_retry: bool = False):
         system, rest = normalize_context(TranscriptContext(messages=messages))
         if self.prefix and rest[:len(self.prefix)] != self.prefix:
             self.prefix = []
@@ -149,42 +170,59 @@ class ContextCompactor:
         # earlier work of that turn get their own checkpoint next to the history
         # summary, matching the TypeScript agent's split-turn compaction.
         self.last_usage = None
+        await self._emit(CompactionStartEvent(reason=reason))
         turn_start = -1
         if tail[cut].role != "user":
             for i in range(cut - 1, -1, -1):
                 if tail[i].role == "user":
                     turn_start = i
                     break
-        if turn_start >= 0:
-            history_usage: Optional[Usage] = None
-            if turn_start > 0:
-                history, history_usage = await self._summarize(
-                    tail[:turn_start], model, options, stream, chunk_budget,
-                    HISTORY_SUMMARIZATION_PROMPT, self.summary, history_budget,
+        try:
+            if turn_start >= 0:
+                history_usage: Optional[Usage] = None
+                if turn_start > 0:
+                    history, history_usage = await self._summarize(
+                        tail[:turn_start], model, options, stream, chunk_budget,
+                        HISTORY_SUMMARIZATION_PROMPT, self.summary, history_budget, reason,
+                    )
+                else:
+                    # The whole tail is one turn; only the prior summary can stand in.
+                    history = self.summary or "No prior history."
+                # Smaller output budget, like the TypeScript turn-prefix summary.
+                turn_context, turn_usage = await self._summarize(
+                    tail[turn_start:cut], model, options, stream, chunk_budget,
+                    TURN_PREFIX_SUMMARIZATION_PROMPT, "", turn_budget, reason,
                 )
+                summary = history + "\n\n---\n\n**Turn Context (split turn):**\n\n" + turn_context
+                usage = combine_usage(history_usage, turn_usage) if history_usage else turn_usage
             else:
-                # The whole tail is one turn; only the prior summary can stand in.
-                history = self.summary or "No prior history."
-            # Smaller output budget, like the TypeScript turn-prefix summary.
-            turn_context, turn_usage = await self._summarize(
-                tail[turn_start:cut], model, options, stream, chunk_budget,
-                TURN_PREFIX_SUMMARIZATION_PROMPT, "", turn_budget,
-            )
-            summary = history + "\n\n---\n\n**Turn Context (split turn):**\n\n" + turn_context
-            usage = combine_usage(history_usage, turn_usage) if history_usage else turn_usage
-        else:
-            summary, usage = await self._summarize(
-                tail[:cut], model, options, stream, chunk_budget,
-                HISTORY_SUMMARIZATION_PROMPT, self.summary, history_budget,
-            )
-        result = ([system] if system else []) + [
-            UserMessage(content="Previous conversation summary:\n" + summary, timestamp=0)
-        ] + tail[cut:]
-        if sum(estimate_message_tokens(m) for m in result) >= sum(estimate_message_tokens(m) for m in projected):
-            raise RuntimeError("Context compaction could not reduce context; shorten the latest input or tool output")
+                summary, usage = await self._summarize(
+                    tail[:cut], model, options, stream, chunk_budget,
+                    HISTORY_SUMMARIZATION_PROMPT, self.summary, history_budget, reason,
+                )
+            result = ([system] if system else []) + [
+                UserMessage(content="Previous conversation summary:\n" + summary, timestamp=0)
+            ] + tail[cut:]
+            if sum(estimate_message_tokens(m) for m in result) >= sum(estimate_message_tokens(m) for m in projected):
+                raise RuntimeError("Context compaction could not reduce context; shorten the latest input or tool output")
+        except BaseException as exc:
+            await self._emit(CompactionEndEvent(
+                reason=reason, result=None, will_retry=will_retry,
+                aborted=isinstance(exc, AbortError) or "was aborted" in str(exc),
+                error_message=str(exc) or exc.__class__.__name__,
+            ))
+            raise
         self.summary = summary
         self.prefix = rest[:len(self.prefix) + cut]
         self.last_usage = usage
+        await self._emit(CompactionEndEvent(
+            reason=reason,
+            will_retry=will_retry,
+            result={"summary": summary,
+                    "tokens_before": sum(estimate_message_tokens(m) for m in projected),
+                    "tokens_after": sum(estimate_message_tokens(m) for m in result),
+                    "usage": usage},
+        ))
         if self.on_summary is not None:
             self.on_summary(summary, usage)
         return result
@@ -205,7 +243,8 @@ class ContextCompactor:
         return history, turn
 
     async def _summarize(self, messages, model: Model, options, stream, chunk_budget: int,
-                         system_prompt: str, previous_summary: str, max_tokens: int) -> Tuple[str, Usage]:
+                         system_prompt: str, previous_summary: str, max_tokens: int,
+                         reason: str = "threshold") -> Tuple[str, Usage]:
         """Iteratively merge serialized message chunks into one running summary.
 
         Returns the summary text and the combined usage of every summarization
@@ -245,7 +284,15 @@ class ContextCompactor:
                     raise RuntimeError("Context summarization stream ended without a done/error event")
                 return final
 
-            final = await retry_assistant_call(produce, self.retry, options.signal)
+            final = await retry_assistant_call(produce, self.retry, options.signal, RetryCallbacks(
+                on_retry_scheduled=lambda attempt, max_attempts, delay_ms, error_message:
+                    self._emit(SummarizationRetryScheduledEvent(
+                        attempt=attempt, max_attempts=max_attempts, delay_ms=delay_ms,
+                        error_message=error_message or "")),
+                on_retry_attempt_start=lambda:
+                    self._emit(SummarizationRetryAttemptStartEvent(source="compaction", reason=reason)),
+                on_retry_finished=lambda *args: self._emit(SummarizationRetryFinishedEvent()),
+            ))
             if options.signal:
                 options.signal.throw_if_aborted()
             if final is None:
@@ -270,7 +317,7 @@ class ContextCompactor:
     async def compact_now(self, messages, model: Model, options, stream):
         """Force an immediate projection; returns (projected, before, after) token estimates."""
         before = sum(estimate_message_tokens(m) for m in messages)
-        projected = await self.project(messages, model, options, stream, force=True)
+        projected = await self.project(messages, model, options, stream, force=True, reason="manual")
         return projected, before, sum(estimate_message_tokens(m) for m in projected)
 
     async def stream(self, model, context, options, stream):
@@ -282,7 +329,8 @@ class ContextCompactor:
         for attempt in range(2):
             async for event in stream(model, TranscriptContext(messages=messages), options):
                 if isinstance(event, StreamErrorEvent) and is_context_overflow(event.error) and attempt == 0:
-                    recovered = await self.project(context.messages, model, options, stream, force=True)
+                    recovered = await self.project(context.messages, model, options, stream, force=True,
+                                                   reason="overflow", will_retry=True)
                     if recovered == messages:
                         yield event
                         return

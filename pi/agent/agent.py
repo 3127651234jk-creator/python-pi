@@ -14,12 +14,13 @@ from typing import Any, AsyncIterator, Callable, Deque, List, Optional
 from ..ai.models import Model
 from ..ai.providers import get_default_stream_fn
 from ..ai.retry import RetryPolicy, RetrySleepAbortError, is_retryable_assistant_error, retry_delay_ms, sleep_ms
-from ..ai.types import SystemMessage, TextContent, ToolResultMessage, UserMessage
+from ..ai.types import DoneEvent, SystemMessage, TextContent, ToolResultMessage, UserMessage
 from ..util import AbortSignal
 from .agent_loop import default_convert_to_llm, run_agent_loop
 from .compaction import CompactionSettings, ContextCompactor, is_context_overflow
 from .types import (
     AgentContext,
+    AgentEndEvent,
     AgentEvent,
     AgentLoopConfig,
     AgentTool,
@@ -27,6 +28,9 @@ from .types import (
     AutoRetryStartEvent,
     MessageEndEvent,
 )
+
+
+QUEUE_MODES = ("all", "one-at-a-time")
 
 
 class Agent:
@@ -38,12 +42,18 @@ class Agent:
         tools: Optional[List[AgentTool]] = None,
         system_prompt: Optional[str] = None,
         thinking_level: str = "off",
-        queue_mode: str = "all",
+        steering_queue_mode: str = "one-at-a-time",
+        follow_up_queue_mode: str = "one-at-a-time",
         compaction: Optional[CompactionSettings] = None,
         cache_retention: Optional[str] = "5m",
         block_images: bool = False,
         retry: Optional[RetryPolicy] = None,
+        finish_turn: Optional[Callable[..., Any]] = None,
+        on_provider_stream_event: Optional[Callable[[Any], Any]] = None,
+        queue_mode: Optional[str] = None,
     ) -> None:
+        if steering_queue_mode not in QUEUE_MODES or follow_up_queue_mode not in QUEUE_MODES:
+            raise ValueError("queue mode must be all or one-at-a-time")
         self.model = model
         self.compactor = ContextCompactor(compaction or CompactionSettings())
         self.retry = retry
@@ -55,18 +65,41 @@ class Agent:
         self.block_images = block_images
         self.tools: List[AgentTool] = list(tools or [])
         self.messages: List[Any] = []
-        self.queue_mode = queue_mode
+        # Each queue drains independently (TS steeringMode/followUpMode); both
+        # default to one-at-a-time like TS 1.1.0's queues.
+        self.steering_queue_mode = steering_queue_mode
+        self.follow_up_queue_mode = follow_up_queue_mode
+        if queue_mode is not None:
+            # Deprecated alias: one mode for both queues.
+            self.steering_queue_mode = queue_mode
+            self.follow_up_queue_mode = queue_mode
         self.is_streaming = False
         self.error_message: Optional[str] = None
+        # Whether the run that just settled was aborted (port of the TS
+        # _agentRunAbortRequested flag reported by agent_settled.aborted).
+        self.abort_requested = False
         self._steering_queue: Deque[Any] = deque()
         self._follow_up_queue: Deque[Any] = deque()
         self._listeners: List[Callable[[AgentEvent], Any]] = []
         self._abort: Optional[AbortSignal] = None
+        # Per-run signal for abort_retry(): cancels a pending backoff without
+        # aborting the run itself (the failed attempt settles the run).
+        self._retry_abort: Optional[AbortSignal] = None
         self._run_task: Optional[Any] = None
         self.system_prompt = system_prompt
         self.before_tool_call = None
         self.after_tool_call = None
         self.prepare_request = None
+        # Turn-end decision hook ({action: "end"} | {action: "continue"}).
+        self.finish_turn = finish_turn
+        # Observes raw provider events after parsing (TS onProviderStreamEvent).
+        self.on_provider_stream_event = on_provider_stream_event
+        # Fired after any queue change (enqueue or drain); may be async.
+        # Hosts (RPC mode) use it to broadcast queue_update on consumption.
+        self.on_queue_update: Optional[Callable[[], Any]] = None
+        # Called with (model, context, options) of the last real provider
+        # request that produced an assistant response (cache warming capture).
+        self.on_real_request: Optional[Callable[[Any, Any, Any], None]] = None
         self._request_model = None
         if system_prompt:
             self.messages.append(SystemMessage(content=system_prompt, timestamp=_now_ms()))
@@ -99,19 +132,58 @@ class Agent:
 
     # -- queues ------------------------------------------------------------
 
-    async def _get_steering_messages(self) -> List[Any]:
-        return self._drain(self._steering_queue)
+    @property
+    def queue_mode(self) -> str:
+        """Deprecated combined queue mode: reading reflects steering, writing
+        sets both queues. Use ``steering_queue_mode``/``follow_up_queue_mode``."""
 
-    async def _get_follow_up_messages(self) -> List[Any]:
-        return self._drain(self._follow_up_queue)
+        return self.steering_queue_mode
 
-    def _drain(self, queue: Deque[Any]) -> List[Any]:
+    @queue_mode.setter
+    def queue_mode(self, mode: str) -> None:
+        if mode not in QUEUE_MODES:
+            raise ValueError("queue mode must be all or one-at-a-time")
+        self.steering_queue_mode = mode
+        self.follow_up_queue_mode = mode
+
+    def _peek(self, queue: Deque[Any], mode: str) -> List[Any]:
+        """Next batch a drain would deliver, without consuming (TS queue.peek)."""
         if not queue:
             return []
-        if self.queue_mode == "one-at-a-time":
+        if mode == "one-at-a-time":
+            return [queue[0]]
+        return list(queue)
+
+    def peek_queued_messages(self) -> List[Any]:
+        """Preview the messages selected for the next turn without consuming
+        them (port of Agent.peekQueuedMessages): the steering batch, or the
+        follow-up batch when steering is empty."""
+
+        steering = self._peek(self._steering_queue, self.steering_queue_mode)
+        return steering if steering else self._peek(self._follow_up_queue, self.follow_up_queue_mode)
+
+    async def _get_steering_messages(self) -> List[Any]:
+        return await self._drain_notified(self._steering_queue, self.steering_queue_mode)
+
+    async def _get_follow_up_messages(self) -> List[Any]:
+        return await self._drain_notified(self._follow_up_queue, self.follow_up_queue_mode)
+
+    def _drain(self, queue: Deque[Any], mode: str) -> List[Any]:
+        if not queue:
+            return []
+        if mode == "one-at-a-time":
             return [queue.popleft()]
         messages = list(queue)
         queue.clear()
+        return messages
+
+    async def _drain_notified(self, queue: Deque[Any], mode: str) -> List[Any]:
+        """Drain a queue and fire the queue-change hook (port of _emitQueueUpdate)."""
+        messages = self._drain(queue, mode)
+        if messages and self.on_queue_update is not None:
+            result = self.on_queue_update()
+            if hasattr(result, "__await__"):
+                await result
         return messages
 
     def steer(self, text: str, images: Optional[List[Any]] = None) -> None:
@@ -127,6 +199,12 @@ class Agent:
     def abort(self) -> None:
         if self._abort is not None:
             self._abort.abort()
+
+    def abort_retry(self) -> None:
+        """Cancel a pending auto-retry backoff; the run settles on the failed
+        attempt instead of continuing (port of TS AgentSession.abortRetry)."""
+        if self._retry_abort is not None:
+            self._retry_abort.abort()
 
     async def prompt(
         self,
@@ -151,7 +229,9 @@ class Agent:
             raise RuntimeError("Agent is already streaming")
         self.is_streaming = True
         self.error_message = None
+        self.abort_requested = False
         self._abort = AbortSignal()
+        self._retry_abort = AbortSignal()
         attempt = 0
         stream = get_default_stream_fn()
         completed_messages: List[Any] = []
@@ -163,6 +243,20 @@ class Agent:
             # the message and then another subscriber may raise.
             if isinstance(event, MessageEndEvent):
                 completed_messages.append(event.message)
+            if isinstance(event, AgentEndEvent):
+                # TS AgentSession computes willRetry when agent_end is emitted:
+                # no abort requested, retry budget remains, and the final
+                # assistant message is a retryable (non-overflow) error.
+                failed = next(
+                    (m for m in reversed(event.messages) if getattr(m, "role", None) == "assistant"),
+                    None,
+                )
+                event.will_retry = bool(
+                    self._abort is not None
+                    and not self._abort.aborted
+                    and failed is not None
+                    and self._should_retry(failed, attempt)
+                )
             is_tool_result_event = (getattr(getattr(event, "message", None), "role", None)
                                     == "toolResult")
             if deferred_listener_error is not None and not is_tool_result_event:
@@ -181,11 +275,31 @@ class Agent:
             # Reads the live attempt count: the same config drives every retry
             # round, and the predicate decides whether a failure is superseded.
             config.should_omit_error = lambda message: self._should_retry(message, attempt)
+            # Compaction summarization reports through the same subscriber
+            # pipeline while the run is active.
+            self.compactor.event_sink = emit
             transcript = list(self.messages)
             prompts_list = prompts
 
+            def capture_stream(inner):
+                """Record the latest request that produced an assistant response:
+                the innermost provider boundary, so summarization calls (which
+                precede the real request after compaction) are superseded."""
+                sink = self.on_real_request
+
+                async def wrapped(model, context, options):
+                    async for event in inner(model, context, options):
+                        if (sink is not None and isinstance(event, DoneEvent)
+                                and getattr(event.message, "role", None) == "assistant"):
+                            sink(model, context, options)
+                        yield event
+
+                return wrapped
+
+            final_stream = capture_stream(stream) if self.on_real_request is not None else stream
+
             async def compacted_stream(model, context, options):
-                async for event in self.compactor.stream(model, context, options, stream):
+                async for event in self.compactor.stream(model, context, options, final_stream):
                     yield event
 
             while True:
@@ -254,7 +368,7 @@ class Agent:
                 # resume and live runs agree on both the history and the request.
                 failed.retried = True
                 try:
-                    await sleep_ms(delay, self._abort)
+                    await self._sleep_retry_backoff(delay)
                 except RetrySleepAbortError:
                     await self._emit(
                         AutoRetryEndEvent(success=False, attempt=attempt, final_error="Retry cancelled")
@@ -262,9 +376,31 @@ class Agent:
                     break
         finally:
             self.is_streaming = False
+            self.abort_requested = self._abort is not None and self._abort.aborted
             self._abort = None
+            self._retry_abort = None
+            self.compactor.event_sink = None
             self.messages = _sync_messages(self, completed_messages)
         return all_new
+
+    async def _sleep_retry_backoff(self, delay: int) -> None:
+        """Backoff sleep that ends early on a run abort or an abort_retry call."""
+        retry_signal = self._retry_abort
+        if retry_signal is None:
+            await sleep_ms(delay, self._abort)
+            return
+        sleep_task = asyncio.ensure_future(sleep_ms(delay, self._abort))
+        cancel_task = asyncio.ensure_future(retry_signal.wait())
+        try:
+            await asyncio.wait({sleep_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+            if cancel_task.done() and not (self._abort is not None and self._abort.aborted):
+                raise RetrySleepAbortError()
+            # A completed sleep (or its abort) raises through here.
+            await sleep_task
+        finally:
+            cancel_task.cancel()
+            if not sleep_task.done():
+                sleep_task.cancel()
 
     def _should_retry(self, message: Any, attempt: int) -> bool:
         """Whether a failed assistant message is retried at this attempt count.
@@ -314,7 +450,9 @@ class Agent:
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
             prepare_request=prepare_request,
+            finish_turn=self.finish_turn,
             cache_retention=self.cache_retention,
+            on_provider_stream_event=self.on_provider_stream_event,
         )
 
     async def stream_events(self, text: str) -> AsyncIterator[AgentEvent]:
