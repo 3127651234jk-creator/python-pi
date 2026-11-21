@@ -599,3 +599,39 @@ def test_durable_blocked_tool_result_has_no_duration(tmp_path, monkeypatch):
     finally:
         os.environ.pop("FAUX_SCRIPT", None)
         faux.reset_script_index()
+
+
+def test_live_tool_slots_do_not_accumulate_across_rounds(tmp_path, monkeypatch):
+    """Each tool round presents only its own slots, and the ended run leaves no
+    live state behind (TS ``endRun`` deletes ``live.tools``)."""
+
+    monkeypatch.setenv("FAUX_SCRIPT", json.dumps([
+        {"toolCalls": [{"id": "c1", "name": "echo", "arguments": {}}]},
+        {"toolCalls": [{"id": "c2", "name": "echo", "arguments": {}}]},
+        {"text": "final"},
+    ]))
+    faux.reset_script_index()
+    try:
+        async def scenario():
+            session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
+            harness = Harness(session, make_model())
+            seen = []
+
+            async def execute(call_id, params, signal=None, on_update=None):
+                live = await harness.live(cid)
+                seen.append([slot.get("call_id") for slot in live.get("tools") or []])
+                return AgentToolResult(content=[TextContent(text="echoed")])
+
+            harness.register_tools({"echo": AgentTool(name="echo", description="echo", execute=execute)})
+            cid = await harness.create_conversation()
+            await harness.submit_input(cid, "run the tool")
+            await harness.run_pending_tasks()
+
+            assert seen == [["c1"], ["c2"]]
+            assert await harness.live(cid) == {}
+            await session.close()
+
+        asyncio.run(scenario())
+    finally:
+        os.environ.pop("FAUX_SCRIPT", None)
+        faux.reset_script_index()

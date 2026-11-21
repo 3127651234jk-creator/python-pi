@@ -57,5 +57,23 @@ def clear_generation(live: Dict[str, Any]) -> None:
     live.pop("generation", None)
 
 
+def clear_tools(live: Dict[str, Any]) -> None:
+    """Drop the current tool round's slots (TS ``delete live.tools``)."""
+
+    live.pop("tools", None)
+
+
+def end_run(live: Dict[str, Any]) -> None:
+    """Clear the presentation owned by an ending run: the partial and tool slots.
+
+    Port of the TS ``endRun`` cleanup (without ``run`` control, which this port
+    does not model). Keeping the slots after their run ends would make
+    ``pi.live`` accumulate every finished tool round forever.
+    """
+
+    clear_generation(live)
+    clear_tools(live)
+
+
 def tool_slots(live: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [slot for slot in live.get("tools") or [] if isinstance(slot, dict)]

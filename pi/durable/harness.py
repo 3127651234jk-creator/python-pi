@@ -34,7 +34,7 @@ from .entries import ASSISTANT_ENTRY, USER_ENTRY
 from .errors import StorageRejected, error_message
 from .extensions import AgentDoc, ProviderDoc, Extension, HookApi, Registry, invoke
 from .inbox import InboxDoc, apply_boundary, prepare_boundary, withdraw_queued_inputs
-from .live import LiveDoc, clear_generation, finish_slot, generation_state, tool_slot
+from .live import LiveDoc, clear_generation, clear_tools, end_run, finish_slot, generation_state, tool_slot
 from .output import Progress
 from .prompt import INSTRUCTIONS_KEY, plan_system_entries
 from .session import Session
@@ -1076,7 +1076,9 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
         async def tx_change(tx, current):
             live = await tx.doc(LiveDoc, current.conversation_id)
             boundary = await prepare_boundary(tx, current.conversation_id, harness.steering_mode, harness.follow_up_mode)
-            clear_generation(live.value)
+            # The attempt is over: whether this settles the run or starts a tool
+            # round, older slots are not part of the new presentation.
+            end_run(live.value)
             live.dirty = True
             response = message_from_json(current.state.checkpoint["response"])
             entry = await tx.append_entry(
@@ -1121,6 +1123,9 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
             raise RuntimeError("A tool round ended without a result entry")
         await harness.run_hooks("after_tools", runtime, task.state.checkpoint["assistant"], results)
         async def change(tx, current):
+            live = await tx.doc(LiveDoc, current.conversation_id)
+            clear_tools(live.value)
+            live.dirty = True
             boundary = await prepare_boundary(tx, current.conversation_id, harness.steering_mode, harness.follow_up_mode)
             placed = await apply_boundary(tx, boundary, "postTools")
             ids = list(current.input.get("submission_ids", [current.input["submission_id"]]))
@@ -1164,7 +1169,7 @@ async def _abort_generation(tx, current: TaskRecord) -> None:
 
 
 async def _convert_generation_partial(tx, current: TaskRecord) -> None:
-    """Keep a committed partial as an aborted assistant entry and clear live state."""
+    """Keep a committed partial as an aborted assistant entry and end the run's live presentation."""
 
     if current.kind != "pi.generation":
         return
@@ -1181,7 +1186,7 @@ async def _convert_generation_partial(tx, current: TaskRecord) -> None:
                 "data": {"stop_reason": "aborted", "partial": True},
             },
         )
-    clear_generation(live.value)
+    end_run(live.value)
     live.dirty = True
 
 
