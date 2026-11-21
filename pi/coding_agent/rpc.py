@@ -183,7 +183,13 @@ class RpcServer:
             self.ui_futures.pop(request_id, None)
 
     def resolve_ui(self, reply: dict) -> None:
-        future = self.ui_futures.get(reply.get("id"))
+        request_id = reply.get("id")
+        # Request ids are generated as hex strings; anything else is malformed.
+        # An unhashable id (list/dict) would otherwise raise out of the stdin
+        # read loop and take the whole server down.
+        if not isinstance(request_id, str):
+            return
+        future = self.ui_futures.get(request_id)
         if future is not None and not future.done():
             future.set_result(reply)
 

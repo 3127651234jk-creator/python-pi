@@ -459,6 +459,22 @@ def test_parse_error_does_not_stop_server():
     asyncio.run(check())
 
 
+def test_unhashable_extension_ui_response_id_does_not_stop_server():
+    async def check():
+        output = io.StringIO()
+        lines = [
+            b'{"type":"extension_ui_response","id":["a"],"value":true}\n',
+            b'{"type":"extension_ui_response","id":{"a":1},"value":true}\n',
+            b'{"type":"extension_ui_response","value":true}\n',
+            b'{"id":"ok","type":"get_state"}\n',
+        ]
+        await RpcServer(Agent(resolve_model("faux")), JsonWriter(output)).serve(io.BytesIO(b"".join(lines)))
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        assert len(records) == 1
+        assert records[0]["id"] == "ok" and records[0]["success"]
+    asyncio.run(check())
+
+
 def test_serve_shutdown_does_not_wait_for_blocked_stdin():
     """Cancelling serve() must not wedge asyncio.run()'s executor shutdown.
 
