@@ -260,6 +260,9 @@ def ts_entry_to_custom(record: dict) -> Optional[dict]:
         ts_usage = record.get("usage")
         if isinstance(ts_usage, dict):
             data["usage"] = _ts_usage(ts_usage).to_dict()
+        if isinstance(record.get("checkpoint"), dict):
+            # Python-written TS records carry the portable cut point along.
+            data["checkpoint"] = record["checkpoint"]
         return {"kind": "compaction", "data": data}
     if kind == "model_change":
         return {"kind": "model_change", "data": {"provider": record.get("provider", ""), "modelId": record.get("modelId", "")}}
@@ -276,6 +279,8 @@ def custom_to_ts_entry(kind: str, data: dict) -> Optional[dict]:
         usage_data = data.get("usage")
         if isinstance(usage_data, dict):
             entry["usage"] = usage_to_ts(usage_from_json(usage_data))
+        if isinstance(data.get("checkpoint"), dict):
+            entry["checkpoint"] = data["checkpoint"]
         return entry
     if kind == "model_change":
         return {"type": "model_change", "provider": data.get("provider", ""), "modelId": data.get("modelId", "")}
@@ -327,6 +332,35 @@ def read_ts_file(path: str) -> dict:
     return {"name": name, "records": records}
 
 
+def compaction_first_kept_id(branch, entry_id: str, data: dict) -> str:
+    """Map the portable checkpoint length onto TS ``firstKeptEntryId``.
+
+    ``checkpoint["length"]`` counts the non-system messages the summary
+    consumed, measured on the projected context (``SessionManager.messages``):
+    entries dropped by a ``context_edit`` with a null replacement are omitted
+    here too, so the index lines up with the transcript the checkpoint was
+    written against. TS keeps the untouched remainder from the mapped
+    message's entry. A fully consumed transcript keeps nothing, which TS
+    spells as the compaction entry's own id; without a checkpoint the cut
+    point is unknown and the own id is the safe fallback.
+    """
+    length = (data.get("checkpoint") or {}).get("length")
+    if isinstance(length, int):
+        omitted = set()
+        for entry in branch:
+            if entry.custom is not None and entry.custom["kind"] == "ts_context_edit" \
+                    and entry.custom["data"].get("replacement") is None:
+                target = entry.custom["data"].get("targetId")
+                if target:
+                    omitted.add(target)
+        messages = [entry for entry in branch
+                    if entry.message is not None and not isinstance(entry.message, SystemMessage)
+                    and entry.id not in omitted]
+        if 0 <= length < len(messages):
+            return messages[length].id
+    return entry_id
+
+
 def write_ts_file(path: str, session) -> str:
     """Write a SessionManager's active branch in the TS session format."""
     import json
@@ -355,7 +389,11 @@ def write_ts_file(path: str, session) -> str:
         elif entry.custom is not None:
             mapped = custom_to_ts_entry(entry.custom["kind"], entry.custom["data"])
             if mapped is not None:
-                lines.append(json.dumps({**common, **mapped, "timestamp": int(time.time() * 1000)}, ensure_ascii=False))
+                record = {**common, **mapped, "timestamp": int(time.time() * 1000)}
+                if mapped.get("type") == "compaction":
+                    # Required by TS consumers; derived from the portable checkpoint.
+                    record["firstKeptEntryId"] = compaction_first_kept_id(branch, entry.id, entry.custom["data"])
+                lines.append(json.dumps(record, ensure_ascii=False))
             elif entry.custom["kind"].startswith("ts_"):
                 record = dict(entry.custom["data"])
                 record.update(common)

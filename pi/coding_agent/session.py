@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 from ..ai.json_io import message_from_json, nested_calls_from_json, usage_from_json
 from ..ai.types import Message, get_message_text
-from .ts_interop import our_message_to_ts, ts_message_to_ours
+from .ts_interop import compaction_first_kept_id, custom_to_ts_entry, our_message_to_ts, ts_message_to_ours
 
 from ..ai.types import (
     AssistantMessage,
@@ -136,6 +136,7 @@ class SessionManager:
         self.entries: List[SessionEntry] = []
         self.leaf_id: Optional[str] = None
         self.name = ""
+        self.format = "native"  # "native" or "ts": the on-disk JSONL shape
         self._incomplete_tail_offset: Optional[int] = None
         os.makedirs(self.session_dir, exist_ok=True)
 
@@ -164,12 +165,62 @@ class SessionManager:
         self.entries = []
         self.leaf_id = None
         self.name = ""
+        self.format = "native"
         return path
+
+    def _ts_record(self, record: dict) -> Optional[dict]:
+        """Translate one native append record into the TS v3 JSONL shape.
+
+        Sessions loaded from a TS file keep that format so later appends stay
+        on the existing ``parentId`` chain instead of becoming unreachable
+        snake_case branches. Returns ``None`` for records TS does not persist.
+        """
+        kind = record.get("type")
+        if kind == "leaf":
+            # TS derives the active leaf from the last entry; no marker record.
+            return None
+        if kind == "name":
+            return {"type": "session_info", "id": uuid.uuid4().hex, "parentId": self.leaf_id,
+                    "timestamp": _now_iso(), "name": record.get("name", "")}
+        base = {"id": record["id"], "parentId": record.get("parent_id"),
+                "timestamp": record.get("timestamp") or _now_iso()}
+        if kind == "message":
+            return {**base, "type": "message",
+                    "message": our_message_to_ts(message_from_json(record["message"]))}
+        if kind == "custom_message":
+            message = our_message_to_ts(message_from_json(record["message"]))
+            result = {**base, "type": "custom_message", "customType": record.get("customType", ""),
+                      "display": record.get("display", True), "content": message["content"]}
+            if record.get("details") is not None:
+                result["details"] = record["details"]
+            return result
+        custom_type = record.get("customType", "")
+        data = record.get("data") or {}
+        if custom_type.startswith("ts_") and isinstance(data.get("type"), str):
+            # Opaque round-trip of an unknown TS record read_ts_file stashed
+            # verbatim; extensions appending their own "ts_*" kind without a
+            # "type" key fall through to the generic custom record instead.
+            original = dict(data)
+            original.update({"id": base["id"], "parentId": base["parentId"]})
+            return original
+        mapped = custom_to_ts_entry(custom_type, data)
+        if mapped is None:
+            return {**base, "type": "custom", "customType": custom_type, "data": data}
+        result = {**base, **mapped}
+        if result.get("type") == "compaction":
+            # The compaction entry is not in self.entries yet, so the branch
+            # contains exactly the entries before it.
+            result["firstKeptEntryId"] = compaction_first_kept_id(self.get_branch(), record["id"], data)
+        return result
 
     def _write(self, record: dict) -> None:
         if self.session_file is None:
             self.start_new()
         assert self.session_file is not None
+        if self.format == "ts":
+            record = self._ts_record(record)
+            if record is None:
+                return
         if self._incomplete_tail_offset is not None:
             with open(self.session_file, "r+b") as handle:
                 handle.truncate(self._incomplete_tail_offset)
@@ -550,6 +601,7 @@ class SessionManager:
         self.entries = entries
         self.leaf_id = leaf
         self.name = name
+        self.format = "native"
         return self.messages()
 
     def load_ts(self, path: str) -> List[Any]:
@@ -567,9 +619,11 @@ class SessionManager:
             entries.append(entry)
             leaf = entry.id
         self.session_file = path
+        self._incomplete_tail_offset = None
         self.entries = entries
         self.leaf_id = leaf
         self.name = parsed["name"]
+        self.format = "ts"
         return self.messages()
 
     def export_ts(self, path: str) -> str:

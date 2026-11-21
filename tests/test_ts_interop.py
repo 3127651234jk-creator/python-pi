@@ -172,6 +172,170 @@ def test_session_roundtrip_through_ts_format(tmp_path):
     assert len(notes) == 1 and notes[0].message.content == "imported"
 
 
+def test_append_after_ts_load_stays_in_ts_tree(tmp_path):
+    """A resumed TS session must keep writing camelCase ``parentId`` records."""
+    lines = [
+        FIXTURE_LINES[0],
+        {"type": "message", "id": "u1", "parentId": None, "timestamp": "2024-01-01T00:00:01.000Z",
+         "message": {"role": "user", "content": "first", "timestamp": 1}},
+        {"type": "message", "id": "a1", "parentId": "u1", "timestamp": "2024-01-01T00:00:02.000Z",
+         "message": {"role": "assistant", "api": "faux", "provider": "faux", "model": "faux",
+                     "stopReason": "stop", "timestamp": 2,
+                     "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                               "totalTokens": 0, "cost": {"total": 0}},
+                     "content": [{"type": "text", "text": "reply"}]}},
+    ]
+    path = write_fixture(tmp_path, "".join(json.dumps(line) + "\n" for line in lines))
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    assert [m.role for m in manager.load(path)] == ["user", "assistant"]
+    manager.append(UserMessage(content="third", timestamp=3))
+
+    records = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    assert records[0]["type"] == "session"
+    assert all("parentId" in record and "parent_id" not in record for record in records[1:])
+    assert records[-1]["parentId"] == "a1"
+    assert records[-1]["message"]["role"] == "user"
+
+    reloaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    messages = reloaded.load(path)
+    assert [(m.role, m.content if isinstance(m.content, str) else None) for m in messages] == [
+        ("user", "first"), ("assistant", None), ("user", "third")]
+
+
+def test_load_ts_resets_incomplete_tail_offset(tmp_path):
+    """Loading a TS session must drop a pending truncation offset."""
+    native = tmp_path / "native.jsonl"
+    native.write_text(json.dumps({"type": "message", "id": "n1", "parent_id": None, "timestamp": "t",
+                                  "message": {"role": "user", "content": "native", "timestamp": 1}}) + "\n"
+                      + '{"type": "mess', encoding="utf-8")
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.load(str(native))
+    assert manager._incomplete_tail_offset is not None
+
+    path = write_fixture(tmp_path)
+    manager.load_ts(path)
+    assert manager._incomplete_tail_offset is None
+    size_before = os.path.getsize(path)
+    manager.append(UserMessage(content="after", timestamp=9))
+    text = (tmp_path / "ts-session.jsonl").read_text(encoding="utf-8")
+    assert os.path.getsize(path) > size_before
+    assert text.startswith('{"type": "session"')
+    assert "hello" in text and "after" in text
+
+
+def test_metadata_appends_after_ts_load_use_ts_records(tmp_path):
+    path = write_fixture(tmp_path)
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.load(path)
+    manager.rename("renamed")
+    manager.append_custom("state", {"n": 2})
+    manager.append_compaction("sum", tokens_before=5, checkpoint={"length": 1, "last": "x"})
+
+    records = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    assert [record["type"] for record in records[-3:]] == ["session_info", "custom", "compaction"]
+    assert records[-3]["name"] == "renamed"
+    assert all("parentId" in record for record in records[-3:])
+    compaction = records[-1]
+    assert compaction["firstKeptEntryId"] == "e2"
+    assert compaction["checkpoint"] == {"length": 1, "last": "x"}
+
+    reloaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    reloaded.load(path)
+    assert reloaded.name == "renamed"
+    assert reloaded.latest_custom("state") == {"n": 2}
+    assert reloaded.latest_custom("compaction")["checkpoint"] == {"length": 1, "last": "x"}
+
+
+def test_ts_prefixed_custom_kinds_roundtrip_after_ts_load(tmp_path):
+    """Raw TS passthrough records keep their shape; extension ts_* kinds stay custom."""
+    path = write_fixture(tmp_path)
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.load(path)
+    # Opaque passthrough of the label record read from the file, re-appended.
+    raw_label = next(e.custom["data"] for e in manager.entries if e.custom and e.custom["kind"] == "ts_label")
+    manager.append_custom("ts_label", raw_label)
+    # An extension's own ts_* kind carries no "type" key and must not lose it.
+    manager.append_custom("ts_extension_state", {"count": 1})
+
+    records = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    assert records[-2]["type"] == "label" and records[-2]["label"] == "pin"
+    assert records[-1]["type"] == "custom" and records[-1]["customType"] == "ts_extension_state"
+
+    reloaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    reloaded.load(path)
+    labels = reloaded.custom_entries("ts_label")
+    assert len(labels) == 2 and labels[-1].custom["data"]["label"] == "pin"
+    state = reloaded.custom_entries("ts_extension_state")
+    assert len(state) == 1 and state[0].custom["data"] == {"count": 1}
+
+
+def test_export_ts_writes_compaction_first_kept_entry_id(tmp_path):
+    """export_ts emits the TS-required firstKeptEntryId on compaction records."""
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    manager.start_new()
+    first = manager.append(UserMessage(content="one", timestamp=1))
+    second = manager.append(UserMessage(content="two", timestamp=2))
+    manager.append(UserMessage(content="three", timestamp=3))
+
+    # Partial consumption: checkpoint length 1 keeps from the second message.
+    manager.append_compaction("cut one", tokens_before=9, checkpoint={"length": 1, "last": "x"})
+    exported = manager.export_ts(str(tmp_path / "cut.jsonl"))
+    records = [json.loads(line) for line in open(exported, encoding="utf-8") if line.strip()]
+    compaction = next(r for r in records if r.get("type") == "compaction")
+    assert compaction["firstKeptEntryId"] == second
+    assert compaction["firstKeptEntryId"] != first
+
+    # Full consumption keeps nothing, which TS spells as the entry's own id.
+    manager.append_compaction("cut all", tokens_before=9, checkpoint={"length": 3, "last": "y"})
+    exported_all = manager.export_ts(str(tmp_path / "cut-all.jsonl"))
+    records_all = [json.loads(line) for line in open(exported_all, encoding="utf-8") if line.strip()]
+    compactions = [r for r in records_all if r.get("type") == "compaction"]
+    assert len(compactions) == 2
+    assert compactions[-1]["firstKeptEntryId"] == compactions[-1]["id"]
+
+    # No checkpoint: unknown cut point falls back to the entry's own id.
+    manager.append_compaction("no checkpoint", tokens_before=9)
+    exported_legacy = manager.export_ts(str(tmp_path / "cut-legacy.jsonl"))
+    legacy = [r for r in (json.loads(line) for line in open(exported_legacy, encoding="utf-8") if line.strip())
+              if r.get("type") == "compaction"][-1]
+    assert legacy["firstKeptEntryId"] == legacy["id"]
+
+    # The exported cut point round-trips back into the portable checkpoint.
+    reloaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    reloaded.load(exported)
+    assert reloaded.latest_custom("compaction")["checkpoint"] == {"length": 1, "last": "x"}
+
+
+def test_compaction_first_kept_respects_context_edits(tmp_path):
+    """checkpoint indexes the projected transcript, not the raw entry list."""
+    lines = [
+        FIXTURE_LINES[0],
+        {"type": "message", "id": "m1", "parentId": None, "timestamp": 1,
+         "message": {"role": "user", "content": "dropped", "timestamp": 1}},
+        {"type": "message", "id": "m2", "parentId": "m1", "timestamp": 2,
+         "message": {"role": "user", "content": "kept", "timestamp": 2}},
+        {"type": "message", "id": "m3", "parentId": "m2", "timestamp": 3,
+         "message": {"role": "user", "content": "tail", "timestamp": 3}},
+        {"type": "context_edit", "id": "x1", "parentId": "m3", "timestamp": 4,
+         "targetId": "m1", "replacement": None},
+    ]
+    path = write_fixture(tmp_path, "".join(json.dumps(line) + "\n" for line in lines))
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    assert [m.content for m in manager.load(path)] == ["kept", "tail"]
+
+    # checkpoint length 1 consumed the first *projected* message (m2/"kept"),
+    # so TS must keep from m3, not from the omitted m1's successor in raw order.
+    manager.append_compaction("sum", tokens_before=9, checkpoint={"length": 1, "last": "x"})
+    exported = manager.export_ts(str(tmp_path / "out.jsonl"))
+    compaction = next(r for r in (json.loads(line) for line in open(exported, encoding="utf-8") if line.strip())
+                      if r.get("type") == "compaction")
+    assert compaction["firstKeptEntryId"] == "m3"
+
+    reloaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    reloaded.load(exported)
+    assert reloaded.latest_custom("compaction")["checkpoint"] == {"length": 1, "last": "x"}
+
+
 def test_compaction_usage_roundtrip(tmp_path):
     manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
     manager.start_new()
