@@ -223,10 +223,7 @@ class McpClient:
                 await self.close()
                 raise RuntimeError(f"MCP server {self.name} is closed")
             self.pump_task = asyncio.create_task(self._stdio_pump())
-            async def drain():
-                while await self.process.stderr.read(4096):
-                    pass
-            self.stderr_task = asyncio.create_task(drain())
+            self.stderr_task = asyncio.create_task(self._drain_stderr(self.process.stderr))
         else:
             headers = {"Accept": "application/json, text/event-stream",
                 **{k: expand(v) for k, v in self.config.get("headers", {}).items()}}
@@ -262,6 +259,31 @@ class McpClient:
                 pass
             self.pump_task = None
         self._fail_pending("MCP server disconnected")
+
+    async def _stop_stderr_drain(self) -> None:
+        task, self.stderr_task = self.stderr_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                # Awaiting retrieves a cancelled or failed drain: a task whose
+                # exception nobody reads is reported as unretrieved when collected.
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _drain_stderr(self, stderr) -> None:
+        """Drain server stderr to EOF.
+
+        The stream is bound by the caller: teardown clears ``self.process`` while this
+        loop may still be between reads, and looking it up again would raise
+        AttributeError inside a task whose exception nobody retrieves.
+        """
+
+        try:
+            while await stderr.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
 
     def _fail_pending(self, reason: str) -> None:
         for future in self.pending.values():
@@ -522,8 +544,8 @@ class McpClient:
                 await http.aclose()
             except Exception:  # noqa: BLE001 - closing never fails the shutdown
                 pass
-        if self.process:
-            process, self.process = self.process, None
+        process, self.process = self.process, None
+        if process:
             if process.returncode is None:
                 if sys.platform == "win32":
                     killer = await asyncio.create_subprocess_exec("taskkill", "/F", "/T", "/PID", str(process.pid),
@@ -539,9 +561,9 @@ class McpClient:
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.wait()
-            if self.stderr_task:
-                self.stderr_task.cancel()
-                self.stderr_task = None
+        # Stop the drain only after the child is reaped: while it is alive the pipe
+        # must keep being read, or a chatty server blocks on a full stderr buffer.
+        await self._stop_stderr_drain()
 
 
 class McpManager:

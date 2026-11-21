@@ -317,3 +317,67 @@ def test_m07_one_failed_cleanup_does_not_block_others(tmp_path):
         assert manager._cleanup_tasks == set()
 
     asyncio.run(scenario())
+
+
+def test_stderr_drain_keeps_its_stream_when_teardown_clears_process(tmp_path):
+    """The drain must not look ``self.process`` up again between reads: teardown
+    clears it, and the resulting AttributeError would die in an unawaited task."""
+
+    async def scenario():
+        client = McpClient("stdio", {"command": "unused"}, tmp_path)
+
+        class Stderr:
+            def __init__(self):
+                self.chunks = [b"warning: noisy\n", b""]
+
+            async def read(self, size):
+                # Teardown clears the process while the drain is between reads.
+                client.process = None
+                return self.chunks.pop(0)
+
+        stream = Stderr()
+
+        class Process:
+            stderr = stream
+            returncode = 0
+
+        client.process = Process()
+        client.stderr_task = asyncio.create_task(client._drain_stderr(stream))
+        await asyncio.wait_for(client.stderr_task, 5)
+        assert not client.stderr_task.cancelled()
+        assert client.stderr_task.exception() is None
+
+    asyncio.run(scenario())
+
+
+def test_close_cancels_and_reaps_stderr_drain(tmp_path):
+    async def scenario():
+        client = McpClient("stdio", {"command": "unused"}, tmp_path)
+        reading = asyncio.Event()
+
+        class Stderr:
+            async def read(self, size):
+                reading.set()
+                await asyncio.Event().wait()
+                return b""
+
+        class Process:
+            stderr = Stderr()
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        client.process = Process()
+        task = asyncio.create_task(client._drain_stderr(client.process.stderr))
+        client.stderr_task = task
+        await asyncio.wait_for(reading.wait(), 5)
+
+        await asyncio.wait_for(client.close(), 5)
+
+        assert task.done()
+        assert task.cancelled()
+        assert client.stderr_task is None
+        assert client.process is None
+
+    asyncio.run(scenario())
