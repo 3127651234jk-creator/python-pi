@@ -714,7 +714,14 @@ SLASH_HELP = """Commands:
 Anything else is sent as a prompt. Ctrl+C aborts the current run."""
 
 
-async def read_console_input() -> str:
+async def run_console_prompt(prompt: Callable[..., str], *args: Any) -> str:
+    """Run a blocking console prompt (input/getpass) off the event loop.
+
+    The reader runs in a daemon thread instead of ``run_in_executor(None, ...)``:
+    Python 3.9's ``asyncio.run()`` shuts the default executor down with
+    ``wait=True``, so a worker still blocked in ``input()`` keeps the process
+    alive after Ctrl+C until the user presses Enter.
+    """
     loop = asyncio.get_running_loop()
     result = loop.create_future()
 
@@ -729,7 +736,7 @@ async def read_console_input() -> str:
     def read():
         value, error = None, None
         try:
-            value = input("\n> ").strip()
+            value = prompt(*args)
         except BaseException as exc:
             error = exc
         try:
@@ -739,6 +746,10 @@ async def read_console_input() -> str:
 
     threading.Thread(target=read, daemon=True).start()
     return await result
+
+
+async def read_console_input() -> str:
+    return (await run_console_prompt(input, "\n> ")).strip()
 
 
 async def interactive_loop(agent: Agent, renderer: CliRenderer, session: Optional[SessionManager], registry: Optional[ModelRegistry] = None,
@@ -1283,7 +1294,7 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
             credential = await login_xai(print)
         elif provider == "radius":
             async def choose(message):
-                return await asyncio.get_running_loop().run_in_executor(None, input, message)
+                return await run_console_prompt(input, message)
             credential = await login_radius(print, choose)
         elif provider == "openrouter":
             credential = await login_openrouter(print)
@@ -1292,7 +1303,7 @@ async def authenticate(registry: ModelRegistry, provider: str, oauth: bool = Fal
         else:
             raise ModelError(f"OAuth not configured for {provider}; API-key login is available")
     else:
-        key = await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, f"API key for {provider}: ")
+        key = await run_console_prompt(getpass.getpass, f"API key for {provider}: ")
         if not key.strip():
             raise ValueError("Empty API key")
         credential = {"type": "api_key", "key": key.strip()}
@@ -1329,7 +1340,7 @@ class TextWizardIO:
         if default is not None:
             hint += ", Enter for default"
         while True:
-            raw = await asyncio.get_running_loop().run_in_executor(None, input, hint + ": ")
+            raw = await run_console_prompt(input, hint + ": ")
             text = raw.strip()
             if text.lower() == ":cancel":
                 return None
@@ -1347,10 +1358,10 @@ class TextWizardIO:
                          validate: Optional[Callable[[str], str]] = None) -> Optional[str]:
         while True:
             if password:
-                raw = await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, f"{title}: ")
+                raw = await run_console_prompt(getpass.getpass, f"{title}: ")
             else:
                 shown = f" [{default}]" if default else ""
-                raw = await asyncio.get_running_loop().run_in_executor(None, input, f"{title}{shown}: ")
+                raw = await run_console_prompt(input, f"{title}{shown}: ")
             if allow_cancel_word and raw.strip() == ":cancel":
                 return None
             if validate is None:
@@ -1473,8 +1484,7 @@ async def _choose_console(title: str, values):
     print(title)
     for index, (label, _value) in enumerate(values, 1):
         print(f"  {index}. {label}")
-    raw = await asyncio.get_running_loop().run_in_executor(
-        None, input, f"Choose [1-{len(values)}]: ")
+    raw = await run_console_prompt(input, f"Choose [1-{len(values)}]: ")
     try:
         index = int(raw.strip())
     except ValueError:
@@ -1508,8 +1518,7 @@ async def bug_report_command(argument: str, agent: Agent, session: Optional[Sess
     chooser = ui.choose if ui else _choose_console
     hint = argument.strip()
     if not hint:
-        hint = await asyncio.get_running_loop().run_in_executor(
-            None, input, "What went wrong? (optional, Enter to skip): ")
+        hint = await run_console_prompt(input, "What went wrong? (optional, Enter to skip): ")
     include_session = False
     if session is not None:
         include_session = await chooser("Include the session transcript?", [
