@@ -37,10 +37,22 @@ class SqliteStorage(MemoryStorage):
         self._replay()
 
     def _replay(self) -> None:
-        cursor = self.conn.execute("SELECT seq, writes FROM commits ORDER BY seq")
-        for seq, payload in cursor:
+        self._replay_from(1)
+
+    def _replay_from(self, seq: int) -> None:
+        """Apply every commit at or after ``seq`` that this instance has not seen."""
+        cursor = self.conn.execute(
+            "SELECT seq, writes FROM commits WHERE seq >= ? ORDER BY seq", (seq,)
+        )
+        for row_seq, payload in cursor:
             batch = json.loads(payload)
-            self.apply_commit(self._decode_writes(batch), seq)
+            self.apply_commit(self._decode_writes(batch), row_seq)
+
+    def _rollback(self) -> None:
+        try:
+            self.conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     def _encode_writes(self, writes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         encoded: List[Dict[str, Any]] = []
@@ -64,31 +76,37 @@ class SqliteStorage(MemoryStorage):
 
     async def commit(self, writes: List[Dict[str, Any]]) -> int:
         self.assert_open()
-        self.reject_copy_source_conflicts(writes)
-        resolved = [self.resolve_document_copy(w) if w["type"] == "document.copy" else w for w in writes]
-        seq = self.next_seq
-        # Validate before opening the transaction so rejections leave no rows.
-        self.check_global_ids(resolved)
-        actions = self.prepare_document_actions(resolved)
-        self.check_document_actions(actions)
-        self.check_record_statuses(resolved)
         try:
-            payload = json.dumps(self._encode_writes(resolved), ensure_ascii=True)
-        except (TypeError, UnicodeEncodeError, ValueError) as exc:
-            raise StorageRejected(f"Commit is not JSON-serializable: {exc}") from exc
-        try:
-            self.conn.execute("BEGIN")
+            # IMMEDIATE serializes writers, so the log cannot advance between
+            # the replay below and our own row landing.
+            self.conn.execute("BEGIN IMMEDIATE")
+            # Another process may have committed since this instance opened (or
+            # last committed). Replay its rows so the sequence and every ID and
+            # document check below see the transaction's state, not a stale
+            # open-time snapshot.
+            self._replay_from(self.next_seq)
+            self.reject_copy_source_conflicts(writes)
+            resolved = [self.resolve_document_copy(w) if w["type"] == "document.copy" else w for w in writes]
+            seq = self.next_seq
+            self.check_global_ids(resolved)
+            actions = self.prepare_document_actions(resolved)
+            self.check_document_actions(actions)
+            self.check_record_statuses(resolved)
+            try:
+                payload = json.dumps(self._encode_writes(resolved), ensure_ascii=True)
+            except (TypeError, UnicodeEncodeError, ValueError) as exc:
+                raise StorageRejected(f"Commit is not JSON-serializable: {exc}") from exc
             self.conn.execute(
                 "INSERT INTO commits (seq, writes) VALUES (?, ?)",
                 (seq, payload),
             )
             self.conn.execute("COMMIT")
         except sqlite3.Error as exc:
-            try:
-                self.conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
+            self._rollback()
             raise RuntimeError(f"sqlite commit failed: {exc}") from exc
+        except BaseException:
+            self._rollback()
+            raise
         self.apply_writes(resolved, actions, seq)
         self.next_seq = seq + 1
         return seq

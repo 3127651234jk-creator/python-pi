@@ -398,6 +398,57 @@ def test_sqlite_serialization_failure_leaves_connection_usable(tmp_path):
     asyncio.run(scenario())
 
 
+def test_sqlite_second_writer_uses_the_committed_sequence(tmp_path):
+    async def scenario():
+        path = str(tmp_path / "shared.db")
+        first = SqliteStorage(path)
+        # Opened before any commit, so this instance's snapshot still has next_seq == 1.
+        second = SqliteStorage(path)
+
+        assert await first.commit([write_conversation(conversation(2))]) == 1
+        # The second instance must take the committed sequence, not its open-time copy.
+        assert await second.commit([write_conversation(conversation(3))]) == 2
+        assert second.next_seq == 3
+        assert (await second.conversation(2)) is not None
+
+        await first.close()
+        await second.close()
+
+        reopened = SqliteStorage(path)
+        assert reopened.next_seq == 3
+        assert (await reopened.conversation(2)) is not None
+        assert (await reopened.conversation(3)) is not None
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_stale_snapshot_rejects_ids_committed_by_another_writer(tmp_path):
+    async def scenario():
+        path = str(tmp_path / "shared.db")
+        first = SqliteStorage(path)
+        stale = SqliteStorage(path)
+        await first.commit([write_conversation(conversation(2))])
+
+        # Validation runs against the transaction's state, so the duplicate ID
+        # is rejected instead of being appended as an unreadable commit.
+        with pytest.raises(StorageRejected, match="already belongs to conversation"):
+            await stale.commit([write_conversation(conversation(2))])
+        assert not stale.conn.in_transaction
+        assert stale.next_seq == 2
+        assert stale.conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == 1
+
+        await first.close()
+        await stale.close()
+
+        reopened = SqliteStorage(path)
+        assert reopened.next_seq == 2
+        assert (await reopened.conversation(2)) is not None
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_invalid_record_status_rejected_before_apply(tmp_path, backend):
     async def scenario():
