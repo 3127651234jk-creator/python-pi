@@ -16,6 +16,7 @@ from typing import List, Optional, Union
 
 from ..ai.types import AudioContent, ImageContent, VideoContent
 from ..images import ProcessImageOptions, detect_supported_image_mime_type_from_file, process_image
+from .tools.common import resolve_to_cwd
 
 # Media attachments are extension-based: no re-encoding, provider validates.
 _MEDIA_MIME_TYPES = {
@@ -45,11 +46,12 @@ def strip_bom(text: str) -> str:
 
 
 def resolve_read_path(path: str, cwd: str) -> str:
-    """Resolve a @file argument: ~ expansion, absolute or cwd-relative."""
-    expanded = os.path.expanduser(path)
-    if os.path.isabs(expanded):
-        return os.path.normpath(expanded)
-    return os.path.normpath(os.path.join(cwd, expanded))
+    """Resolve a @file argument the way tool paths are resolved.
+
+    Shared with the read tool: unicode-space (NBSP) normalization, ``file://``
+    URLs, ``~`` expansion, absolute or cwd-relative paths.
+    """
+    return resolve_to_cwd(path, cwd)
 
 
 async def process_file_arguments(
