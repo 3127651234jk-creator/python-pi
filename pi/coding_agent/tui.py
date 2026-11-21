@@ -34,6 +34,31 @@ DEFAULT_KEYBINDINGS = {
     "models": ["c-l"], "sessions": ["c-o"], "exit": ["c-d"],
     "complete": ["tab"], "save": ["c-s"],
 }
+_SHORTCUT_MODIFIERS = {"ctrl": "c", "control": "c", "alt": "escape", "meta": "escape", "option": "escape"}
+
+
+def _shortcut_keys(shortcut: str) -> List[str]:
+    """Translate user shortcuts such as ``ctrl+r`` into prompt_toolkit keys.
+
+    prompt_toolkit only accepts ``c-r``-style modifiers; alt combinations need
+    a separate leading ``escape`` token. Unknown spellings pass through so
+    prompt_toolkit can report them.
+    """
+    keys: List[str] = []
+    for part in shortcut.split():
+        pieces = [piece for piece in part.split("+") if piece]
+        modifiers = [piece.lower() for piece in pieces[:-1]]
+        if not modifiers or any(modifier not in _SHORTCUT_MODIFIERS for modifier in modifiers):
+            keys.append(part)
+            continue
+        mapped = [_SHORTCUT_MODIFIERS[modifier] for modifier in modifiers]
+        if "escape" in mapped:
+            keys.append("escape")
+        key = pieces[-1].lower() if "c" in mapped else pieces[-1]
+        keys.append("c-" + key if "c" in mapped else key)
+    return keys
+
+
 THEMES = {
     "dark": {
         "prompt": "bold ansicyan", "bottom-toolbar": "bg:#202530 #dddddd",
@@ -667,7 +692,10 @@ class TerminalUI:
         self.markdown_transform = None
         self.style = Style.from_dict(_theme_styles(self.themes[self.settings.get("theme", "dark")]))
         bindings = KeyBindings()
-        keys = {**DEFAULT_KEYBINDINGS, **self.settings.get("keybindings", {})}
+        user_keys = self.settings.get("keybindings", {})
+        keys = {**DEFAULT_KEYBINDINGS, **{
+            action: [" ".join(_shortcut_keys(shortcut)) for shortcut in shortcuts]
+            for action, shortcuts in user_keys.items()}}
         # "save" belongs to modal forms (the custom API page); the prompt has
         # no save target, so it is not registered here.
         self.form_keybindings = keys
@@ -719,7 +747,7 @@ class TerminalUI:
             if action == "save":
                 continue
             for shortcut in shortcuts:
-                binding = bindings.add(*shortcut.split(), eager=True)
+                binding = bindings.add(*_shortcut_keys(shortcut), eager=True)
                 binding(handlers[action])
                 normalized = bindings.bindings[-1].keys
                 if normalized in registered:
@@ -727,7 +755,7 @@ class TerminalUI:
                 registered.add(normalized)
         for _action, shortcuts, handler in (extra_bindings or []):
             for shortcut in shortcuts:
-                binding = bindings.add(*shortcut.split(), eager=True)
+                binding = bindings.add(*_shortcut_keys(shortcut), eager=True)
                 binding(extension_handler(handler))
                 normalized = bindings.bindings[-1].keys
                 if normalized in registered:

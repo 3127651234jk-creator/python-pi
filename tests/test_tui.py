@@ -51,6 +51,22 @@ def test_custom_submit_and_shortcut_validation():
         asyncio.run(check(pipe))
 
 
+def test_ctrl_shortcut_spellings_are_normalized():
+    async def check(pipe):
+        ui = TerminalUI(
+            Agent(resolve_model("faux")), lambda: [], {"keybindings": {"submit": ["ctrl+s"]}},
+            input=pipe, output=DummyOutput(),
+            extra_bindings=[("refresh", ["ctrl+r"], lambda: None)])
+        registered = {binding.keys for binding in ui.session.key_bindings.bindings}
+        assert ("c-s",) in registered
+        assert ("c-r",) in registered
+        with pytest.raises(ValueError, match="collides"):
+            TerminalUI(ui.agent, lambda: [], input=pipe, output=DummyOutput(),
+                       extra_bindings=[("refresh", ["ctrl+r", "c-r"], lambda: None)])
+    with create_pipe_input() as pipe:
+        asyncio.run(check(pipe))
+
+
 def test_selector_confirmation_and_cancel():
     async def check(pipe):
         with create_app_session(input=pipe, output=DummyOutput()):
