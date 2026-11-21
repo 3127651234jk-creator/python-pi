@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import stat
 import sys
+import uuid
 from urllib.parse import unquote, urlsplit
 from typing import Any, Awaitable, Callable, Optional
 from weakref import WeakValueDictionary
@@ -58,6 +60,41 @@ def resolve_to_cwd(path: str, cwd: str) -> str:
     path = _normalize_path(path, tool_input=True)
     cwd = _normalize_path(cwd)
     return os.path.abspath(os.path.join(cwd, path))
+
+
+def write_file_atomic(path: str, data: bytes) -> None:
+    """Replace ``path`` with ``data`` through a same-directory temp file.
+
+    ``os.replace`` is atomic on POSIX and Windows, so a crash, a full disk or
+    an interrupted write leaves the previous file intact instead of a
+    truncated one. Symlinks are followed so the link itself survives.
+    """
+    target = os.path.realpath(path) if os.path.islink(path) else path
+    directory = os.path.dirname(target) or "."
+    while True:
+        temp_path = os.path.join(directory, f".pi-write-{uuid.uuid4().hex}.tmp")
+        try:
+            # 0o666 lets the umask pick the normal creation mode; mkstemp's
+            # fixed 0600 would make new files unreadable to group/others.
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            break
+        except FileExistsError:
+            continue
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        try:
+            # Keep the original permissions when replacing an existing file.
+            os.chmod(temp_path, stat.S_IMODE(os.stat(target).st_mode))
+        except OSError:
+            pass
+        os.replace(temp_path, target)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def detect_image_mime_type(path: str):

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from ...ai.types import TextContent
 from ...agent.types import AgentTool, AgentToolResult
-from .common import resolve_to_cwd, with_file_mutation_queue
+from .common import resolve_to_cwd, with_file_mutation_queue, write_file_atomic
 from .edit_diff import (
     Edit,
     apply_edits_to_normalized_content,
@@ -140,8 +140,7 @@ def create_edit_tool(cwd: str) -> AgentTool:
 
             final_content = ("\ufeff" if bom else "") + restore_line_endings(new_content, original_ending)
             encoded_content = final_content.encode("utf-8")
-            with open(absolute_path, "wb") as handle:
-                handle.write(encoded_content)
+            write_file_atomic(absolute_path, encoded_content)
             check_aborted()
 
             diff, first_changed_line = generate_diff_string(base_content, new_content)

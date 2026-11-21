@@ -95,6 +95,78 @@ def test_write_encoding_failure_preserves_original(tmp_path):
     assert path.read_bytes() == b"original"
 
 
+def test_write_replace_failure_preserves_original(tmp_path, monkeypatch):
+    from pi.coding_agent.tools import common as common_module
+
+    path = tmp_path / "file.txt"
+    path.write_bytes(b"original")
+
+    def fail_replace(_src, _dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(common_module.os, "replace", fail_replace)
+
+    async def scenario():
+        with pytest.raises(OSError, match="disk full"):
+            await get_tool(str(tmp_path), "write").execute(
+                "t1", {"path": "file.txt", "content": "replacement"}
+            )
+
+    asyncio.run(scenario())
+    assert path.read_bytes() == b"original"
+    assert [entry.name for entry in tmp_path.iterdir()] == ["file.txt"]
+
+
+def test_edit_replace_failure_preserves_original(tmp_path, monkeypatch):
+    from pi.coding_agent.tools import common as common_module
+
+    path = tmp_path / "file.txt"
+    path.write_text("alpha\n", encoding="utf-8")
+
+    def fail_replace(_src, _dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(common_module.os, "replace", fail_replace)
+
+    async def scenario():
+        with pytest.raises(OSError, match="disk full"):
+            await get_tool(str(tmp_path), "edit").execute(
+                "t1", {"path": "file.txt", "edits": [{"oldText": "alpha", "newText": "beta"}]}
+            )
+
+    asyncio.run(scenario())
+    assert path.read_text(encoding="utf-8") == "alpha\n"
+    assert [entry.name for entry in tmp_path.iterdir()] == ["file.txt"]
+
+
+def test_read_counts_trailing_newline_as_terminator(tmp_path):
+    (tmp_path / "file.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    async def scenario():
+        read = get_tool(str(tmp_path), "read")
+        whole = await read.execute("t1", {"path": "file.txt"})
+        assert whole.content[0].text == "one\ntwo\n"
+        with pytest.raises(ValueError, match=r"2 lines total"):
+            await read.execute("t2", {"path": "file.txt", "offset": 3})
+        last = await read.execute("t3", {"path": "file.txt", "offset": 2, "limit": 1})
+        assert last.content[0].text == "two\n"
+
+    asyncio.run(scenario())
+
+
+def test_read_empty_file_still_has_one_line(tmp_path):
+    (tmp_path / "empty.txt").write_text("", encoding="utf-8")
+
+    async def scenario():
+        read = get_tool(str(tmp_path), "read")
+        result = await read.execute("t1", {"path": "empty.txt"})
+        assert result.content[0].text == ""
+        with pytest.raises(ValueError, match=r"1 lines total"):
+            await read.execute("t2", {"path": "empty.txt", "offset": 2})
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("name", ["offset", "limit"])
 @pytest.mark.parametrize("value", [-1, 0, 1.5, True, "1"])
 def test_read_rejects_invalid_pagination(tmp_path, name, value):

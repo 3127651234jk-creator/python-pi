@@ -210,19 +210,26 @@ def create_read_tool(
         _raise_if_aborted(signal)
 
         all_lines = text_content.split("\n")
-        total_file_lines = len(all_lines)
+        ends_with_newline = text_content.endswith("\n")
+        # A trailing newline terminates the last line; it does not start an
+        # extra empty line. Empty text still counts as one empty line so
+        # offset=1 can read an empty file.
+        total_file_lines = len(all_lines) - (1 if ends_with_newline else 0)
         start_line = max(0, (offset or 1) - 1)
         start_line_display = start_line + 1
-        if start_line >= len(all_lines):
-            raise ValueError(f"Offset {offset} is beyond end of file ({len(all_lines)} lines total)")
+        if start_line >= total_file_lines:
+            raise ValueError(f"Offset {offset} is beyond end of file ({total_file_lines} lines total)")
 
         user_limited_lines: Optional[int] = None
         if limit is not None:
-            end_line = min(start_line + limit, len(all_lines))
-            selected = "\n".join(all_lines[start_line:end_line])
+            end_line = min(start_line + limit, total_file_lines)
             user_limited_lines = end_line - start_line
         else:
-            selected = "\n".join(all_lines[start_line:])
+            end_line = total_file_lines
+        selected = "\n".join(all_lines[start_line:end_line])
+        if ends_with_newline and end_line == total_file_lines and end_line > start_line:
+            # Selecting through EOF keeps the file's final newline.
+            selected += "\n"
 
         truncation = truncate_head(selected)
         if truncation.first_line_exceeds_limit:
@@ -247,8 +254,8 @@ def create_read_tool(
                     f"({format_size(DEFAULT_MAX_BYTES)} limit). Use offset={next_offset} to continue.]"
                 )
             details = truncation
-        elif user_limited_lines is not None and start_line + user_limited_lines < len(all_lines):
-            remaining = len(all_lines) - (start_line + user_limited_lines)
+        elif user_limited_lines is not None and start_line + user_limited_lines < total_file_lines:
+            remaining = total_file_lines - (start_line + user_limited_lines)
             next_offset = start_line + user_limited_lines + 1
             output_text = f"{truncation.content}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
             details = None

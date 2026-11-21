@@ -1726,7 +1726,7 @@ async def refresh_radius_models(registry: ModelRegistry) -> None:
         print(f"warning: Radius model discovery failed: {describe_error(exc)}", file=sys.stderr)
 
 
-async def async_main(argv: Optional[List[str]] = None) -> int:
+async def _async_main(argv: Optional[List[str]] = None) -> int:
     # Redirected Windows streams can default to a legacy code page. Configure
     # text mode too, before startup diagnostics or model output are written.
     for stream in (sys.stdout, sys.stderr):
@@ -2100,6 +2100,19 @@ def _route_durable_command(argv: List[str]) -> Optional[int]:
 
         return mcp_main(argv[1:])
     return None
+
+
+async def async_main(argv: Optional[List[str]] = None) -> int:
+    """Run the CLI and always release the stdout takeover.
+
+    ``main()`` restores stdout too, but tests and embedders call this coroutine
+    directly; without the wrapper a JSON/RPC run would leave ``sys.stdout``
+    pointing at stderr for the rest of the process.
+    """
+    try:
+        return await _async_main(argv)
+    finally:
+        restore_stdout()
 
 
 def main(argv: Optional[List[str]] = None) -> int:

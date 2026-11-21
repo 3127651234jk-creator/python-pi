@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from ...ai.types import TextContent
 from ...agent.types import AgentTool, AgentToolResult
-from .common import resolve_to_cwd, with_file_mutation_queue
+from .common import resolve_to_cwd, with_file_mutation_queue, write_file_atomic
 
 WRITE_SCHEMA = {
     "type": "object",
@@ -54,8 +54,7 @@ def create_write_tool(cwd: str) -> AgentTool:
             if directory:
                 os.makedirs(directory, exist_ok=True)
             check_aborted()
-            with open(absolute_path, "wb") as handle:
-                handle.write(encoded_content)
+            write_file_atomic(absolute_path, encoded_content)
             check_aborted()
             return AgentToolResult(content=[TextContent(text=f"Successfully wrote to {path}")])
 

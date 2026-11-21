@@ -1,7 +1,8 @@
+import asyncio
 import io
 import sys
 
-from pi.coding_agent import output_guard
+from pi.coding_agent import cli, output_guard
 
 
 def teardown_function(_result):
@@ -60,3 +61,17 @@ def test_fileno_points_at_stderr(monkeypatch):
     monkeypatch.setattr(sys, "stderr", _Stderr())
     output_guard.take_over_stdout()
     assert sys.stdout.fileno() == 42
+
+
+def test_async_main_restores_stdout(monkeypatch):
+    """Direct async_main callers (tests, embedders) must not leak the takeover."""
+    original = sys.stdout
+
+    async def fake(_argv):
+        output_guard.take_over_stdout()
+        return 0
+
+    monkeypatch.setattr(cli, "_async_main", fake)
+    assert asyncio.run(cli.async_main([])) == 0
+    assert sys.stdout is original
+    assert not output_guard.is_stdout_taken_over()
