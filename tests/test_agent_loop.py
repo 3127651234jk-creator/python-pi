@@ -599,6 +599,80 @@ def test_agent_auto_retries_transient_error():
     asyncio.run(scenario())
 
 
+def test_convert_to_llm_drops_tool_results_of_retried_attempt():
+    """A superseded attempt's toolResults must be omitted with their tool_use.
+
+    Answering tool calls that streamed before the failure keeps the raw
+    transcript consistent, but replaying those results after the assistant
+    message was dropped leaves an orphan tool_result that providers reject.
+    """
+    model = make_model()
+    failed = make_partial(model, 0)
+    failed.content = [ToolCall(id="t1", name="echo", arguments={"text": "x"})]
+    failed.stop_reason = "error"
+    failed.retried = True
+    messages = [
+        UserMessage(content="hello", timestamp=0),
+        failed,
+        ToolResultMessage(
+            tool_call_id="t1", tool_name="echo", content=[TextContent(text="Operation aborted")],
+            is_error=True, timestamp=0,
+        ),
+        ToolResultMessage(
+            tool_call_id="t0", tool_name="echo", content=[TextContent(text="earlier")],
+            is_error=False, timestamp=0,
+        ),
+    ]
+    projected = default_convert_to_llm(messages)
+    assert [getattr(m, "role", None) for m in projected] == ["user", "toolResult"]
+    # Only the result of the superseded attempt is dropped; unrelated results stay.
+    assert projected[-1].tool_call_id == "t0"
+
+
+def test_agent_auto_retry_omits_results_answering_streamed_tool_calls():
+    """Retrying a stream that broke mid tool call must not replay orphan results."""
+
+    async def scenario():
+        model = Model(id="mid-tool", name="m", api="mid-tool-error-test", provider="test", base_url="")
+        request_roles = []
+
+        async def stream_fn(model, context, options=None):
+            request_roles.append(
+                [
+                    (getattr(m, "role", None), getattr(m, "tool_call_id", None))
+                    for m in context.messages
+                ]
+            )
+            partial = make_partial(model, 0)
+            partial.content = [ToolCall(id="t1", name="echo", arguments={"text": "x"})]
+            if len(request_roles) == 1:
+                partial.stop_reason = "error"
+                partial.error_message = "terminated"
+                yield StreamStartEvent(partial=partial)
+                yield StreamErrorEvent(reason="error", error=partial)
+                return
+            partial.content = [TextContent(text="recovered")]
+            partial.stop_reason = "stop"
+            yield DoneEvent(reason="stop", message=partial)
+
+        STREAM_FNS["mid-tool-error-test"] = stream_fn
+        try:
+            agent = Agent(model=model, tools=[make_tool()], retry=RetryPolicy(base_delay_ms=0))
+            messages = await agent.prompt("hello")
+        finally:
+            STREAM_FNS.pop("mid-tool-error-test", None)
+
+        assert messages[-1].content[0].text == "recovered"
+        assert [getattr(m, "role", None) for m in messages] == [
+            "system", "user", "assistant", "toolResult", "assistant",
+        ]
+        # The retried attempt and the result answering its streamed call are both
+        # omitted, so the retry request never carries an orphan tool_result.
+        assert request_roles[1] == [("system", None), ("user", None)]
+
+    asyncio.run(scenario())
+
+
 def test_abort_answers_remaining_tool_calls_parallel():
     """An abort during preparation still answers the calls that never started."""
 

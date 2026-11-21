@@ -1025,6 +1025,12 @@ def default_convert_to_llm(messages: List[Any], block_images: bool = False) -> L
     """Pass through the four LLM roles, filtering UI-only custom messages and
     failed attempts superseded by an auto-retry.
 
+    A superseded assistant message is dropped together with the toolResults that
+    answer its tool calls: a stream that fails mid tool call still answers the
+    streamed calls (so the raw transcript stays consistent), but replaying those
+    results without their tool_use blocks would be an orphan tool_result that
+    Anthropic/OpenAI reject with a 400.
+
     ``!``-mode bash executions project to user text like the TS convertToLlm
     (bashExecutionToText); runs made with ``!!`` stay out of the context.
 
@@ -1034,13 +1040,21 @@ def default_convert_to_llm(messages: List[Any], block_images: bool = False) -> L
     effect on the next request without touching stored history.
     """
     converted = []
+    omitted_tool_call_ids = set()
     for m in messages:
         role = getattr(m, "role", None)
         if role == "bashExecution":
             if getattr(m, "exclude_from_context", False):
                 continue
             converted.append(UserMessage(content=bash_execution_to_text(m), timestamp=m.timestamp))
-        elif role in ("system", "user", "assistant", "toolResult") and not getattr(m, "retried", False):
+        elif getattr(m, "retried", False):
+            if role == "assistant":
+                omitted_tool_call_ids.update(
+                    block.id for block in (getattr(m, "content", None) or []) if isinstance(block, ToolCall)
+                )
+        elif role == "toolResult" and getattr(m, "tool_call_id", None) in omitted_tool_call_ids:
+            continue
+        elif role in ("system", "user", "assistant", "toolResult"):
             converted.append(m)
     if not block_images:
         return converted
