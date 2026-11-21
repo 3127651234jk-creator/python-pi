@@ -41,3 +41,22 @@ def test_double_take_over_is_idempotent():
     assert sys.stdout is taken
     output_guard.restore_stdout()
     assert sys.stdout is original
+
+
+def test_buffer_writes_go_to_stderr(capsys):
+    output_guard.take_over_stdout()
+    sys.stdout.buffer.write(b"stray bytes\n")
+    sys.stdout.buffer.flush()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "stray bytes" in captured.err
+
+
+def test_fileno_points_at_stderr(monkeypatch):
+    class _Stderr(io.StringIO):
+        def fileno(self):
+            return 42
+
+    monkeypatch.setattr(sys, "stderr", _Stderr())
+    output_guard.take_over_stdout()
+    assert sys.stdout.fileno() == 42

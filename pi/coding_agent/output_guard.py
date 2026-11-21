@@ -10,11 +10,37 @@ import sys
 from typing import Optional
 
 
+class _BinaryForwarder:
+    """Binary view of stderr, so ``sys.stdout.buffer`` cannot reach real stdout."""
+
+    def write(self, data):
+        stream = sys.stderr
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            return stream.write(data.decode("utf-8", "replace"))
+        return buffer.write(data)
+
+    def flush(self):
+        stream = sys.stderr
+        buffer = getattr(stream, "buffer", None)
+        return (buffer if buffer is not None else stream).flush()
+
+    def __getattr__(self, name):
+        stream = sys.stderr
+        return getattr(getattr(stream, "buffer", None) or stream, name)
+
+
 class _Forwarder:
     """Minimal file object forwarding writes to stderr."""
 
     def __init__(self, original) -> None:
         self.original = original
+
+    @property
+    def buffer(self):
+        # Delegating ``buffer`` to the original stream would hand out the real
+        # stdout buffer; binary writes would then bypass the protocol guard.
+        return _BinaryForwarder()
 
     def write(self, text):
         return sys.stderr.write(text)
@@ -24,6 +50,11 @@ class _Forwarder:
 
     def isatty(self):
         return False
+
+    def fileno(self):
+        # The guard is stderr, so fd-level writes (os.write, logging handlers)
+        # must target stderr's descriptor rather than stdout's.
+        return sys.stderr.fileno()
 
     def __getattr__(self, name):
         return getattr(self.original, name)
