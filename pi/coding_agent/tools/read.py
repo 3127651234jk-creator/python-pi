@@ -5,8 +5,9 @@ Python port of ``packages/coding-agent/src/core/tools/read.ts``.
 
 from __future__ import annotations
 
+import asyncio
 import os
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Awaitable, Callable, List, Optional, Union
 
 from ...ai.types import ImageContent, TextContent
 from ...agent.types import AgentTool, AgentToolResult
@@ -16,8 +17,13 @@ from ...images import (
     process_image,
     resize_options_from_profile,
 )
+from ...util import AbortError
 from .common import resolve_to_cwd
 from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationResult, format_size, truncate_head
+
+# Read size per worker-thread hop: an abort is observed within one chunk instead
+# of after the whole file has been read.
+READ_CHUNK_SIZE = 1024 * 1024
 
 READ_SCHEMA = {
     "type": "object",
@@ -67,6 +73,59 @@ def _model_resize_options(model: Any):
     return resize_options_from_profile(profile) if profile is not None else None
 
 
+def _raise_if_aborted(signal: Optional[Any]) -> None:
+    if signal is not None and getattr(signal, "aborted", False):
+        raise AbortError("Operation aborted")
+
+
+async def _await_with_abort(awaitable: Awaitable[Any], signal: Optional[Any]) -> Any:
+    """Await ``awaitable`` but stop waiting as soon as ``signal`` aborts.
+
+    Worker-thread work (image decode/resize) cannot be cancelled from asyncio,
+    so the abandoned thread finishes in the background and its result is
+    discarded.
+    """
+    if signal is None:
+        return await awaitable
+    task = asyncio.ensure_future(awaitable)
+    waiter = asyncio.ensure_future(signal.wait())
+    try:
+        done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+        if not task.done():
+            task.cancel()
+    if task not in done:
+        raise AbortError("Operation aborted")
+    return task.result()
+
+
+async def _read_chunks(handle: Any, signal: Optional[Any]) -> List[Any]:
+    chunks: List[Any] = []
+    while True:
+        _raise_if_aborted(signal)
+        chunk = await asyncio.to_thread(handle.read, READ_CHUNK_SIZE)
+        if not chunk:
+            return chunks
+        chunks.append(chunk)
+
+
+async def _read_bytes(path: str, signal: Optional[Any]) -> bytes:
+    handle = await asyncio.to_thread(open, path, "rb")
+    try:
+        return b"".join(await _read_chunks(handle, signal))
+    finally:
+        await asyncio.to_thread(handle.close)
+
+
+async def _read_text(path: str, signal: Optional[Any]) -> str:
+    handle = await asyncio.to_thread(open, path, "r", encoding="utf-8", errors="replace")
+    try:
+        return "".join(await _read_chunks(handle, signal))
+    finally:
+        await asyncio.to_thread(handle.close)
+
+
 def to_read_output(content: List[Union[TextContent, ImageContent]]) -> Union[str, dict]:
     """The image block and its note, or the text for text files and images that could not
     be processed."""
@@ -96,6 +155,7 @@ def create_read_tool(
         signal: Optional[Any] = None,
         on_update: Optional[Any] = None,
     ) -> AgentToolResult:
+        _raise_if_aborted(signal)
         path: str = params["path"]
         offset: Optional[int] = params.get("offset")
         limit: Optional[int] = params.get("limit")
@@ -107,22 +167,27 @@ def create_read_tool(
         if not os.path.isfile(absolute_path):
             raise FileNotFoundError(f"File not found: {path}")
 
+        _raise_if_aborted(signal)
         mime_type = detect_supported_image_mime_type_from_file(absolute_path)
         content: List[Union[TextContent, ImageContent]]
 
         if mime_type:
-            with open(absolute_path, "rb") as handle:
-                data = handle.read()
+            data = await _read_bytes(absolute_path, signal)
             model = get_model() if get_model is not None else None
             settings = image_settings() if image_settings is not None else {}
-            processed = await process_image(
-                data,
-                mime_type,
-                ProcessImageOptions(
-                    auto_resize_images=bool(settings.get("auto_resize", True)),
-                    resize_options=_model_resize_options(model),
+            _raise_if_aborted(signal)
+            processed = await _await_with_abort(
+                process_image(
+                    data,
+                    mime_type,
+                    ProcessImageOptions(
+                        auto_resize_images=bool(settings.get("auto_resize", True)),
+                        resize_options=_model_resize_options(model),
+                    ),
                 ),
+                signal,
             )
+            _raise_if_aborted(signal)
             non_vision_note = _get_non_vision_image_note(model)
             if not processed.ok:
                 text = f"Read image file [{mime_type}]\n{processed.message}"
@@ -141,8 +206,8 @@ def create_read_tool(
                 ]
             return AgentToolResult(content=content, structured_content=to_read_output(content))
 
-        with open(absolute_path, "r", encoding="utf-8", errors="replace") as handle:
-            text_content = handle.read()
+        text_content = await _read_text(absolute_path, signal)
+        _raise_if_aborted(signal)
 
         all_lines = text_content.split("\n")
         total_file_lines = len(all_lines)

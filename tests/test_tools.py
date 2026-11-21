@@ -7,6 +7,7 @@ import base64
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,9 +15,11 @@ import pytest
 
 from pi.coding_agent.tools import create_default_tools
 from pi.coding_agent.tools import bash as bash_module
+from pi.coding_agent.tools import read as read_module
 from pi.coding_agent.tools.edit import prepare_edit_arguments
 from pi.coding_agent.tools.read import create_read_tool
 from pi.coding_agent.tools.truncate import truncate_head, truncate_tail
+from pi.util import AbortError, AbortSignal
 
 # A valid 1x1 PNG, shared with the codemode worker tests.
 PNG_1PX = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
@@ -125,6 +128,67 @@ def test_read_truncation_notice(tmp_path):
         # 50 lines is under the 2000-line default, so no notice appears.
         result3 = await read.execute("t3", {"path": "big.txt"})
         assert "line 49" in result3.content[0].text
+
+    asyncio.run(scenario())
+
+
+def test_read_rejects_already_aborted_signal(tmp_path):
+    (tmp_path / "file.txt").write_text("hello", encoding="utf-8")
+    signal = AbortSignal()
+    signal.abort()
+
+    async def scenario():
+        with pytest.raises(AbortError):
+            await create_read_tool(str(tmp_path)).execute("t1", {"path": "file.txt"}, signal)
+
+    asyncio.run(scenario())
+
+
+def test_read_stops_reading_large_file_when_aborted(tmp_path, monkeypatch):
+    # More than one READ_CHUNK_SIZE so the read loop gets a second iteration to
+    # observe the abort raised between chunks.
+    (tmp_path / "big.txt").write_text("line\n" * 300_000, encoding="utf-8")
+    signal = AbortSignal()
+    real_to_thread = asyncio.to_thread
+    reads = 0
+
+    async def aborting_to_thread(fn, *args, **kwargs):
+        nonlocal reads
+        result = await real_to_thread(fn, *args, **kwargs)
+        if getattr(fn, "__name__", "") == "read":
+            reads += 1
+            if reads == 1:
+                signal.abort()
+        return result
+
+    monkeypatch.setattr(read_module, "asyncio", SimpleNamespace(to_thread=aborting_to_thread))
+
+    async def scenario():
+        with pytest.raises(AbortError):
+            await create_read_tool(str(tmp_path)).execute("t1", {"path": "big.txt"}, signal)
+
+    asyncio.run(scenario())
+
+
+def test_read_stops_waiting_for_image_processing_when_aborted(tmp_path, monkeypatch):
+    (tmp_path / "picture.png").write_bytes(base64.b64decode(PNG_1PX))
+    signal = AbortSignal()
+
+    async def slow_process(data, mime_type, options=None):
+        await asyncio.sleep(30)
+        raise AssertionError("abandoned image processing must not be awaited")
+
+    monkeypatch.setattr(read_module, "process_image", slow_process)
+
+    async def scenario():
+        async def abort_soon():
+            await asyncio.sleep(0.01)
+            signal.abort()
+
+        aborter = asyncio.ensure_future(abort_soon())
+        with pytest.raises(AbortError):
+            await create_read_tool(str(tmp_path)).execute("t1", {"path": "picture.png"}, signal)
+        await aborter
 
     asyncio.run(scenario())
 
