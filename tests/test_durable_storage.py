@@ -398,6 +398,51 @@ def test_sqlite_serialization_failure_leaves_connection_usable(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_invalid_record_status_rejected_before_apply(tmp_path, backend):
+    async def scenario():
+        storage = make_storage(backend, tmp_path)
+        cid, tid, sid = await storage.mint_id(), await storage.mint_id(), await storage.mint_id()
+        await storage.commit([write_conversation(conversation(cid))])
+
+        with pytest.raises(StorageRejected, match="Invalid task status"):
+            await storage.commit([write_task(task_record(tid, cid, "paused"))])
+        assert await storage.task(tid) is None
+        assert (await storage.scan_tasks({}, 10)).items == []
+
+        invalid = SubmissionRecord(id=sid, conversation_id=cid, type="input", status="lost")
+        with pytest.raises(StorageRejected, match="Invalid submission status"):
+            await storage.commit([write_submission(invalid)])
+        assert await storage.submission(sid) is None
+        assert (await storage.scan_submissions({}, 10)).items == []
+
+        # The rejected commits consumed no sequence and left the store usable.
+        assert storage.next_seq == 2
+        assert await storage.commit([write_task(task_record(tid, cid))]) == 2
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["jsonl", "sqlite"])
+def test_invalid_status_commit_keeps_backing_file_reopenable(tmp_path, backend):
+    async def scenario():
+        storage = make_storage(backend, tmp_path)
+        cid, tid = await storage.mint_id(), await storage.mint_id()
+        await storage.commit([write_conversation(conversation(cid))])
+        with pytest.raises(StorageRejected):
+            await storage.commit([write_task(task_record(tid, cid, "paused"))])
+        await storage.close()
+
+        reopened = make_storage(backend, tmp_path)
+        assert await reopened.task(tid) is None
+        assert reopened.next_seq == 2
+        assert (await reopened.scan_tasks({"status": "pending"}, 10)).items == []
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("backend", ["jsonl", "sqlite"])
 def test_context_edits_survive_reopen(tmp_path, backend):
     async def scenario():

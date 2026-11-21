@@ -196,6 +196,7 @@ class BaseStorage:
         self.check_global_ids(writes)
         document_actions = self.prepare_document_actions(writes)
         self.check_document_actions(document_actions)
+        self.check_record_statuses(writes)
         self.apply_writes(writes, document_actions, seq)
         self.next_seq = seq + 1
         return seq
@@ -297,6 +298,34 @@ class BaseStorage:
             if live > 1:
                 raise StorageRejected("Document address already has a current incarnation")
 
+    def check_record_statuses(self, writes: List[Dict[str, Any]]) -> None:
+        """Reject task and submission statuses outside their enums.
+
+        The status indexes only carry the contractual buckets, so an unknown
+        status must fail with the rest of the validation. The log-backed stores
+        persist a commit before applying it, and a status error raised there
+        would leave a log line no replay can apply.
+        """
+
+        for write in writes:
+            wtype = write["type"]
+            if wtype == "task":
+                self.task_ids_for_status(write["value"].state.status)
+            elif wtype == "submission":
+                self.submission_ids_for_status(write["value"].status)
+
+    def task_ids_for_status(self, status: str) -> List[int]:
+        ids = self.task_ids_by_status.get(status)
+        if ids is None:
+            raise StorageRejected(f"Invalid task status: {status}")
+        return ids
+
+    def submission_ids_for_status(self, status: str) -> List[int]:
+        ids = self.submission_ids_by_status.get(status)
+        if ids is None:
+            raise StorageRejected(f"Invalid submission status: {status}")
+        return ids
+
     def apply_writes(self, writes: List[Dict[str, Any]], document_actions: Dict[int, Dict[str, Any]], seq: int) -> None:
         import copy as _copy
 
@@ -326,10 +355,10 @@ class BaseStorage:
                 previous = self.tasks.get(value.id)
                 if previous is None:
                     self._insert_sorted(self.task_ids, value.id)
-                    self._insert_sorted(self.task_ids_by_status[value.state.status], value.id)
+                    self._insert_sorted(self.task_ids_for_status(value.state.status), value.id)
                 elif previous.state.status != value.state.status:
-                    self._remove_sorted(self.task_ids_by_status[previous.state.status], value.id)
-                    self._insert_sorted(self.task_ids_by_status[value.state.status], value.id)
+                    self._remove_sorted(self.task_ids_for_status(previous.state.status), value.id)
+                    self._insert_sorted(self.task_ids_for_status(value.state.status), value.id)
                 self.tasks[value.id] = value
                 self.next_id = max(self.next_id, value.id + 1)
             elif wtype == "submission":
@@ -338,10 +367,10 @@ class BaseStorage:
                 previous = self.submissions.get(value.id)
                 if previous is None:
                     self._insert_sorted(self.submission_ids, value.id)
-                    self._insert_sorted(self.submission_ids_by_status[value.status], value.id)
+                    self._insert_sorted(self.submission_ids_for_status(value.status), value.id)
                 elif previous.status != value.status:
-                    self._remove_sorted(self.submission_ids_by_status[previous.status], value.id)
-                    self._insert_sorted(self.submission_ids_by_status[value.status], value.id)
+                    self._remove_sorted(self.submission_ids_for_status(previous.status), value.id)
+                    self._insert_sorted(self.submission_ids_for_status(value.status), value.id)
                 if previous is not None and previous.request_id is not None:
                     request_key = (previous.conversation_id, previous.request_id)
                     if self.submission_ids_by_request.get(request_key) == value.id:
@@ -558,7 +587,7 @@ class BaseStorage:
 
     def scan_tasks_sync(self, query: Dict[str, Any], limit: int, cursor: Optional[Dict[str, Any]]) -> Page:
         order, after = self.scan_start(query.get("order"), cursor, "ascending")
-        ids = self.task_ids if query.get("status") is None else self.task_ids_by_status[query["status"]]
+        ids = self.task_ids if query.get("status") is None else self.task_ids_for_status(query["status"])
         values: List[Any] = []
         for rid in self._scan_ids(ids, order, after):
             if len(values) > limit:
@@ -580,7 +609,7 @@ class BaseStorage:
 
     def scan_submissions_sync(self, query: Dict[str, Any], limit: int, cursor: Optional[Dict[str, Any]]) -> Page:
         order, after = self.scan_start(query.get("order"), cursor, "ascending")
-        ids = self.submission_ids if query.get("status") is None else self.submission_ids_by_status[query["status"]]
+        ids = self.submission_ids if query.get("status") is None else self.submission_ids_for_status(query["status"])
         values: List[Any] = []
         for rid in self._scan_ids(ids, order, after):
             if len(values) > limit:

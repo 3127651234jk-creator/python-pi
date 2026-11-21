@@ -88,6 +88,7 @@ class JsonlStorage(MemoryStorage):
         self.check_global_ids(resolved)
         actions = self.prepare_document_actions(resolved)
         self.check_document_actions(actions)
+        self.check_record_statuses(resolved)
         try:
             payload = json.dumps({"seq": seq, "writes": self._encode_writes(resolved)}, ensure_ascii=True) + "\n"
         except (TypeError, UnicodeEncodeError, ValueError) as exc:
