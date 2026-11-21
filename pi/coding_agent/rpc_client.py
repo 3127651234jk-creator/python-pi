@@ -11,9 +11,24 @@ class RpcClient:
         self.process = None
         self.reader = None
         self.pending = {}
-        self.events = asyncio.Queue()
-        self.lock = asyncio.Lock()
+        # Created on first async use: on Python 3.9 asyncio primitives bind to
+        # the loop current at construction, and clients are often built before
+        # the asyncio.run() loop that uses them.
+        self._events: Optional[asyncio.Queue] = None
+        self._lock: Optional[asyncio.Lock] = None
         self.sequence = 0
+
+    @property
+    def events(self) -> asyncio.Queue:
+        if self._events is None:
+            self._events = asyncio.Queue()
+        return self._events
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def start(self, args: Optional[List[str]] = None, cwd: Optional[str] = None):
         if self.process:

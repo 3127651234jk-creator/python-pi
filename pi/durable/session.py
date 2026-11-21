@@ -48,15 +48,30 @@ class Session:
         self._commit_listeners: List[Callable[[CommitPublication], None]] = []
         self._creation_hooks: List[Callable] = []
         self._close_listeners: List[Callable[[], None]] = []
-        self._line_lock = asyncio.Lock()
+        # Created on first async use: on Python 3.9 asyncio.Lock binds to the
+        # loop current at construction, and create_session() is a synchronous
+        # API that commonly runs before asyncio.run().
+        self.__line_lock: Optional[asyncio.Lock] = None
         # Scheduler ownership spans task execution, beyond individual commits.
-        self._scheduler_lock = asyncio.Lock()
+        self.__scheduler_lock: Optional[asyncio.Lock] = None
         self._closing = False
         self._closed = False
         self._close_task: Optional[asyncio.Task] = None
         self._poison: Optional[BaseException] = None
         self._document_cache: Dict[str, Optional[Any]] = {}
         self.host = SessionHost(self)
+
+    @property
+    def _line_lock(self) -> asyncio.Lock:
+        if self.__line_lock is None:
+            self.__line_lock = asyncio.Lock()
+        return self.__line_lock
+
+    @property
+    def _scheduler_lock(self) -> asyncio.Lock:
+        if self.__scheduler_lock is None:
+            self.__scheduler_lock = asyncio.Lock()
+        return self.__scheduler_lock
 
     def now(self) -> int:
         source = self._now

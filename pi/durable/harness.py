@@ -197,7 +197,10 @@ class Harness:
         self.register_definition(compact_definition())
         from .tasks import tool_definition
         self.register_definition(tool_definition())
-        self._stop = asyncio.Event()
+        # Created on first use inside the running loop: on Python 3.9
+        # asyncio.Event binds to the loop current at construction, and
+        # harnesses are often built before the loop that runs them.
+        self.__stop: Optional[asyncio.Event] = None
         self._signals: Dict[int, asyncio.Event] = {}
         # Tool progress waiters survive from the execute phase to the settle
         # transaction, which is the commit that makes the result visible.
@@ -206,6 +209,12 @@ class Harness:
         # its derived view, reused while the head marker stays put.
         self._context_cache: Dict[int, ContextRange] = {}
         self._context_expiry_tasks: Dict[int, asyncio.Task] = {}
+
+    @property
+    def _stop(self) -> asyncio.Event:
+        if self.__stop is None:
+            self.__stop = asyncio.Event()
+        return self.__stop
 
     @staticmethod
     def _report_progress_error(error: BaseException) -> None:

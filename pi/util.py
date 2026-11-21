@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import AsyncIterator, Callable, Generic, Optional, Tuple, TypeVar, cast
+from typing import AsyncIterator, Callable, Generic, List, Optional, Tuple, TypeVar, cast
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -69,20 +69,30 @@ class AbortSignal:
     """Asyncio-friendly replacement for the DOM AbortSignal used by pi."""
 
     def __init__(self) -> None:
-        self._event = asyncio.Event()
+        # Created on first async use: on Python 3.9 asyncio.Event binds to the
+        # loop current at construction, and signals are often built before the
+        # loop that will wait on them exists.
+        self._event: Optional[asyncio.Event] = None
+        self._aborted = False
 
     @property
     def aborted(self) -> bool:
-        return self._event.is_set()
+        return self._aborted
 
     def abort(self) -> None:
-        self._event.set()
+        self._aborted = True
+        if self._event is not None:
+            self._event.set()
 
     def throw_if_aborted(self) -> None:
         if self.aborted:
             raise AbortError("Operation aborted")
 
     async def wait(self) -> None:
+        if self._aborted:
+            return
+        if self._event is None:
+            self._event = asyncio.Event()
         await self._event.wait()
 
     def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -93,7 +103,7 @@ class AbortSignal:
             return lambda: None
 
         async def waiter() -> None:
-            await self._event.wait()
+            await self.wait()
             listener()
 
         task = asyncio.get_running_loop().create_task(waiter())
@@ -112,18 +122,25 @@ class EventStream(Generic[T, U]):
     """
 
     def __init__(self, is_done: Callable[[T], bool], get_result: Callable[[T], U]) -> None:
-        self._queue: "asyncio.Queue[object]" = asyncio.Queue()
+        # Queue/Event are created on first use: on Python 3.9 they bind to the
+        # loop current at construction, and streams are often built before the
+        # loop that will consume them. Events pushed before that are buffered.
+        self._queue: Optional["asyncio.Queue[object]"] = None
+        self._pending: List[object] = []
         self._sentinel = object()
         self._is_done = is_done
         self._get_result = get_result
         self._result: Optional[U] = None
         self._ended = False
-        self._completion = asyncio.Event()
+        self._completion: Optional[asyncio.Event] = None
 
     def push(self, event: T) -> None:
         if self._ended:
             raise RuntimeError("EventStream already ended")
-        self._queue.put_nowait(event)
+        if self._queue is None:
+            self._pending.append(event)
+        else:
+            self._queue.put_nowait(event)
         if self._is_done(event):
             self.end(self._get_result(event))
 
@@ -132,21 +149,38 @@ class EventStream(Generic[T, U]):
             return
         self._result = result
         self._ended = True
-        self._completion.set()
-        self._queue.put_nowait(self._sentinel)
+        if self._completion is not None:
+            self._completion.set()
+        if self._queue is not None:
+            self._queue.put_nowait(self._sentinel)
 
     async def result(self) -> U:
-        await self._completion.wait()
+        if not self._ended:
+            if self._completion is None:
+                self._completion = asyncio.Event()
+            await self._completion.wait()
         return cast(U, self._result)
+
+    def _ensure_queue(self) -> "asyncio.Queue[object]":
+        if self._queue is None:
+            # Created inside the consumer's loop; replay what was pushed before.
+            self._queue = asyncio.Queue()
+            for event in self._pending:
+                self._queue.put_nowait(event)
+            self._pending.clear()
+            if self._ended:
+                self._queue.put_nowait(self._sentinel)
+        return self._queue
 
     def __aiter__(self) -> "EventStream[T, U]":
         return self
 
     async def __anext__(self) -> T:
-        event = await self._queue.get()
+        queue = self._ensure_queue()
+        event = await queue.get()
         if event is self._sentinel:
             # Keep completion visible to later and concurrent consumers.
-            self._queue.put_nowait(self._sentinel)
+            queue.put_nowait(self._sentinel)
             raise StopAsyncIteration
         return cast(T, event)
 

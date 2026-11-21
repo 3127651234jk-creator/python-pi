@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import time
+import weakref
 from dataclasses import replace
 from typing import Any, Dict, Optional
 from urllib.parse import quote
@@ -36,7 +37,19 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 _TOKEN_CACHE: Dict[str, tuple] = {}
-_TOKEN_LOCK: Optional[asyncio.Lock] = None
+# One lock per event loop: on Python 3.9 asyncio.Lock binds to the loop current
+# at construction, so a cached module-level lock breaks the second asyncio.run()
+# in the same process ("got Future attached to a different loop").
+_TOKEN_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _token_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _TOKEN_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TOKEN_LOCKS[loop] = lock
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +179,7 @@ async def vertex_access_token(account_path: Optional[str] = None) -> str:
     cached = _TOKEN_CACHE.get(cache_key)
     if cached and cached[1] > time.time() + 60:
         return cached[0]
-    global _TOKEN_LOCK
-    if _TOKEN_LOCK is None:
-        _TOKEN_LOCK = asyncio.Lock()
-    async with _TOKEN_LOCK:
+    async with _token_lock():
         cached = _TOKEN_CACHE.get(cache_key)
         if cached and cached[1] > time.time() + 60:
             return cached[0]
