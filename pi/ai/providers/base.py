@@ -6,7 +6,6 @@ import copy
 import inspect
 import ipaddress
 import json
-import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -446,7 +445,7 @@ class ProviderState:
 
     def __init__(self, model: Model, timestamp: int) -> None:
         self.model = model
-        self._partial = make_partial(model, int(time.time() * 1000))
+        self._partial = make_partial(model, timestamp)
         # Provider block index -> position in ``content``. Provider indices may
         # skip blocks the port does not materialize (e.g. redacted thinking).
         self._block_positions: Dict[int, int] = {}
