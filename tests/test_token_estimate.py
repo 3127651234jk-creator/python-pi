@@ -351,3 +351,18 @@ def test_compaction_clamp_message_uses_the_shared_divisor():
     tiny = clamp_message(message, 100)
     assert len(tiny.content) < len(message.content)
     assert estimate_text_tokens(tiny.content) <= 100
+
+
+def test_compaction_clamp_message_stays_within_budget_for_many_blocks():
+    from pi.agent.compaction import clamp_message
+
+    # 500 short text blocks used to blow past the budget: once `remaining` hit
+    # 0 the share was 0, and text[-0:] returned the whole block while every
+    # block still paid for a truncation marker.
+    message = UserMessage(
+        content=[TextContent(text="x" * 40) for _ in range(500)], timestamp=0)
+    max_chars = max(256, int(100 * CHARS_PER_TOKEN) - 1024)
+    clamped = clamp_message(message, 100)
+    kept = "".join(block.text for block in clamped.content if isinstance(block, TextContent))
+    assert len(kept) <= max_chars + 64  # one marker of slack
+    assert estimate_message_tokens(clamped) <= 100

@@ -87,14 +87,29 @@ def clamp_message(message: Message, max_tokens: int) -> Message:
     blocks = []
     remaining = max_chars
     for block in message.content:
-        if isinstance(block, TextContent):
-            share = min(remaining, max(1, int(max_chars * len(block.text) / total)))
-            head = share * 2 // 3
-            tail = share - head
-            blocks.append(TextContent(text=block.text[:head] + marker.format(len(block.text) - share) + block.text[-tail:]))
-            remaining -= share
-        else:
+        if not isinstance(block, TextContent):
             blocks.append(block)
+            continue
+        if not block.text:
+            blocks.append(block)
+            continue
+        # Budget exhausted: drop this block's text instead of slicing it with a
+        # zero share (text[0:] / text[-0:] would keep the whole block).
+        if remaining <= 1:
+            continue
+        share = min(remaining - 1, max(1, int(max_chars * len(block.text) / total)))
+        if share >= len(block.text):
+            blocks.append(block)
+            remaining -= len(block.text)
+            continue
+        head = share * 2 // 3
+        tail = share - head
+        marker_text = marker.format(len(block.text) - share)
+        text = block.text[:head] + (block.text[-tail:] if tail else "") + marker_text
+        # Charge the marker to the budget too, so many short blocks cannot
+        # multiply marker overhead far past max_chars.
+        remaining -= share + len(marker_text)
+        blocks.append(TextContent(text=text))
     return replace(message, content=blocks)
 
 
