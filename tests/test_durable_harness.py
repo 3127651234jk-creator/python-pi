@@ -282,6 +282,98 @@ def test_compact_cut_inside_last_entry_does_not_fault(tmp_path):
     asyncio.run(scenario())
 
 
+def test_compact_prefix_is_anchored_to_entry_not_message_index(tmp_path, monkeypatch):
+    """Entries committed between prepare and summarize must not shift the cut."""
+
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        try:
+            model = make_model()
+            model.context_window = 6000
+            harness = Harness(session, model)
+            harness.register_definition(compact_definition(keep_recent_tokens=1, reserve_tokens=1))
+            cid = await harness.create_conversation()
+
+            captured = {}
+
+            async def stream_once(model, messages, harness, **kwargs):
+                captured["prompt"] = messages
+                return AssistantMessage(content=[TextContent(text="summary")], api="faux",
+                                        provider="faux", model="faux", usage=Usage(),
+                                        stop_reason="stop", timestamp=0)
+
+            monkeypatch.setattr("pi.durable.harness._stream_once", stream_once)
+
+            def assistant(text):
+                return to_json(AssistantMessage(
+                    content=[TextContent(text=text)], api="faux", provider="faux", model="faux",
+                    usage=Usage(), stop_reason="stop", timestamp=0,
+                ))
+
+            async def change(tx):
+                first = await tx.append_entry(cid, {
+                    "kind": USER_ENTRY.kind,
+                    "model": [to_json(UserMessage(content="hi there", timestamp=0))],
+                })
+                await tx.append_entry(cid, {
+                    "kind": ASSISTANT_ENTRY.kind,
+                    "model": [assistant("PREFIX-A"), assistant("PREFIX-B")],
+                })
+                await tx.append_entry(cid, {
+                    "kind": USER_ENTRY.kind,
+                    "model": [to_json(UserMessage(content="recent question", timestamp=0))],
+                })
+                kept = await tx.append_entry(cid, {
+                    "kind": ASSISTANT_ENTRY.kind,
+                    "model": [assistant("KEPT-MARKER" + "k" * 24000)],
+                })
+                return first.id, kept.id
+
+            first_id, kept_id = await session.commit(change)
+
+            # Run prepare alone, then grow the transcript before summarize.
+            task_id = await harness.submit_compact_task(cid)
+            task = await harness._get_task(task_id)
+            definition = harness.definitions[task.kind]
+            await harness._reserve(task.id, definition, task)
+            current = await harness._get_task(task.id)
+            runtime = TaskRuntime(harness, task.id, asyncio.Event())
+            await definition.phases["prepare"](current, runtime, harness)
+
+            prepared = await harness._get_task(task.id)
+            assert prepared.state.checkpoint["phase"] == "summarize"
+            assert prepared.state.checkpoint["head_entry_id"] == kept_id
+
+            async def append_edit(tx):
+                # An omit edit shrinks the prefix, shifting every later message
+                # index — a stored index would now slice past the head entry.
+                await tx.append_entry(cid, {
+                    "kind": SYSTEM_ENTRY.kind,
+                    "edits": [{"target": first_id, "action": "omit"}],
+                })
+
+            await session.commit(append_edit)
+            await harness.run_pending_tasks()
+
+            record = await harness._get_task(task_id)
+            assert record.state.status == "terminal"
+            assert record.state.outcome.status == "completed"
+            assert record.state.outcome.result["compacted"] is True
+
+            digest = captured["prompt"][1].content
+            assert "PREFIX-A" in digest
+            assert "recent question" in digest
+            assert "KEPT-MARKER" not in digest
+
+            transcript = await harness.transcript(cid)
+            assert transcript[-1].kind == COMPACTION_ENTRY.kind
+            assert transcript[-1].head == kept_id
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
 def test_durable_generation_retries_transient_stream_error(tmp_path):
     """A transient stream drop retries with backoff before the turn commits."""
 

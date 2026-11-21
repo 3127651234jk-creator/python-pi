@@ -290,18 +290,30 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
                 "phase": "settle", "summary": decision["summary"], "head_entry_id": head_entry, "tokens": total}))
             return
         await runtime.commit(lambda tx, current: TaskState(status="running",
-            checkpoint={"phase": "summarize", "cut": cut, "head_entry_id": head_entry,
+            checkpoint={"phase": "summarize", "head_entry_id": head_entry,
                         "tokens": total, "attempt": 1}))
 
     async def summarize(task, runtime: TaskRuntime, harness: Harness) -> None:
         entries = await harness.context_entries(task.conversation_id)
         edits = context_edits(entries)
+        # The cut is anchored to the head entry, not a message index: entries
+        # can be committed (and edits change earlier contributions) between
+        # prepare and summarize, so a stored index would slice the wrong prefix.
+        head_entry_id = task.state.checkpoint["head_entry_id"]
+        index = next((i for i, entry in enumerate(entries) if entry.id == head_entry_id), None)
+        if index is None:
+            # Another head marker already dropped the planned prefix, so there
+            # is nothing left for this compaction to summarize.
+            await runtime.commit(lambda tx, current: TaskState(status="terminal",
+                outcome=TaskOutcome(status="completed",
+                                    result={"compacted": False, "stale": True,
+                                            "tokens": task.state.checkpoint.get("tokens")})))
+            return
         messages: List[Any] = []
-        for entry in entries:
+        for entry in entries[:index]:
             for item in entry_messages(entry, edits.get(entry.id)):
                 messages.append(item if not isinstance(item, dict) else message_from_json(item))
-        cut = task.state.checkpoint["cut"]
-        digest = "\n".join(f"{getattr(m, 'role', 'message')}: {ai_to_json(m)}" for m in messages[:cut])
+        digest = "\n".join(f"{getattr(m, 'role', 'message')}: {ai_to_json(m)}" for m in messages)
         # Bound the summarizer input so the call itself fits the window.
         chunk_budget = max(1, (harness.model.context_window - reserve_tokens - 4096))
         digest = digest[: chunk_budget * 4]
