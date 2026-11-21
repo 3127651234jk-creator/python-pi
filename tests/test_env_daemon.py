@@ -445,6 +445,8 @@ def test_file_operations_match_the_local_env(tmp_path):
 
 def test_handle_close_waits_for_operations_in_flight(monkeypatch):
     """A handle closes after the operations already running on it, like Rust's ``Arc<File>``."""
+    import threading
+
     from pi.env import daemon as daemon_module
 
     class _TestHandle(daemon_module.ClosableHandle):
@@ -468,12 +470,53 @@ def test_handle_close_waits_for_operations_in_flight(monkeypatch):
     monkeypatch.setattr(daemon_module, "MAX_HANDLES", 1)
     server = object.__new__(daemon_module.Server)
     server.handles = {1: object()}
+    server.handle_lock = threading.Lock()
     server.next_handle = 2
     overflow = _TestHandle()
     with pytest.raises(daemon_module.Failure) as failure:
         server.insert(overflow)
     assert failure.value.code == "EMFILE"
     assert overflow.released is True
+
+
+def test_handle_ids_stay_unique_under_concurrent_insert():
+    """``insert`` runs on executor threads: the check, id increment, and store are one atomic step."""
+    import threading
+
+    from pi.env import daemon as daemon_module
+
+    class Handle:
+        def close(self):
+            pass
+
+    server = object.__new__(daemon_module.Server)
+    server.handles = {}
+    server.handle_lock = threading.Lock()
+    server.next_handle = 1
+
+    workers_count = 8
+    per_worker = 200
+    barrier = threading.Barrier(workers_count)
+    ids = []
+    ids_lock = threading.Lock()
+
+    def insert_many():
+        barrier.wait()
+        local = [server.insert(Handle()) for _ in range(per_worker)]
+        with ids_lock:
+            ids.extend(local)
+
+    workers = [threading.Thread(target=insert_many) for _ in range(workers_count)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert len(ids) == workers_count * per_worker
+    assert len(set(ids)) == len(ids)
+    assert sorted(ids) == list(range(1, len(ids) + 1))
+    assert len(server.handles) == len(ids)
+    assert server.next_handle == len(ids) + 1
 
 
 def test_stdin_shell_command_receives_eof(tmp_path, monkeypatch):

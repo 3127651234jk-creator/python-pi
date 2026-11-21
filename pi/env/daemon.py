@@ -461,6 +461,8 @@ class Server:
         self.output = output
         self.tmpdir = tmpdir
         self.handles: Dict[int, Any] = {}
+        # ``insert`` runs on executor threads; the check, id increment, and store are one step.
+        self.handle_lock = threading.Lock()
         self.next_handle = 1
         self.controls: Dict[int, Control] = {}
         self.groups = groups
@@ -497,13 +499,14 @@ class Server:
         return found
 
     def insert(self, handle: Any) -> int:
-        if len(self.handles) >= MAX_HANDLES:
-            handle.close()
-            raise Failure("EMFILE", "EMFILE: too many open files")
-        handle_id = self.next_handle
-        self.next_handle += 1
-        self.handles[handle_id] = handle
-        return handle_id
+        with self.handle_lock:
+            if len(self.handles) >= MAX_HANDLES:
+                handle.close()
+                raise Failure("EMFILE", "EMFILE: too many open files")
+            handle_id = self.next_handle
+            self.next_handle += 1
+            self.handles[handle_id] = handle
+            return handle_id
 
     # -- dispatch --------------------------------------------------------------
 
