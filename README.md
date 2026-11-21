@@ -671,7 +671,7 @@ asyncio.run(main())
 | `pi.durable.testing` | `packages/durable/src/testing` | 一致性套件：`create_storage_conformance`（23 个用例 × 任意后端）、`create_env_conformance`（21 个用例 × 任意 ExecutionEnv）、`createExpectAssertions` 对应的 `ConformanceAssertions`、存储基准（`seed_storage_benchmark`/`measure_*_benchmarks`）与 pytest 适配（`runner.py`）；套件与测试运行器无关，`tests/test_durable_*_conformance.py` 驱动 |
 | `pi.durable.live` / `pi.durable.output.Progress` | `harness/live.ts`、`harness/output.ts` | `pi.live` 文档：生成中的 partial 与工具运行输出/详情；`Progress` 自适应提交（首个变更立即提交、最多一个在途、按写入字节 100 KiB/s 拉长间隔） |
 
-进度与 live 状态：`ProgressPolicy` 的 `partial_interval_ms` 与 `output_interval_ms` 默认都是 100 ms；缺省/`None` 取默认，`0` 保留，负数、NaN/无穷、bool 和错误类型直接报错。生成流按 partial 节流提交到 `pi.live.generation`；工具通过 `on_update` 累积运行输出，按 `OutputBuffer` 窗口截断并记录丢弃字节/行数，提交到 `pi.live.tools`。提交成功后才对订阅者可见；写入失败通过 `Harness.on_report` 暴露并拒绝等待者。`Progress.stop()` 取消定时器、等待在途提交并返回待最终事务结算的 waiter；settle/abort/retry/关闭/异常都走收尾，终态之后不再产生进度写入。
+进度与 live 状态：`ProgressPolicy` 的 `partial_interval_ms` 与 `output_interval_ms` 默认都是 100 ms；缺省/`None` 取默认，`0` 保留，负数、NaN/无穷、bool 和错误类型直接报错。生成流按 partial 节流提交到 `pi.live.generation`；generation 工具轮次中的工具通过 `on_update` 累积运行输出，按 `OutputBuffer` 窗口截断并记录丢弃字节/行数，提交到 `pi.live.tools`（slot 由 generation 在轮次开始时创建，独立 `pi.tool` 任务不写入 live）。提交成功后才对订阅者可见；写入失败通过 `Harness.on_report` 暴露并拒绝等待者。`Progress.stop()` 取消定时器、等待在途提交并返回待最终事务结算的 waiter；settle/abort/retry/关闭/异常都走收尾，终态之后不再产生进度写入。
 
 恢复边界：重开存储只恢复已提交的 partial 和任务 checkpoint；未提交的尾部不可见，也不会被当成完整回答。running 任务恢复为 pending 后重新执行 provider 请求，settle 只追加一条最终 assistant 条目；abort/fault/orphan 会把已提交 partial 转成 `stop_reason=aborted` 的 assistant 条目并清空 live，避免重复结算。
 

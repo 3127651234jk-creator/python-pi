@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from pi.agent.types import AgentToolResult
+from pi.agent.types import AgentTool, AgentToolResult
 from pi.ai.models import Model
 from pi.ai.retry import RetryPolicy
 from pi.ai.types import (
@@ -18,6 +18,7 @@ from pi.ai.types import (
     StreamStartEvent,
     TextContent,
     TextDeltaEvent,
+    ToolCall,
     Usage,
 )
 from pi.durable.entries import ASSISTANT_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
@@ -103,13 +104,27 @@ class StreamingTool:
         return AgentToolResult(content=[TextContent(text=text)], details={"done": True})
 
 
-def test_p08_tool_output_window_and_dropped_counts(tmp_path):
+def test_p08_tool_output_window_and_dropped_counts(tmp_path, monkeypatch):
+    responses = {"count": 0}
+
+    async def stream_once(model, messages, harness, on_partial=None, tools=None):
+        responses["count"] += 1
+        if responses["count"] == 1:
+            return AssistantMessage(content=[ToolCall(id="c1", name="stream", arguments={})],
+                                    api="faux", provider="faux", model="faux",
+                                    usage=Usage(), stop_reason="toolUse", timestamp=0)
+        return AssistantMessage(content=[TextContent(text="done")], api="faux", provider="faux",
+                                model="faux", usage=Usage(), stop_reason="stop", timestamp=0)
+
+    monkeypatch.setattr("pi.durable.harness._stream_once", stream_once)
+
     async def scenario():
         session = create_session(JsonlStorage(str(tmp_path / "s.jsonl")))
         harness = Harness(session, make_model(), progress={"output_interval_ms": 20})
-        harness.register_tools({"stream": StreamingTool()})
+        harness.register_tools({"stream": AgentTool(name="stream", description="stream",
+                                                    execute=StreamingTool().execute)})
         cid = await harness.create_conversation()
-        await harness.submit_tool_task(cid, "stream", {})
+        await harness.submit_input(cid, "run the tool")
         running = asyncio.create_task(harness.run_pending_tasks())
 
         async def saw_progress():
@@ -127,12 +142,11 @@ def test_p08_tool_output_window_and_dropped_counts(tmp_path):
 
         await running
         transcript = await harness.transcript(cid)
-        assert [entry.kind for entry in transcript] == [TOOL_RESULT_ENTRY.kind]
-        assert transcript[0].model[0].content[0].text.count("行😀") == 30
-        live = await harness.live(cid)
-        slot = live["tools"][0]
-        assert slot["status"] == "done" and slot["entry"] == transcript[0].id
-        assert "output" not in slot and "dropped_bytes" not in slot
+        tool_result = next(entry for entry in transcript if entry.kind == TOOL_RESULT_ENTRY.kind)
+        assert tool_result.model[0].content[0].text.count("行😀") == 30
+        # The slots belong to the generation's tool round; the ended round
+        # clears them (TS endRun deletes live.tools).
+        assert await harness.live(cid) == {}
         await session.close()
 
     asyncio.run(scenario())
@@ -323,9 +337,9 @@ def test_p07_final_transaction_failure_is_observable_and_leaves_no_entry(tmp_pat
         assert tasks[0].state.outcome.status == "faulted"
         assert "final transaction rejected" in tasks[0].state.outcome.error["message"]
         assert await harness.transcript(cid) == []
-        live = await harness.live(cid)
-        assert live["tools"][0]["status"] == "done"
-        assert "output" not in live["tools"][0]
+        # A standalone pi.tool task has no live slot (TS creates slots only for
+        # a generation's tool round), so the fault leaves no presentation.
+        assert await harness.live(cid) == {}
         await session.close()
 
     asyncio.run(scenario())

@@ -32,15 +32,6 @@ def tool_slot(live: Dict[str, Any], task_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def ensure_tool_slot(live: Dict[str, Any], task_id: int, call_id: str, name: str) -> Dict[str, Any]:
-    slots = live.setdefault("tools", [])
-    slot = tool_slot(live, task_id)
-    if slot is None:
-        slot = {"task_id": task_id, "call_id": call_id, "name": name, "status": "pending"}
-        slots.append(slot)
-    return slot
-
-
 def clear_progress(slot: Dict[str, Any]) -> None:
     for key in ("output", "dropped_bytes", "dropped_lines", "details", "diagnostics"):
         slot.pop(key, None)

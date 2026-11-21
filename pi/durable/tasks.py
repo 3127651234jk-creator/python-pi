@@ -22,7 +22,7 @@ from ..ai.estimate import estimate_message_tokens
 from . import harness as harness_module
 from .entries import COMPACTION_ENTRY, TOOL_RESULT_ENTRY
 from .harness import Harness, TaskRuntime
-from .live import LiveDoc, ensure_tool_slot, finish_slot, tool_slot
+from .live import LiveDoc, finish_slot, tool_slot
 from .output import OutputLimits, Progress, bound_output
 from .prompt import context_edits, entry_messages
 from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, utf8_byte_length
@@ -71,9 +71,13 @@ def tool_definition() -> TaskDefinition:
 
         async def start(tx, current):
             live = await tx.doc(LiveDoc, conversation_id)
-            slot = ensure_tool_slot(live.value, task.id, call_id, tool_name)
-            slot["status"] = "running"
-            live.dirty = True
+            slot = tool_slot(live.value, task.id)
+            # Only a generation's tool round lists this task (TS startToolRound
+            # writes the slots); a standalone pi.tool task has no live
+            # presentation and leaves none behind.
+            if slot is not None:
+                slot["status"] = "running"
+                live.dirty = True
             return None
 
         await runtime.commit(start)
@@ -89,7 +93,9 @@ def tool_definition() -> TaskDefinition:
 
             async def change(tx, current):
                 live = await tx.doc(LiveDoc, conversation_id)
-                slot = ensure_tool_slot(live.value, task.id, call_id, tool_name)
+                slot = tool_slot(live.value, task.id)
+                if slot is None:
+                    return None
                 slot["status"] = "running"
                 slot["output"] = bounded.text
                 slot["dropped_bytes"] = bounded.dropped_bytes

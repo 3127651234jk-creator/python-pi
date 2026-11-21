@@ -1091,11 +1091,18 @@ def generation_definition(stream_fn=None) -> TaskDefinition:
             )
             if calls and response.stop_reason not in ("error", "aborted"):
                 children = []
+                slots = []
                 for call in calls:
                     child = await tx.create_task(harness.definitions["pi.tool"],
                         {"tool": call.name, "arguments": call.arguments, "call_id": call.id},
                         {"ownership": {"kind": "conversation"}, "conversation_id": current.conversation_id})
                     children.append(child.id)
+                    slots.append({"task_id": child.id, "call_id": call.id,
+                                  "name": call.name, "status": "pending"})
+                # The round's presentation belongs to the generation (TS
+                # startToolRound): slots exist only while their round runs, and
+                # the tool tasks never create them.
+                live.value["tools"] = slots
                 return TaskState(status="waiting", on=children, policy="allSettled",
                                  checkpoint={"phase": "after_tools", "assistant": entry.id, "tools": children})
             if continuation is not None:
