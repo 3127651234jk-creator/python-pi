@@ -116,6 +116,10 @@ def test_callback_settings_keep_fixed_port_and_uri():
     assert exact["listen_host"] == "127.0.0.1"
     assert exact["fixed_redirect_url"] == "http://localhost:8080/oauth/callback"
 
+    port_only = callback_settings({"callback_url": "http://127.0.0.1:8080"})
+    assert port_only["path"] == "/callback"
+    assert port_only["fixed_redirect_url"] == "http://127.0.0.1:8080/callback"
+
     dynamic = callback_settings({})
     assert dynamic["fixed_redirect_url"] is None
     assert dynamic["port"] is None

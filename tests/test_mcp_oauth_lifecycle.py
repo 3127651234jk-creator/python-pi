@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import socket
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -171,6 +172,12 @@ async def send_callback(redirect_url, query):
     return status.decode()
 
 
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def authorization_url(messages):
     for message in messages:
         if "Open: " in message:
@@ -312,6 +319,30 @@ def test_o07_wrong_state_or_path_does_not_authorize(tmp_path, monkeypatch):
         assert not manager.oauth_store.get(key).get("access")
         assert not fake.token_requests
 
+        status = await send_callback(redirect, {"code": "auth-code", "state": query["state"][0]})
+        assert "200" in status
+        await asyncio.wait_for(login, 5)
+        assert fake.token_requests[-1]["code"] == "auth-code"
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_o07_callback_url_with_port_only_keeps_callback_path(tmp_path, monkeypatch):
+    fake = FakeOAuthMcp()
+    install(monkeypatch, fake)
+    messages = []
+    port = free_port()
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path, {"callback_url": f"http://127.0.0.1:{port}"}))
+        manager.notify = messages.append
+        await manager.reload()
+        login = asyncio.create_task(manager.oauth_login("remote"))
+        await wait_for(lambda: any("Open: " in message for message in messages))
+        query = parse_qs(urlsplit(authorization_url(messages)).query)
+        redirect = query["redirect_uri"][0]
+        assert redirect == f"http://127.0.0.1:{port}/callback"
         status = await send_callback(redirect, {"code": "auth-code", "state": query["state"][0]})
         assert "200" in status
         await asyncio.wait_for(login, 5)

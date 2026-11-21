@@ -649,7 +649,9 @@ def callback_settings(oauth: dict) -> dict:
     port = parts.port if parts.port else settings["callback_port"]
     fixed = None
     if parts.port:
-        fixed = raw
+        # The callback server only answers on `path`, so a configured URL without
+        # one would advertise a redirect the local server refuses with 404.
+        fixed = f"{parts.scheme}://{parts.netloc}{path}"
     elif port is not None:
         display = f"[{host}]" if ":" in host else host
         fixed = f"http://{display}:{port}{path}"
