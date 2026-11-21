@@ -620,6 +620,12 @@ class ExtensionManager:
         self.agent.tools.extend(api.tools)
         self.commands.update(api.commands)
         self.context.commands = self.commands
+        # Initial loads and reloads both pass through here, so re-apply the run's
+        # --tools / --exclude-tools selection and rebuild the system prompt from
+        # the new loadout. Lazy import: cli imports this module at load time.
+        from .cli import apply_tool_selection
+
+        apply_tool_selection(self.agent)
 
     async def _load_python(self, path: Path) -> None:
         name = "_pi_extension_" + uuid.uuid4().hex

@@ -192,6 +192,55 @@ def test_extension_refresh_tools_honors_selection(tmp_path):
     assert names_of(agent) == ["read"]
 
 
+def test_rpc_reload_extensions_honors_selection_and_refreshes_prompt(tmp_path):
+    """RPC reload goes through _seal: --tools still filters and the prompt is rebuilt."""
+    import asyncio
+    import io
+    import json
+
+    from pi.agent.agent import Agent
+    from pi.ai.models import resolve_model
+    from pi.coding_agent.config import Configuration
+    from pi.coding_agent.extensions import ExtensionManager
+    from pi.coding_agent.rpc import JsonWriter, RpcServer
+    from pi.coding_agent.system_prompt import SystemPromptOptions, build_system_prompt
+
+    directory = tmp_path / ".pi/extensions"
+    directory.mkdir(parents=True)
+    (directory / "demo.py").write_text(
+        "from pi.agent.types import AgentTool, AgentToolResult\n"
+        "from pi.ai.types import TextContent\n"
+        "def setup(api):\n"
+        "    async def echo(call_id, params, signal=None, on_update=None):\n"
+        "        return AgentToolResult(content=[TextContent(text='ok')])\n"
+        "    api.register_tool(AgentTool(name='echo', label='echo', description='Echo',"
+        " parameters={}, execute=echo))\n",
+        encoding="utf-8")
+
+    async def check():
+        options = SystemPromptOptions(cwd=str(tmp_path), selected_tools=["read", "bash"])
+        agent = Agent(resolve_model("faux"), tools=[tool("read"), tool("bash")],
+                      system_prompt=build_system_prompt(options))
+        agent._system_prompt_options = options
+        agent._tool_selection = select(["--tools", "read"])
+        manager = ExtensionManager(Configuration(str(tmp_path), str(tmp_path / "user")), agent)
+        try:
+            output = io.StringIO()
+            server = RpcServer(agent, JsonWriter(output), extensions=manager)
+            await server.dispatch({"id": "reload", "type": "reload_extensions"})
+            assert json.loads(output.getvalue())["success"]
+            # The extension tool is excluded by --tools, and the stale bash rule
+            # leaves the prompt with the tool that went away.
+            assert names_of(agent) == ["read"]
+            assert options.selected_tools == ["read"]
+            assert "Use bash for file operations like ls, rg, find" not in agent.system_prompt
+            assert agent.messages[0].content == agent.system_prompt
+        finally:
+            await manager.close()
+
+    asyncio.run(check())
+
+
 # ---------------------------------------------------------------------------
 # +name/-name modifiers (F-CA-01)
 # ---------------------------------------------------------------------------
