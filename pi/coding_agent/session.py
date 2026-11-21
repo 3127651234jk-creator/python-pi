@@ -619,7 +619,7 @@ class SessionManager:
             entries.append(entry)
             leaf = entry.id
         self.session_file = path
-        self._incomplete_tail_offset = None
+        self._incomplete_tail_offset = parsed.get("incomplete_tail_offset")
         self.entries = entries
         self.leaf_id = leaf
         self.name = parsed["name"]

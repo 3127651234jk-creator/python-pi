@@ -292,20 +292,35 @@ def custom_to_ts_entry(kind: str, data: dict) -> Optional[dict]:
 
 
 def read_ts_file(path: str) -> dict:
-    """Parse a TS session file into {'name', 'records': [record...]} with messages converted.
+    """Parse a TS session file into {'name', 'records': [...], 'incomplete_tail_offset': ...}.
 
     Each returned record is ``{'id', 'parent_id', 'message'?|'custom'?|'name'?}``.
+    A crash can leave a half-written final line. Like the native reader, an
+    unterminated tail that fails to parse is tolerated and its byte offset is
+    reported so the next append truncates it before writing; corruption in a
+    newline-terminated line still raises.
     """
     import json
 
     records: List[Dict[str, Any]] = []
     name = ""
-    with open(path, "r", encoding="utf-8-sig") as handle:
-        for line in handle:
-            line = line.strip()
+    incomplete_tail_offset = None
+    with open(path, "rb") as handle:
+        while True:
+            offset = handle.tell()
+            raw_line = handle.readline()
+            if not raw_line:
+                break
+            try:
+                line = raw_line.decode("utf-8-sig").strip()
+                record = json.loads(line) if line else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                if not raw_line.endswith(b"\n"):
+                    incomplete_tail_offset = offset
+                    break
+                raise ValueError(f"Invalid session JSON in {path} at byte {offset}") from None
             if not line:
                 continue
-            record = json.loads(line)
             kind = record.get("type")
             if kind == "session":
                 continue  # header
@@ -329,7 +344,7 @@ def read_ts_file(path: str) -> dict:
                 # Unknown TS entry types (usage, context_edit, label, ...) round-trip opaquely.
                 entry["custom"] = {"kind": "ts_" + str(kind), "data": record}
             records.append(entry)
-    return {"name": name, "records": records}
+    return {"name": name, "records": records, "incomplete_tail_offset": incomplete_tail_offset}
 
 
 def compaction_first_kept_id(branch, entry_id: str, data: dict) -> str:

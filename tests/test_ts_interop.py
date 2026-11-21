@@ -202,8 +202,8 @@ def test_append_after_ts_load_stays_in_ts_tree(tmp_path):
         ("user", "first"), ("assistant", None), ("user", "third")]
 
 
-def test_load_ts_resets_incomplete_tail_offset(tmp_path):
-    """Loading a TS session must drop a pending truncation offset."""
+def test_load_ts_replaces_previous_incomplete_tail_offset(tmp_path):
+    """Loading a TS session adopts that file's own truncation offset."""
     native = tmp_path / "native.jsonl"
     native.write_text(json.dumps({"type": "message", "id": "n1", "parent_id": None, "timestamp": "t",
                                   "message": {"role": "user", "content": "native", "timestamp": 1}}) + "\n"
@@ -221,6 +221,39 @@ def test_load_ts_resets_incomplete_tail_offset(tmp_path):
     assert os.path.getsize(path) > size_before
     assert text.startswith('{"type": "session"')
     assert "hello" in text and "after" in text
+
+
+@pytest.mark.parametrize("tail", [b'{"type":"message","id":"e10","parentId":"e9"', b'{"text":"\xe4'])
+def test_load_ts_tolerates_truncated_tail_then_append(tmp_path, tail):
+    """A crash-truncated final line must not block resuming a TS session."""
+    path = write_fixture(tmp_path)
+    clean_roles = [message.role for message in SessionManager(
+        session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path)).load(path)]
+    with open(path, "ab") as handle:
+        handle.write(tail)
+
+    manager = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    assert [message.role for message in manager.load(path)] == clean_roles
+    assert manager._incomplete_tail_offset is not None
+
+    manager.append(UserMessage(content="after crash", timestamp=10))
+    records = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    assert records[-1]["type"] == "message"
+    assert records[-1]["message"]["content"] == "after crash"
+    assert records[-1]["parentId"] == "e9"
+
+    reloaded = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path))
+    assert [message.role for message in reloaded.load(path)] == clean_roles + ["user"]
+    assert reloaded.leaf_id == records[-1]["id"]
+
+
+def test_load_ts_rejects_corruption_in_complete_line(tmp_path):
+    """Corruption in a newline-terminated TS line is still fatal."""
+    path = write_fixture(tmp_path)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"broken":\n')
+    with pytest.raises(ValueError, match="ts-session.jsonl"):
+        SessionManager(session_dir=str(tmp_path / "sessions"), cwd=str(tmp_path)).load(path)
 
 
 def test_metadata_appends_after_ts_load_use_ts_records(tmp_path):
