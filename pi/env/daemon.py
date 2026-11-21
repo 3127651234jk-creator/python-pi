@@ -1981,7 +1981,12 @@ async def respond_long(server: Server, request_id: int, op: str, json: Any, cont
 
 
 def parse_frame(buffer: bytearray) -> Optional[Tuple[int, int, Any, bytes]]:
-    """Parse one frame from ``buffer``; ``None`` when more bytes are needed. Raises ``ValueError`` on corrupt framing."""
+    """Parse one frame from ``buffer``; ``None`` when more bytes are needed.
+
+    A frame whose JSON body is malformed still yields a frame, with ``json`` set to ``None``:
+    the frame boundary is intact, so only that request fails. ``ValueError`` is reserved for a
+    corrupt length prefix, after which the stream can no longer be framed.
+    """
     if len(buffer) < 4:
         return None
     length = int.from_bytes(buffer[:4], "big")
@@ -1996,13 +2001,14 @@ def parse_frame(buffer: bytearray) -> Optional[Tuple[int, int, Any, bytes]]:
         kind = body[0]
         request_id = int.from_bytes(body[1:5], "big")
         json_length = int.from_bytes(body[5:9], "big")
-        if 9 + json_length > length:
-            raise ValueError("Corrupt frame")
-        try:
-            json = json_module.loads(bytes(body[9 : 9 + json_length]).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise ValueError("Corrupt frame") from None
-        payload = bytes(body[9 + json_length :])
+        json: Any = None
+        payload = b""
+        if 9 + json_length <= length:
+            try:
+                json = json_module.loads(bytes(body[9 : 9 + json_length]).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                pass  # Answered as an invalid request by the dispatcher.
+            payload = bytes(body[9 + json_length :])
     finally:
         body.release()
         view.release()

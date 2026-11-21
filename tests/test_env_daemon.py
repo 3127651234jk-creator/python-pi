@@ -6,7 +6,9 @@ reconnection (``packages/env``'s ``test/differential`` and unit concerns, in Pyt
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -710,5 +712,97 @@ def test_watch_coverage_failure_maps_to_invalid(tmp_path):
             await environment.cleanup(Context())
             connection.close()
             await connection.wait_closed()
+
+    asyncio.run(main())
+
+
+def _raw_frame(kind: int, request_id: int, body: bytes) -> bytes:
+    return struct.pack(">IBII", 9 + len(body), kind, request_id, len(body)) + body
+
+
+async def _read_raw_frame(stream):
+    header = await stream.readexactly(4)
+    body = await stream.readexactly(int.from_bytes(header, "big"))
+    json_length = int.from_bytes(body[5:9], "big")
+    return (
+        body[0],
+        int.from_bytes(body[1:5], "big"),
+        json.loads(body[9 : 9 + json_length]),
+        body[9 + json_length :],
+    )
+
+
+def test_parse_frame_reports_malformed_json_per_request():
+    """A frame with a bad JSON body is handed to the dispatcher with ``json=None``; framing stays intact."""
+    from pi.env import daemon as daemon_module
+
+    for body in (b"{not json", b"\xff\xfe"):
+        buffer = bytearray(_raw_frame(daemon_module.REQUEST, 7, body))
+        assert daemon_module.parse_frame(buffer) == (daemon_module.REQUEST, 7, None, b"")
+        assert buffer == bytearray()
+
+    invalid_json_length = bytearray(struct.pack(">IBII", 9 + 2, daemon_module.REQUEST, 8, 100) + b"{}")
+    assert daemon_module.parse_frame(invalid_json_length) == (daemon_module.REQUEST, 8, None, b"")
+
+    # A corrupt length prefix still ends the stream: frames can no longer be delimited.
+    with pytest.raises(ValueError):
+        daemon_module.parse_frame(bytearray(b"\x00\x00\x00\x01"))
+    with pytest.raises(ValueError):
+        daemon_module.parse_frame(bytearray((17 * 1024 * 1024).to_bytes(4, "big")))
+
+
+def test_bad_json_frame_fails_only_that_request(tmp_path):
+    """A malformed frame's request fails alone; commands already running keep going and report back."""
+    from pi.env import daemon as daemon_module
+
+    async def main():
+        token = "0f" * 16
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "pi.env.daemon",
+            "serve",
+            "--token",
+            token,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        assert process.stdin is not None and process.stdout is not None
+        try:
+            sync = await asyncio.wait_for(process.stdout.readline(), 10)
+            assert sync == f"PI-ENV {token}\n".encode("ascii")
+
+            exec_id = 2
+            request = {
+                "op": "exec",
+                "cwd": str(tmp_path),
+                "argv": [sys.executable, "-c", "import time; time.sleep(0.5); print('survived')"],
+            }
+            process.stdin.write(_raw_frame(daemon_module.REQUEST, exec_id, json.dumps(request).encode()))
+            # Behind the command: a request frame whose JSON body cannot be parsed.
+            process.stdin.write(_raw_frame(daemon_module.REQUEST, 3, b"{not json"))
+            await process.stdin.drain()
+
+            error = None
+            output_text = ""
+            deadline = asyncio.get_running_loop().time() + 20
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                kind, request_id, body, payload = await asyncio.wait_for(_read_raw_frame(process.stdout), remaining)
+                if kind == daemon_module.ERROR and request_id == 3:
+                    error = body
+                elif kind == daemon_module.EVENT and request_id == exec_id:
+                    output_text += payload.decode()
+                elif kind == daemon_module.RESULT and request_id == exec_id:
+                    assert body.get("exitCode") == 0
+                    break
+
+            assert error == {"code": "EINVAL", "message": "invalid JSON"}
+            assert "survived" in output_text
+            assert process.returncode is None
+        finally:
+            process.kill()
+            await process.wait()
 
     asyncio.run(main())
