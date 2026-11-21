@@ -14,7 +14,7 @@ import httpx
 
 from pi.agent.agent import Agent
 from pi.ai.models import Model, ModelCost, resolve_model
-from pi.ai.providers import amazon_bedrock, google, openai_completions, openai_responses
+from pi.ai.providers import amazon_bedrock, anthropic, google, openai_completions, openai_responses
 from pi.ai.providers.base import SimpleStreamOptions
 from pi.ai.types import (
     AssistantMessage,
@@ -22,6 +22,7 @@ from pi.ai.types import (
     ImageContent,
     SystemMessage,
     TextContent,
+    ThinkingContent,
     Tool,
     ToolCall,
     ToolResultMessage,
@@ -235,8 +236,6 @@ def test_responses_replay_omits_item_id_for_other_models():
 
 
 def test_compound_ids_stay_distinct_for_anthropic_and_bedrock():
-    from pi.ai.providers import anthropic
-
     message = AssistantMessage(content=[
         ToolCall(id="call_1|fc_2", name="echo", arguments={}),
         ToolCall(id="call_1|fc_3", name="echo", arguments={}),
@@ -309,3 +308,35 @@ def test_rpc_get_state_reports_compaction():
 
     records = asyncio.run(check())
     assert records[0]["data"]["isCompacting"] is True
+
+
+# ---------------------------------------------------------------------------
+# Unicode surrogates
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_sanitizes_lone_surrogates_before_json_encoding():
+    lone = "\ud83d"
+    message = AssistantMessage(
+        content=[TextContent(text=f"answer {lone}"), ThinkingContent(thinking=f"think {lone}", thinking_signature="sig")],
+        api="anthropic-messages", provider="anthropic", model="test",
+        usage=Usage(), stop_reason="toolUse", timestamp=0)
+    result = ToolResultMessage(tool_call_id="call", tool_name="echo",
+                               content=[TextContent(text=f"result {lone}")], is_error=False, timestamp=0)
+    context = TranscriptContext([
+        SystemMessage(content=f"system {lone}", timestamp=0),
+        UserMessage(content=f"hello 😀 {lone}", timestamp=0),
+        UserMessage(content=[TextContent(text=f"block {lone}")], timestamp=1),
+        message, result,
+    ])
+    body = anthropic.build_request(Model("test", "t", "anthropic-messages", "test", "https://example.test"),
+                                   context, SimpleStreamOptions())
+    # httpx encodes JSON with ensure_ascii=False; a lone surrogate would raise here.
+    json.dumps(body, ensure_ascii=False).encode("utf-8")
+    assert body["system"].startswith("system ")
+    assert body["messages"][0]["content"].startswith("hello 😀 ")
+    assert body["messages"][1]["content"][0]["text"].startswith("block ")
+    assistant_blocks = body["messages"][2]["content"]
+    assert assistant_blocks[0]["text"].startswith("answer ")
+    assert assistant_blocks[1]["thinking"].startswith("think ")
+    assert body["messages"][3]["content"][0]["content"][0]["text"].startswith("result ")

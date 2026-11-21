@@ -73,7 +73,7 @@ def build_request(model: Model, context: TranscriptContext, options: Optional[Si
         "messages": convert_messages(messages),
     }
     if system is not None:
-        text = get_system_message_text(system)
+        text = _sanitize_surrogates(get_system_message_text(system))
         if text:
             if cache_control:
                 body["system"] = [{"type": "text", "text": text, "cache_control": cache_control}]
@@ -158,6 +158,11 @@ def _declared_tools(system: Optional[SystemMessage]) -> List[Tool]:
     return list(system.tools_added)
 
 
+def _sanitize_surrogates(text: str) -> str:
+    """Replace unpaired surrogates so JSON encoding cannot fail."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def convert_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     """Convert transcript messages to Anthropic API messages.
 
@@ -187,7 +192,7 @@ def convert_messages(messages: List[Any]) -> List[Dict[str, Any]]:
                 if isinstance(block, ImageContent):
                     content.append(_image_block(block))
                 elif isinstance(block, TextContent) and block.text.strip():
-                    content.append({"type": "text", "text": block.text})
+                    content.append({"type": "text", "text": _sanitize_surrogates(block.text)})
             if not content:
                 content = [{"type": "text", "text": "(empty result)"}]
             pending_results.append(
@@ -205,7 +210,7 @@ def convert_messages(messages: List[Any]) -> List[Dict[str, Any]]:
 
 def _user_content(message: UserMessage) -> Any:
     if isinstance(message.content, str):
-        return message.content
+        return _sanitize_surrogates(message.content)
     blocks: List[Dict[str, Any]] = []
     for block in message.content:
         if isinstance(block, ImageContent):
@@ -213,7 +218,7 @@ def _user_content(message: UserMessage) -> Any:
         elif isinstance(block, (AudioContent, VideoContent)):
             raise ValueError("Anthropic Messages does not support audio or video input")
         elif isinstance(block, TextContent) and block.text.strip():
-            blocks.append({"type": "text", "text": block.text})
+            blocks.append({"type": "text", "text": _sanitize_surrogates(block.text)})
     return blocks
 
 
@@ -229,7 +234,7 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
     for block in message.content:
         if isinstance(block, TextContent):
             if block.text.strip():
-                blocks.append({"type": "text", "text": block.text})
+                blocks.append({"type": "text", "text": _sanitize_surrogates(block.text)})
         elif isinstance(block, ThinkingContent):
             if block.redacted:
                 # Redacted thinking travels back as the opaque payload.
@@ -239,12 +244,12 @@ def _assistant_content(message: AssistantMessage) -> List[Dict[str, Any]]:
                 blocks.append(
                     {
                         "type": "thinking",
-                        "thinking": block.thinking,
+                        "thinking": _sanitize_surrogates(block.thinking),
                         "signature": block.thinking_signature,
                     }
                 )
             elif block.thinking.strip():
-                blocks.append({"type": "text", "text": block.thinking})
+                blocks.append({"type": "text", "text": _sanitize_surrogates(block.thinking)})
         elif isinstance(block, ToolCall) and block.raw_item is None:
             blocks.append({"type": "tool_use", "id": normalize_tool_call_id(block.id), "name": block.name, "input": block.arguments})
         # Hosted tool calls have no Anthropic replay shape and are dropped.
