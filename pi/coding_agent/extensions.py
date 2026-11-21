@@ -661,12 +661,34 @@ class ExtensionManager:
             print(f"Extension {path} failed: {exc}", file=sys.stderr)
 
     async def cleanup_api(self, api):
+        """Release everything an API registered, including a setup that failed sealing."""
+        if api.closed:
+            return
         for handler in list(api.handlers.get("session_shutdown", [])):
             try:
                 await invoke(handler, {"type": "session_shutdown"}, self.context)
             except Exception as exc:
                 print(f"Extension cleanup failed: {exc}", file=sys.stderr)
         api.closed = True
+        released = {name for name, config in api.providers.items()
+                    if callable(config.get("stream_simple"))}
+        for name in released:
+            unregister_provider_stream_fn(name)
+        # A failed setup may have shadowed a live extension's stream function;
+        # restore the surviving owner so provider routing is unchanged.
+        for other in self.extensions:
+            if other.closed:
+                continue
+            for name, config in other.providers.items():
+                if name in released and callable(config.get("stream_simple")):
+                    register_provider_stream_fn(name, config["stream_simple"])
+        if self.context.mcp is not None:
+            for name in list(api.mcp_servers):
+                try:
+                    await self.context.mcp.unregister_extension_server(name, str(api.path))
+                except Exception as exc:
+                    print(f"Extension MCP cleanup failed: {exc}", file=sys.stderr)
+            api.mcp_servers.clear()
 
     async def close(self):
         if self.unsubscribe:
@@ -674,13 +696,6 @@ class ExtensionManager:
             self.unsubscribe = None
         for api in reversed(self.extensions):
             await self.cleanup_api(api)
-        for api in self.extensions:
-            for name, config in api.providers.items():
-                if callable(config.get("stream_simple")):
-                    unregister_provider_stream_fn(name)
-            if self.context.mcp is not None:
-                for name in list(api.mcp_servers):
-                    await self.context.mcp.unregister_extension_server(name, str(api.path))
         for bridge in self.ts_bridges:
             try:
                 await bridge.close()

@@ -6,6 +6,7 @@ import pytest
 
 from pi.agent.agent import Agent
 from pi.ai.models import resolve_model
+from pi.ai.providers import PROVIDER_STREAM_FNS
 from pi.ai.providers.faux import reset_script_index
 from pi.coding_agent.config import Configuration
 from pi.coding_agent.extensions import ExtensionManager
@@ -123,3 +124,71 @@ def test_failed_setup_rolls_back_and_rpc_command_is_handled(tmp_path):
         finally:
             await manager.close()
     asyncio.run(check())
+
+
+PROVIDER_SOURCE = '''
+async def setup(api):
+    async def stream_simple(model, context, options=None):
+        if False:
+            yield None
+    stream_simple.owner = "good"
+    api.register_provider("leaky", {"api": "openai-completions", "stream_simple": stream_simple})
+'''
+
+
+class FakeMcp:
+    def __init__(self):
+        self.servers = {}
+
+    async def register_extension_server(self, name, settings, owner):
+        self.servers[name] = (settings, owner)
+
+    async def unregister_extension_server(self, name, owner):
+        if self.servers.get(name, (None, None))[1] == owner:
+            self.servers.pop(name)
+
+    def registered_extension_servers(self):
+        return [{"name": name, "config": config, "extensionPath": owner}
+                for name, (config, owner) in self.servers.items()]
+
+
+def test_failed_seal_releases_provider_and_mcp_registrations(tmp_path):
+    async def check():
+        config = Configuration(str(tmp_path), str(tmp_path / "user"))
+        directory = tmp_path / ".pi/extensions"
+        directory.mkdir(parents=True)
+        (directory / "a_good.py").write_text(PROVIDER_SOURCE, encoding="utf-8")
+        (directory / "b_bad.py").write_text('''
+from pi.agent.types import AgentTool, AgentToolResult
+
+async def setup(api):
+    async def stream_simple(model, context, options=None):
+        if False:
+            yield None
+
+    stream_simple.owner = "bad"
+
+    async def echo(call_id, params, signal=None, on_update=None):
+        return AgentToolResult(content=[])
+
+    api.register_provider("leaky", {"api": "openai-completions", "stream_simple": stream_simple})
+    await api.register_mcp_server("leaky_server", {"command": "echo"})
+    tool = AgentTool(name="dup", description="Dup", parameters={"type": "object"}, execute=echo)
+    api.register_tool(tool)
+    api.register_tool(tool)
+''', encoding="utf-8")
+        mcp = FakeMcp()
+        manager = ExtensionManager(config, Agent(resolve_model("faux")), mcp=mcp)
+        await manager.reload()
+        try:
+            assert len(manager.extensions) == 1
+            # The failed extension's provider registration is gone and the live
+            # extension's stream function is restored.
+            assert getattr(PROVIDER_STREAM_FNS.get("leaky"), "owner", None) == "good"
+            assert mcp.servers == {}
+        finally:
+            await manager.close()
+        assert "leaky" not in PROVIDER_STREAM_FNS
+
+    asyncio.run(check())
+
