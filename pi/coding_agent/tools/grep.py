@@ -26,7 +26,7 @@ def create_grep_tool(cwd: str) -> AgentTool:
                                      literal=bool(params.get("literal")),
                                      context=context, limit=limit, signal=signal)
         args = ["--no-config", "--color=never", "--line-number", "--with-filename", "--no-heading",
-                "--hidden", "--no-require-git", "--glob=!.git/**", "--glob=!node_modules/**", "--sort=path",
+                "--hidden", "--no-require-git", "--glob=!.git", "--glob=!node_modules", "--sort=path",
                 "--max-columns=500", "--max-columns-preview", "--context", str(context)]
         if params.get("ignoreCase"):
             args.append("--ignore-case")

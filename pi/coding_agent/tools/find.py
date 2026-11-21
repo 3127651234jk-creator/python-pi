@@ -19,7 +19,7 @@ def create_find_tool(cwd: str) -> AgentTool:
         if shutil.which("rg") is None:
             return await find_python(root, params["pattern"], limit, signal)
         args = ["--no-config", "--files", "--hidden", "--no-require-git", "--sort=path",
-                "--glob=!.git/**", "--glob=!node_modules/**", "--", "."]
+                "--glob=!.git", "--glob=!node_modules", "--", "."]
         return await run_rg(root, args, limit, signal, include=lambda path: matches_glob(path, params["pattern"]))
 
     return AgentTool(name="find", description="Find files by glob pattern (e.g. '*.py' or 'src/**/*.py'). Paths are relative to the search directory. Respects .gitignore, includes hidden files, skips .git and node_modules. Defaults: 1000 files, 50KB output. Uses ripgrep when installed, otherwise a built-in scan.",

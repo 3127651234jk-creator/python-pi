@@ -27,6 +27,7 @@ from pi.coding_agent.session import SessionManager
 from pi.coding_agent.subscription_auth import token_record
 from pi.coding_agent.tools.bash import create_bash_tool
 from pi.coding_agent.tools.edit_diff import Edit, apply_edits_to_normalized_content, generate_diff_string
+from pi.coding_agent.tools.find import create_find_tool
 from pi.coding_agent.tools.grep import create_grep_tool
 from pi.coding_agent.trust import TrustStore
 from pi.coding_agent.ts_extension import TsExtensionBridge, node_command
@@ -254,6 +255,27 @@ def test_rg_context_url_is_not_a_match(tmp_path):
         result = await create_grep_tool(str(tmp_path)).execute("id", {"pattern": "needle", "context": 1, "limit": 2})
         assert result.details["resultLimitReached"] is False
         assert "file.txt:3:needle" in result.content[0].text
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
+def test_rg_skips_nested_git_and_node_modules(tmp_path):
+    for name in (".git/hidden.txt", "node_modules/pkg/dep.txt"):
+        path = tmp_path / "nested" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("needle", encoding="utf-8")
+    (tmp_path / "keep.txt").write_text("needle", encoding="utf-8")
+
+    async def scenario():
+        found = await create_find_tool(str(tmp_path)).execute("id", {"pattern": "*.txt"})
+        assert "keep.txt" in found.content[0].text
+        assert "hidden.txt" not in found.content[0].text
+        assert "dep.txt" not in found.content[0].text
+        result = await create_grep_tool(str(tmp_path)).execute("id", {"pattern": "needle"})
+        text = result.content[0].text
+        assert "keep.txt:1:needle" in text
+        assert "hidden.txt" not in text
+        assert "dep.txt" not in text
     asyncio.run(scenario())
 
 
