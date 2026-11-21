@@ -35,6 +35,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import uuid
 from typing import Any, Dict, Optional
 
@@ -629,6 +630,58 @@ class RpcServer:
     async def serve(self, source=None):
         source = source or sys.stdin.buffer
         commands = asyncio.Queue()
+        lines = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def pump() -> None:
+            # Drain stdin on a dedicated daemon thread instead of the loop's
+            # default executor: a readline() parked in the executor is not
+            # cancellable, and asyncio.run() joins executor threads on shutdown,
+            # so an idle server could never exit. A daemon thread can be
+            # abandoned safely when serve() is cancelled or stdin is closed.
+            #
+            # Real stdin is read through the unbuffered ``raw`` layer: a daemon
+            # thread blocked in BufferedReader.readline() holds that buffer's
+            # lock, and interpreter shutdown then aborts with
+            # "_enter_buffered_busy ... possibly due to daemon threads".
+            stream = getattr(source, "raw", None)
+            pending = b""
+
+            def emit(line) -> bool:
+                try:
+                    loop.call_soon_threadsafe(lines.put_nowait, line)
+                except RuntimeError:
+                    return False  # event loop already closed
+                return True
+
+            while True:
+                try:
+                    if stream is None:
+                        line = source.readline()
+                        if not line:
+                            emit(b"")
+                            return
+                        if not emit(line):
+                            return
+                        continue
+                    chunk = stream.read(65536)
+                except (OSError, ValueError):
+                    chunk = b""
+                if not chunk:
+                    if pending:
+                        emit(pending)
+                    emit(b"")
+                    return
+                pending += chunk
+                while True:
+                    index = pending.find(b"\n")
+                    if index < 0:
+                        break
+                    if not emit(pending[:index + 1]):
+                        return
+                    pending = pending[index + 1:]
+
+        threading.Thread(target=pump, name="pi-rpc-stdin", daemon=True).start()
 
         async def run_commands() -> None:
             while True:
@@ -642,7 +695,7 @@ class RpcServer:
         drain = None
         try:
             while True:
-                line = await asyncio.to_thread(source.readline)
+                line = await lines.get()
                 if not line:
                     break
                 try:

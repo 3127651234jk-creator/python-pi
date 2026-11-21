@@ -3,6 +3,9 @@ import io
 import json
 import os
 import queue
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -454,6 +457,44 @@ def test_parse_error_does_not_stop_server():
         assert not records[0]["success"] and not records[1]["success"]
         assert records[2]["id"] == "ok" and records[2]["success"]
     asyncio.run(check())
+
+
+def test_serve_shutdown_does_not_wait_for_blocked_stdin():
+    """Cancelling serve() must not wedge asyncio.run()'s executor shutdown.
+
+    stdin stays open (no EOF) so readline() blocks forever; if it were parked in
+    the loop's default executor, process exit would hang waiting for that thread.
+    """
+    script = textwrap.dedent(
+        """
+        import asyncio, io
+        from pi.agent.agent import Agent
+        from pi.ai.models import resolve_model
+        from pi.coding_agent.rpc import JsonWriter, RpcServer
+
+        async def main():
+            server = RpcServer(Agent(resolve_model("faux")), JsonWriter(io.StringIO()))
+            serving = asyncio.create_task(server.serve())
+            await asyncio.sleep(0.2)
+            serving.cancel()
+            try:
+                await serving
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(main())
+        """
+    )
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    process = subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=root)
+    try:
+        returncode = process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise AssertionError("serve() hung on a blocked stdin readline during shutdown")
+    assert returncode == 0, process.stderr.read().decode()
 
 
 def test_extension_ui_response_is_read_while_command_is_running():
