@@ -49,3 +49,10 @@ def test_non_breaking_spaces_in_paths_are_normalized(tmp_path):
                                                    auto_resize_images=False))
     assert "hello nbsp" in processed.text
 
+
+
+def test_invalid_utf8_text_is_decoded_with_replacement(tmp_path):
+    # TS readFile(path, "utf-8") replaces invalid bytes; it does not fail the run.
+    text = write(tmp_path, "latin1.txt", b"caf\xe9")
+    processed = asyncio.run(process_file_arguments([text], cwd=str(tmp_path), auto_resize_images=False))
+    assert "caf\ufffd" in processed.text

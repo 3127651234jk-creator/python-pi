@@ -52,6 +52,8 @@ from .base import (
 
 _FINISH_REASON_MAP = {
     "stop": "stop",
+    # Some gateways end with "end" instead of "stop"; TS maps both to stop.
+    "end": "stop",
     "tool_calls": "toolUse",
     "function_call": "toolUse",
     "length": "length",
@@ -291,8 +293,7 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         yield StreamErrorEvent(reason="error", error=state.snapshot())
         return
 
-    if data.get("usage"):
-        usage = data["usage"]
+    def apply_usage(usage: dict) -> None:
         details = usage.get("prompt_tokens_details", {}) or {}
         completion_details = usage.get("completion_tokens_details", {}) or {}
         # DeepSeek reports prompt_cache_hit_tokens; Kimi a top-level cached_tokens.
@@ -302,11 +303,15 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
             or usage.get("cached_tokens")
             or 0
         )
+        # OpenRouter-compatible providers can report cache writes separately;
+        # prompt_tokens includes them too (TS parseChunkUsage).
+        cache_write = details.get("cache_write_tokens") or 0
         counted = usage_from_counts(
-            # prompt_tokens includes cache reads; report them separately.
-            input_tokens=max(0, (usage.get("prompt_tokens", 0) or 0) - cached),
+            # prompt_tokens includes cache reads/writes; report them separately.
+            input_tokens=max(0, (usage.get("prompt_tokens", 0) or 0) - cached - cache_write),
             output_tokens=usage.get("completion_tokens", 0) or 0,
             cache_read=cached,
+            cache_write=cache_write,
             reasoning=completion_details.get("reasoning_tokens"),
         )
         # Usage arrives in its own final chunk; the [DONE] handler skips the
@@ -315,10 +320,16 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         counted.cost = state.model.calculate_cost(counted)
         state.set_usage(counted)
 
+    if data.get("usage"):
+        apply_usage(data["usage"])
+
     choices = data.get("choices") or []
     if not choices:
         return
     choice = choices[0]
+    # Moonshot-style gateways attach usage to the choice instead of the chunk.
+    if not data.get("usage") and isinstance(choice.get("usage"), dict):
+        apply_usage(choice["usage"])
     state.set_response(data.get("id"), data.get("model"))
 
     delta = choice.get("delta") or {}

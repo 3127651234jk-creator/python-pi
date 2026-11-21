@@ -99,6 +99,8 @@ async def process_file_arguments(
                 result.text += f'<file name="{absolute_path}"></file>\n'
         else:
             with open(absolute_path, "rb") as handle:
-                content = handle.read().decode("utf-8")
+                # Node's readFile(path, "utf-8") replaces invalid bytes rather
+                # than failing, so a single bad byte must not abort the run.
+                content = handle.read().decode("utf-8", errors="replace")
             result.text += f'<file name="{absolute_path}">\n{strip_bom(content)}\n</file>\n'
     return result

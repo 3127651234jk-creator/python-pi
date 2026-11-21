@@ -75,6 +75,18 @@ def test_wire_decoder_round_trip_and_batch_scoping():
     assert apply_ops(value, decoded) == {"a": {"b": "world"}}
 
 
+def test_apply_delete_absent_object_key_is_a_noop():
+    # JS `delete parent[key]` does not throw; a redundant delete is legal wire
+    # input and must not clear the replica.
+    assert apply_ops({"a": 1}, [["d", ["b"]]]) == {"a": 1}
+
+
+def test_apply_splice_index_past_end_clamps_like_js():
+    # Array.splice clamps an index past the end to the length.
+    assert apply_ops([1, 2], [["p", [], 5, 0, [9]]]) == [1, 2, 9]
+    assert apply_ops([1, 2], [["p", [], 5, 2, [9]]]) == [1, 2, 9]
+
+
 def test_wire_decoder_keeps_ids_across_batches_and_resets_on_base():
     encoder = WireEncoder()
     decoder = WireDecoder()
@@ -309,6 +321,24 @@ def test_provider_buffer_overflow_collapses_to_reset():
         assert member["ops"] == [["r", {"count": 101}]]
         subscription.close()
         provider.dispose()
+    asyncio.run(check())
+
+
+def test_provider_dispose_finishes_cleanup_when_a_listener_raises():
+    # A throwing subscriber listener must not abort disposal halfway: every
+    # registration is cleared, then the first listener error is re-raised.
+    async def check():
+        provider, _example = build_provider()
+
+        def boom(update):
+            raise RuntimeError("listener failed")
+
+        subscription = provider.subscribe("pi.example", "singleton", boom)
+        subscription.activate()
+        with pytest.raises(RuntimeError, match="listener failed"):
+            provider.dispose()
+        assert provider._registrations == {}
+        provider.dispose()  # idempotent after the partial failure
     asyncio.run(check())
 
 

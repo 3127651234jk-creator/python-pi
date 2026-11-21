@@ -217,6 +217,16 @@ class RemoteServiceProvider:
         if self._disposed:
             return
         self._disposed = True
+        errors: List[Any] = []
+
+        def emit(registration: Dict[str, Any], update: Dict[str, Any]) -> None:
+            # A listener must not abort disposal halfway: collect its error,
+            # finish clearing every registration, then raise (TS dispose).
+            try:
+                self._emit(registration, update)
+            except Exception as error:  # noqa: BLE001 - collected, then re-raised
+                errors.append(error)
+
         for registration in self._registrations.values():
             instances = list(registration["instances"].values())
             if registration["singleton"] is not None:
@@ -228,15 +238,17 @@ class RemoteServiceProvider:
                 instance["unsubscribe"].clear()
             if registration["singleton"] is not None:
                 registration["singleton"] = None
-                self._emit(registration, {"type": "unavailable"})
+                emit(registration, {"type": "unavailable"})
             for key in list(registration["instances"]):
                 instance = registration["instances"].pop(key)
-                self._emit(registration, {"type": "closed", "instance": instance["address"]})
+                emit(registration, {"type": "closed", "instance": instance["address"]})
             for subscriber in list(registration["subscribers"]):
                 subscriber.closed = True
                 subscriber.buffer.clear()
             registration["subscribers"].clear()
         self._registrations.clear()
+        if errors:
+            raise errors[0]
 
     # ------------------------------------------------------------------ internal
 

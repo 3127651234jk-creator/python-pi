@@ -339,9 +339,13 @@ def test_unexpected_termination_invalidates_session():
     asyncio.run(asyncio.wait_for(check(), 10))
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node unavailable")
+TS_CBOR = Path(__file__).resolve().parents[2] / "packages/protocol/src/cbor/index.ts"
+
+
+@pytest.mark.skipif(shutil.which("node") is None or not TS_CBOR.is_file(),
+                    reason="Node and the TS protocol sources are required")
 def test_typescript_codec_interop(tmp_path):
-    codec = (Path(__file__).resolve().parents[2] / "packages/protocol/src/cbor/index.ts").as_uri()
+    codec = TS_CBOR.as_uri()
     script = tmp_path / "interop.mjs"
     script.write_text(f'''import {{ encodeCbor, decodeCbor }} from "{codec}";
 const message = {{type:"hello",version:8}};

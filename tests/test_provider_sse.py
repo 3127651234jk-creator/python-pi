@@ -781,3 +781,62 @@ data: [DONE]
     assert done.message.usage.input == 8  # prompt_tokens 11 minus 3 cached
     assert done.message.usage.cost["input"] == pytest.approx(8 * 1.0 / 1_000_000)
     assert done.message.usage.cost["total"] == pytest.approx(8 * 1.0 / 1_000_000)
+
+
+def test_openai_completions_splits_cache_read_and_write(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    sse = """data: {"id":"c1","choices":[{"delta":{"content":"Hi"},"finish_reason":"end"}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":200,"cache_write_tokens":300}}}
+
+data: [DONE]
+"""
+    collect = stream_with(monkeypatch, openai_completions, sse)
+    events, _ = asyncio.run(collect())
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    # "end" is a successful stop; prompt_tokens includes both cache parts.
+    assert done.reason == done.message.stop_reason == "stop"
+    usage = done.message.usage
+    assert (usage.input, usage.output, usage.cache_read, usage.cache_write) == (500, 10, 200, 300)
+
+
+def test_openai_completions_accepts_usage_on_the_choice(monkeypatch):
+    from pi.ai.providers import openai_completions
+
+    sse = """data: {"id":"c1","choices":[{"delta":{"content":"Hi"},"finish_reason":"stop","usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cache_write_tokens":3}}}]}
+
+data: [DONE]
+"""
+    collect = stream_with(monkeypatch, openai_completions, sse)
+    events, _ = asyncio.run(collect())
+    usage = next(event for event in events if isinstance(event, DoneEvent)).message.usage
+    assert (usage.input, usage.output, usage.cache_write) == (7, 2, 3)
+
+
+def test_anthropic_message_delta_updates_every_reported_usage_field(monkeypatch):
+    from pi.ai.providers import anthropic
+
+    sse = """event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":10,"cache_read_input_tokens":2,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":4}}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":20,"output_tokens":1,"cache_read_input_tokens":5,"cache_creation_input_tokens":9,"cache_creation":{"ephemeral_1h_input_tokens":6},"output_tokens_details":{"thinking_tokens":2}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"""
+    collect = stream_with(monkeypatch, anthropic, sse)
+    events, _ = asyncio.run(collect())
+    usage = next(event for event in events if isinstance(event, DoneEvent)).message.usage
+    assert (usage.input, usage.output, usage.cache_read) == (20, 1, 5)
+    # The delta keeps the same 5m/1h split as message_start.
+    assert (usage.cache_write, usage.cache_write_1h) == (3, 6)
+    assert usage.reasoning == 2

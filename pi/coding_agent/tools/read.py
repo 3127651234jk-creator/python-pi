@@ -119,7 +119,9 @@ async def _read_bytes(path: str, signal: Optional[Any]) -> bytes:
 
 
 async def _read_text(path: str, signal: Optional[Any]) -> str:
-    handle = await asyncio.to_thread(open, path, "r", encoding="utf-8", errors="replace")
+    # newline="" keeps CRLF and lone CR intact, like Buffer.toString in TS;
+    # universal-newline translation would change line counts and output bytes.
+    handle = await asyncio.to_thread(open, path, "r", encoding="utf-8", errors="replace", newline="")
     try:
         return "".join(await _read_chunks(handle, signal))
     finally:

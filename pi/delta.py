@@ -198,8 +198,8 @@ def apply_ops(target: Any, ops: Sequence[Sequence[Any]]) -> Any:
                 raise PathError(path)
             if verb == "p":
                 index, remove, items = op[2], op[3], op[4]
-                if index > len(node):
-                    raise UnsafePathError(index)
+                # JS Array.splice clamps an index past the end to the length.
+                index = min(index, len(node))
                 del node[index : index + remove]
                 for offset in range(0, len(items), 10_000):
                     node[index + offset : index + offset] = items[offset : offset + 10_000]
@@ -242,9 +242,8 @@ def apply_ops(target: Any, ops: Sequence[Sequence[Any]]) -> Any:
                     raise PathError(path)
                 del parent[key]
             else:
-                if key not in parent:
-                    raise PathError(path)
-                del parent[key]
+                # Deleting an absent object key is a no-op (JS `delete`).
+                parent.pop(key, None)
         elif verb == "a":
             current = read_current()
             if not isinstance(current, str):

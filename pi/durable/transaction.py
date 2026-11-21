@@ -354,9 +354,8 @@ class Transaction:
 
     async def doc(self, definition: DocDefinition, *args: Any) -> DocDraft:
         address_id, address, next_index = resolve_address(definition, list(args))
-        created = any(record.id == address["scope"].get("conversation_id") for record in self._created_conversations)
-        if not created:
-            self._before_table_read()
+        # Document access is not a caller table read and stays available after
+        # the first table write (TS transaction contract).
         if address_id in self._drafts_by_address:
             return self._drafts_by_address[address_id]
         loaded = await self._host.load_document(definition, address)
@@ -376,7 +375,8 @@ class Transaction:
         return draft
 
     async def retire_doc(self, definition: DocDefinition, *args: Any) -> None:
-        self._before_table_read()
+        # Retirement resolves through the host's document cache/storage, so it
+        # is allowed after a table write (TS #findRetirement).
         address_id, address, _next = resolve_address(definition, list(args))
         draft = self._drafts_by_address.get(address_id)
         if draft is not None:

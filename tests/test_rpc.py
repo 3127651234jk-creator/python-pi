@@ -248,9 +248,9 @@ def test_rpc_message_persist_emits_entry_appended(tmp_path):
     asyncio.run(check())
 
 
-def test_rpc_thinking_level_and_session_name_broadcast():
+def test_rpc_thinking_level_and_session_name_broadcast(tmp_path):
     async def check():
-        session = SessionManager(session_dir="unused", cwd=None)
+        session = SessionManager(session_dir=str(tmp_path / "sessions"), cwd=None)
         session.start_new()
         output = io.StringIO()
         agent = Agent(resolve_model("faux"))

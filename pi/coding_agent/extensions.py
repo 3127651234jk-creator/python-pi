@@ -712,7 +712,9 @@ class ExtensionManager:
         active_names = {tool.name for tool in self.agent.tools}
         self.agent.tools.extend(tool for name, tool in self.context.tool_catalog.items()
                                 if name not in active_names and id(tool) not in owned)
-        self.agent.tools = [tool for tool in self.agent.tools if id(tool) not in owned]
+        # Mutate in place: codemode and other holders capture this list object,
+        # so rebinding it would leave them with a stale tool set after /reload.
+        self.agent.tools[:] = [tool for tool in self.agent.tools if id(tool) not in owned]
         self.agent.before_tool_call, self.agent.after_tool_call = self.old_before, self.old_after
         self.agent.prepare_request = self.old_prepare_request
         for name in list(sys.modules):

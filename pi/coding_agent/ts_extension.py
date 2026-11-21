@@ -483,7 +483,9 @@ class TsExtensionBridge:
                 names = params["names"]
                 if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
                     raise ValueError("Tool names must be a string array")
-                api.context.agent.tools = [tool for name, tool in api.context.tool_catalog.items() if name in names]
+                # In place: codemode keeps a reference to this list object.
+                api.context.agent.tools[:] = [tool for name, tool in api.context.tool_catalog.items()
+                                              if name in names]
                 await self._reply(request, self._context_payload())
                 return
             elif method == "refreshTools":

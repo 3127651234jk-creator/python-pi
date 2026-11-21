@@ -76,6 +76,15 @@ def test_parse_codemode_source_reads_first_line():
     assert rest == "code = 3"
 
 
+def test_parse_codemode_source_rejects_options_without_source():
+    # An options line alone used to run an empty script and report success.
+    with pytest.raises(ValueError) as excinfo:
+        host.parse_codemode_source('# @options: {"timeout_ms": 5}')
+    assert "followed by source" in str(excinfo.value)
+    with pytest.raises(ValueError):
+        host.parse_codemode_source('# @options: {"timeout_ms": 5}\n\n   \n')
+
+
 @pytest.mark.parametrize("line", [
     '# @options: not json',
     '# @options: [1]',

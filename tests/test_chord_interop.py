@@ -26,8 +26,17 @@ from pi.server import Server
 
 INTEROP = Path(__file__).resolve().parent / "interop"
 NODE = shutil.which("node")
+TS_PACKAGES = Path(__file__).resolve().parents[2] / "packages"
+# Some TS branches removed the experimental client/protocol/server packages
+# while the Python port kept them; skip instead of failing when the sources
+# these peers load are absent.
+TS_SOURCES_PRESENT = all(
+    (TS_PACKAGES / relative).is_file()
+    for relative in ("protocol/src/index.ts", "server/src/index.ts", "client/src/index.ts"))
 
-REQUIRES_NODE = pytest.mark.skipif(NODE is None, reason="Node unavailable")
+REQUIRES_NODE = pytest.mark.skipif(
+    NODE is None or not TS_SOURCES_PRESENT,
+    reason="Node and the TS client/protocol/server sources are required")
 
 
 async def start_node(script, *args):

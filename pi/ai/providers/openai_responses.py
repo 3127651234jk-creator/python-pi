@@ -143,6 +143,21 @@ async def stream_openai_responses(model, context, options=None):
             blocks.arguments[tool_key] = arguments
             state.partial.content[blocks.indices[tool_key]].arguments = (
                 json.loads(arguments) if arguments.strip() else {})
+        elif kind == "response.output_item.done" and data["item"]["type"] == "function_call":
+            # Some gateways send the whole call in output_item.done without
+            # argument deltas; the done item's arguments are authoritative.
+            item = data["item"]
+            tool_key = ("tool", key)
+            if tool_key not in blocks.indices:
+                call_id = item.get("call_id") or item.get("id") or ""
+                item_id = item.get("id")
+                events = blocks.tool(tool_key, f"{call_id}|{item_id}" if item_id else call_id,
+                                     item.get("name", ""))
+            arguments = item.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                blocks.arguments[tool_key] = arguments
+                state.partial.content[blocks.indices[tool_key]].arguments = (
+                    json.loads(arguments) if arguments.strip() else {})
         elif kind == "response.output_item.done" and data["item"]["type"] == "reasoning":
             item = data["item"]
             index = blocks.indices.get(("thinking", key))
@@ -160,8 +175,13 @@ async def stream_openai_responses(model, context, options=None):
             if refusals:
                 raise RuntimeError("Provider refusal: " + "\n".join(refusals))
             usage = response.get("usage") or {}
-            cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
-            state.set_usage(usage_from_counts(max(0, usage.get("input_tokens", 0) - cached), usage.get("output_tokens", 0), cached,
+            details = usage.get("input_tokens_details") or {}
+            cached = details.get("cached_tokens", 0)
+            cache_write = details.get("cache_write_tokens", 0) or 0
+            # input_tokens includes cache reads and writes (TS finalizeResponse).
+            state.set_usage(usage_from_counts(
+                max(0, usage.get("input_tokens", 0) - cached - cache_write),
+                usage.get("output_tokens", 0), cached, cache_write=cache_write,
                 reasoning=(usage.get("output_tokens_details") or {}).get("reasoning_tokens")))
             state.partial.usage.cost = model.calculate_cost(state.partial.usage)
             state.set_response(response.get("id"), response.get("model"))

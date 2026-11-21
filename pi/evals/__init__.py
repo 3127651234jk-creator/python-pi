@@ -16,6 +16,7 @@ and ``pi.evals.framework`` (the local vitest-evals replacement).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -29,6 +30,9 @@ Check = Union[dict, Callable[[dict], Optional[str]]]
 
 CHECK_TYPES = ("contains", "not_contains", "regex", "response_equals", "tool_called",
                "no_tool_called", "max_tokens", "max_tool_calls")
+
+# Bound one case so a hung agent cannot stall an entire eval run.
+CASE_TIMEOUT_SECONDS = 600.0
 
 
 @dataclass
@@ -134,7 +138,10 @@ async def run_case(case: EvalCase, runner: Callable) -> EvalResult:
     started = time.monotonic()
     try:
         outcome = runner(case.prompt)
-        messages = await outcome if asyncio.iscoroutine(outcome) else await asyncio.wait_for(outcome, 600)
+        # The timeout must cover the normal async runner too: wrapping only
+        # non-coroutine awaitables let a hung agent run forever.
+        messages = (await asyncio.wait_for(outcome, CASE_TIMEOUT_SECONDS)
+                    if inspect.isawaitable(outcome) else outcome)
         transcript = _flatten(list(messages))
         failures = check_case(case, transcript)
         return EvalResult(name=case.name, passed=not failures, failures=failures,

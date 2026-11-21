@@ -369,8 +369,29 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
             state.set_end_turn(True)
         usage = data.get("usage", {}) or {}
         if usage:
+            # Update only fields present (not null): proxies may omit
+            # input_tokens in message_delta, so the message_start value must
+            # survive (TS keeps each field only when reported).
             current = partial.usage
-            current.output = usage.get("output_tokens", current.output) or current.output
+            if usage.get("input_tokens") is not None:
+                current.input = usage["input_tokens"]
+            if usage.get("output_tokens") is not None:
+                current.output = usage["output_tokens"]
+            if usage.get("cache_read_input_tokens") is not None:
+                current.cache_read = usage["cache_read_input_tokens"]
+            if usage.get("cache_creation_input_tokens") is not None:
+                # Keep the same 5m/1h split as message_start: cache_write is the
+                # 5m part and cache_write_1h the extended-TTL part.
+                creation = usage.get("cache_creation") or {}
+                write_1h = creation.get("ephemeral_1h_input_tokens")
+                flat = usage["cache_creation_input_tokens"]
+                current.cache_write = max(0, flat - write_1h) if write_1h is not None else flat
+            creation = usage.get("cache_creation") or {}
+            if creation.get("ephemeral_1h_input_tokens") is not None:
+                current.cache_write_1h = creation["ephemeral_1h_input_tokens"]
+            thinking = (usage.get("output_tokens_details") or {}).get("thinking_tokens")
+            if thinking is not None:
+                current.reasoning = thinking
         return
 
     if etype == "message_stop":

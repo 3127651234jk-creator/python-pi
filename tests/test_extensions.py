@@ -192,3 +192,21 @@ async def setup(api):
 
     asyncio.run(check())
 
+
+
+def test_reload_keeps_the_tool_list_identity(tmp_path):
+    # codemode captures agent.tools by reference; rebinding it on reload/close
+    # left codemode with a stale tool set.
+    async def check():
+        config = Configuration(str(tmp_path), str(tmp_path / "user"))
+        agent = Agent(resolve_model("faux"))
+        tools = agent.tools
+        manager = ExtensionManager(config, agent)
+        await manager.reload()
+        assert agent.tools is tools
+        await manager.reload()
+        assert agent.tools is tools
+        await manager.close()
+        assert agent.tools is tools
+
+    asyncio.run(check())

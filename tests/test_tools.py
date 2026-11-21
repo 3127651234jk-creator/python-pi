@@ -140,7 +140,8 @@ def test_edit_replace_failure_preserves_original(tmp_path, monkeypatch):
 
 
 def test_read_counts_trailing_newline_as_terminator(tmp_path):
-    (tmp_path / "file.txt").write_text("one\ntwo\n", encoding="utf-8")
+    # write_bytes keeps LF on Windows; write_text would translate to CRLF.
+    (tmp_path / "file.txt").write_bytes(b"one\ntwo\n")
 
     async def scenario():
         read = get_tool(str(tmp_path), "read")
@@ -456,3 +457,19 @@ def test_import_does_not_spin_up_an_event_loop():
     )
     result = subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=60)
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+def test_read_preserves_crlf_and_lone_cr_line_endings(tmp_path):
+    # Text mode's universal-newline translation used to turn CRLF into LF and
+    # count a lone CR as a line break; the TS tool returns the bytes verbatim.
+    (tmp_path / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
+    (tmp_path / "cr.txt").write_bytes(b"one\rtwo")
+
+    async def scenario():
+        read = get_tool(str(tmp_path), "read")
+        assert (await read.execute("t1", {"path": "crlf.txt"})).structured_content == "one\r\ntwo\r\n"
+        cr = await read.execute("t2", {"path": "cr.txt"})
+        assert cr.structured_content == "one\rtwo"
+        assert "more lines" not in cr.content[0].text
+
+    asyncio.run(scenario())

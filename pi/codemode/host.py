@@ -171,6 +171,8 @@ def parse_codemode_source(code: str) -> tuple:
         if type(value) is not int or value <= 0:
             raise ValueError(f"codemode @options {key} must be a positive integer")
     rest = code[code.index(first) + len(first):].lstrip("\r\n")
+    if not rest.strip():
+        raise ValueError("codemode @options line must be followed by source on subsequent lines")
     return options, rest
 
 

@@ -161,7 +161,10 @@ async def _wait_graph(tx):
     by_id = {record.id: record for record in records}
     owned: Dict[int, List[int]] = {}
     for record in records:
-        if record.owner is not None and record.state.status != "terminal" and record.id != record.owner:
+        # Background work never holds its owner (TS #waitCycle skips it), so it
+        # is not an edge in the wait-for graph either.
+        if (record.owner is not None and record.state.status != "terminal"
+                and record.id != record.owner and not record.background):
             owned.setdefault(record.owner, []).append(record.id)
     return by_id, owned
 
@@ -910,8 +913,11 @@ class Harness:
 
             completing = await _scan_all(tx.scan_tasks, {"status": "completing"})
             all_tasks = await _scan_all(tx.scan_tasks, {})
+            # Background children never block their owner's finalization
+            # (TS #ownedLive skips them).
             live_owner_ids = {task.owner for task in all_tasks
-                              if task.owner is not None and task.state.status != "terminal"}
+                              if task.owner is not None and task.state.status != "terminal"
+                              and not task.background}
             finalized = 0
             for record in completing:
                 if record.id in live_owner_ids:

@@ -207,3 +207,62 @@ def test_rejects_waiting_on_self_and_on_the_owner(tmp_path):
         await session.close()
 
     asyncio.run(scenario())
+
+
+async def _create_background_child(session, definition, owner_id, cid):
+    from pi.durable.transaction import TransactionScope
+
+    async def create(tx):
+        task = await tx.create_task(definition, {"x": 2}, {
+            "ownership": {"kind": "task", "task_id": owner_id}, "background": True})
+        return task.id
+
+    return await session.commit(create, TransactionScope(conversation_id=cid))
+
+
+def test_background_child_does_not_hold_completing_owner(tmp_path):
+    # Background work never holds its owner: the owner reaches terminal while
+    # the child is still live.
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, Model("faux", "Faux", "faux", "faux", ""))
+        cid = await harness.create_conversation()
+        definition = _flat_definition("pi.custom")
+        harness.register_definition(definition)
+        parent_id = await _create_custom(session, harness, definition, cid)
+        parent = await harness._get_task(parent_id)
+        await harness._reserve(parent_id, definition, parent)
+        child_id = await _create_background_child(session, definition, parent_id, cid)
+
+        runtime = TaskRuntime(harness, parent_id, asyncio.Event())
+        await runtime.commit(lambda tx, current: TaskState(
+            status="terminal", outcome=TaskOutcome(status="completed", result={})))
+        assert (await harness._get_task(parent_id)).state.status == "completing"
+        await harness._finalize_completing()
+
+        assert (await harness._get_task(parent_id)).state.status == "terminal"
+        assert (await harness._get_task(child_id)).state.status != "terminal"
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_background_child_may_wait_on_its_owner(tmp_path):
+    # The owner does not hold a background child, so waiting on the owner adds
+    # no cycle edge (TS #10411/#10533).
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, Model("faux", "Faux", "faux", "faux", ""))
+        cid = await harness.create_conversation()
+        definition = _flat_definition("pi.custom")
+        harness.register_definition(definition)
+        parent_id = await _create_custom(session, harness, definition, cid)
+        child_id = await _create_background_child(session, definition, parent_id, cid)
+
+        runtime = TaskRuntime(harness, child_id, asyncio.Event())
+        await runtime.commit(lambda tx, current: TaskState(
+            status="waiting", checkpoint={"phase": "run"}, on=[parent_id], policy="allSettled"))
+        assert (await harness._get_task(child_id)).state.status == "waiting"
+        await session.close()
+
+    asyncio.run(scenario())

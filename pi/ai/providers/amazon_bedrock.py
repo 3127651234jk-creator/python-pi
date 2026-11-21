@@ -261,7 +261,8 @@ async def stream_bedrock(model, context, options=None):
             elif "messageStop" in item:
                 raw = item["messageStop"]["stopReason"]
                 state.set_raw_stop_reason(raw)
-                reason = {"end_turn": "stop", "stop_sequence": "stop", "tool_use": "toolUse", "max_tokens": "length"}.get(raw)
+                reason = {"end_turn": "stop", "stop_sequence": "stop", "tool_use": "toolUse",
+                          "max_tokens": "length", "model_context_window_exceeded": "length"}.get(raw)
                 if reason is None:
                     raise RuntimeError(f"Bedrock stopped: {raw}")
             elif "metadata" in item:

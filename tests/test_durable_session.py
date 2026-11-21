@@ -236,3 +236,30 @@ def test_lone_surrogate_commit_round_trips_without_poisoning_session(tmp_path, s
         await reopened.close()
 
     asyncio.run(scenario())
+
+
+def test_documents_remain_accessible_after_a_table_write():
+    # TS allows document access after the first table write; only caller table
+    # reads (entries/tasks/conversations) are guarded.
+    async def scenario():
+        session = create_session(MemoryStorage())
+        counter = define_doc(kind="pi.counter", version=2, scope="session", initial=lambda seed: {"count": 0})
+
+        async def create(tx):
+            draft = await tx.doc(counter)
+            draft.value["count"] = 1
+            draft.dirty = True
+
+        await session.commit(create)
+
+        async def write_then_document(tx):
+            await tx.create_conversation({"kind": "ownerless"})
+            draft = await tx.doc(counter)
+            assert draft.value == {"count": 1}
+            await tx.retire_doc(counter)
+
+        await session.commit(write_then_document)
+        assert await session.snapshot(counter) is None
+        await session.close()
+
+    asyncio.run(scenario())

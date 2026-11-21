@@ -579,3 +579,62 @@ def test_json_round_trip_new_blocks():
     system = SystemMessage(content="", timestamp=0, tools_added=[Tool("web_search", "Web", {}, hosted={"type": "web_search"})])
     restored = message_from_json(to_json(system))
     assert restored.tools_added[0].hosted == {"type": "web_search"}
+
+
+def _run_responses_payload(monkeypatch, payload):
+    async def send(self, request, **kwargs):
+        body = "".join("data: " + json.dumps(item) + "\n\n" for item in payload).encode()
+        return httpx.Response(200, request=request, content=body)
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    model = Model(id="test", name="test", api="openai-responses", provider="test",
+                  base_url="https://example.test", api_key="key")
+    async def check():
+        return [event async for event in openai_responses.stream_openai_responses(model, context())]
+    return asyncio.run(check())
+
+
+def test_responses_usage_splits_cache_read_and_write(monkeypatch):
+    events = _run_responses_payload(monkeypatch, [
+        {"type": "response.output_text.delta", "output_index": 0, "delta": "Hi"},
+        {"type": "response.completed", "response": {"id": "r", "status": "completed", "usage": {
+            "input_tokens": 100, "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30}}}},
+    ])
+    usage = next(event for event in events if isinstance(event, DoneEvent)).message.usage
+    assert (usage.input, usage.output, usage.cache_read, usage.cache_write) == (50, 7, 20, 30)
+
+
+def test_responses_output_item_done_carries_function_arguments(monkeypatch):
+    # No argument deltas: the done item's arguments are the only copy.
+    events = _run_responses_payload(monkeypatch, [
+        {"type": "response.output_item.added", "output_index": 1, "item": {
+            "type": "function_call", "id": "fc_1", "call_id": "call", "name": "echo", "arguments": ""}},
+        {"type": "response.output_item.done", "output_index": 1, "item": {
+            "type": "function_call", "id": "fc_1", "call_id": "call", "name": "echo",
+            "arguments": '{"text":"hello"}'}},
+        {"type": "response.completed", "response": {"id": "r", "status": "completed",
+                                                    "usage": {"input_tokens": 1, "output_tokens": 1}}},
+    ])
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    call = next(block for block in done.message.content if isinstance(block, ToolCall))
+    assert call.arguments == {"text": "hello"}
+    assert done.reason == "toolUse"
+
+
+def test_bedrock_context_window_exceeded_is_length(monkeypatch):
+    class Stream:
+        def __iter__(self):
+            return iter([{"messageStop": {"stopReason": "model_context_window_exceeded"}}])
+        def close(self): pass
+
+    class Client:
+        def converse_stream(self, **kwargs): return {"stream": Stream()}
+        def close(self): pass
+
+    monkeypatch.setattr(amazon_bedrock, "boto3", SimpleNamespace(client=lambda *args, **kwargs: Client()))
+    async def check():
+        return [event async for event in amazon_bedrock.stream_bedrock(
+            resolve_model("amazon-bedrock"), context())]
+    events = asyncio.run(check())
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.reason == done.message.stop_reason == "length"
