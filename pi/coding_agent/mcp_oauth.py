@@ -59,8 +59,15 @@ class McpLoginRequired(RuntimeError):
 
 
 class OAuthIssuerMismatchError(McpOAuthError):
-    def __init__(self, expected: str, actual: Optional[str]) -> None:
-        super().__init__("issuer_mismatch", f"Authorization server issuer {actual!r} does not match {expected!r}")
+    """An authorization response's ``iss`` does not match the authorization server.
+
+    ``expected`` is None when no authorization server metadata was discovered,
+    in which case any ``iss`` in the callback is rejected.
+    """
+
+    def __init__(self, expected: Optional[str], actual: Optional[str]) -> None:
+        super().__init__("issuer_mismatch",
+                         f"Authorization server issuer {actual!r} does not match {expected!r}")
         self.expected = expected
         self.actual = actual
 

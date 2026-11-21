@@ -183,8 +183,11 @@ DESCRIPTION_INTRO = (
     "Run Python that calls other tools. The input is raw Python (not JSON, no code fence), "
     "executed in an isolated subprocess with file, import, and code-evaluation builtins "
     "disabled; tool calls are its only I/O.\n"
-    "- tools.<name>(args) calls one tool and blocks until it finishes; tools.<name>.start(args) "
-    "starts a call and returns a handle, composed with wait_all(...) / wait_any(...). "
+    "- tools.<name>(args) calls one tool and blocks until it finishes; it resolves to a string, "
+    "or an object if the tool's declaration says so, and raises an error on failure. A tool whose "
+    "declaration returns an object resolves on failure too when it returned that object; check its "
+    "fields. tools.<name>.start(args) starts a call and returns a handle, composed with "
+    "wait_all(...) / wait_any(...). "
     "Set the module variable `result` to return a value. Calls still running when the script ends are cancelled.\n"
     '- Optional first line: # @options: {"max_output_tokens": 10000, "timeout_ms": 60000}'
 )
@@ -421,16 +424,24 @@ def create_codemode_tool(tools: List[AgentTool], session: Optional[SessionManage
 
     async def run_script_tool(name: str, args: dict, signal,
                               record: host.CallRecord) -> Any:
-        """Execute one script call and convert the full outcome for the script."""
+        """Execute one script call and convert the full outcome for the script.
+
+        A tool that declares an ``output_schema`` resolves to its
+        ``structured_content``, also for error results that carry one (such as
+        a non-zero bash exit); any other tool resolves to its text content.
+        Other failures raise the tool's error text.
+        """
         outcome = await run_tool(name, args, signal, record.id)
         # Show the id the runner actually assigned, not a local guess.
         record.id = outcome.tool_call_id
-        if outcome.is_error:
-            raise RuntimeError(_result_text(outcome.result) or f'tool "{name}" failed')
+        tool = next((candidate for candidate in current_tools() if candidate.name == name), None)
         structured = outcome.result.structured_content
-        if structured is not None:
+        if tool is not None and tool.output_schema is not None and structured is not None:
             return structured
-        return _result_text(outcome.result)
+        text = _result_text(outcome.result)
+        if outcome.is_error:
+            raise RuntimeError(text or f'tool "{name}" failed')
+        return text
 
     # -- models.* namespace (F-CA-04) ---------------------------------------
 

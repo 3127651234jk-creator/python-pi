@@ -116,7 +116,9 @@ async def stream_faux(
         yield ToolCallEndEvent(content_index=index, tool_call=tool_call, partial=partial)
         index += 1
 
-    stop_reason = "toolUse" if tool_calls else "stop"
+    # A scripted "stopReason" overrides the derived one, mirroring the TS
+    # fauxAssistantMessage options (e.g. stopReason "length" for truncation).
+    stop_reason = turn.get("stopReason") or ("toolUse" if tool_calls else "stop")
     partial.stop_reason = stop_reason  # type: ignore[assignment]
     partial.usage = _usage_estimate(partial, context, options)
     yield DoneEvent(reason=stop_reason, message=partial)  # type: ignore[arg-type]

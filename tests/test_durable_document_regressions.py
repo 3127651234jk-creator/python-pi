@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from pi.durable.documents import define_doc, define_doc_family
+from pi.durable.documents import define_doc, define_doc_family, resolve_address
 from pi.durable.session import create_session
 from pi.durable.storage import JsonlStorage, MemoryStorage, SqliteStorage
 
@@ -157,4 +157,51 @@ def test_snapshot_rejects_newer_version_and_migration_is_detached(storage):
             assert await session.snapshot(definition) == {"nested": {"n": 1}}
         finally:
             await session.close()
+    asyncio.run(scenario())
+
+
+def test_document_retention_evicts_unused_documents(storage):
+    async def scenario():
+        definition = define_doc("audit.retention", 1, "session", lambda seed: {"n": 0})
+        clock = {"now": 1_000_000}
+        session = create_session(storage, now=lambda: clock["now"])
+        try:
+            await save(session, definition)
+            await session.snapshot(definition)
+            address_id, _address, _next = resolve_address(definition, [])
+            cached = session._document_cache.get(address_id)
+            assert cached is not None
+
+            # Within the retention window the cached incarnation is reused.
+            clock["now"] += 1
+            await session.snapshot(definition)
+            assert session._document_cache.get(address_id) is cached
+
+            # Past the window the document is evicted and reloads fresh.
+            clock["now"] += 600_000
+            await session.snapshot(definition)
+            reloaded = session._document_cache.get(address_id)
+            assert reloaded is not None and reloaded is not cached
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_document_retention_zero_evicts_after_each_use(storage):
+    async def scenario():
+        definition = define_doc("audit.retention0", 1, "session", lambda seed: {"n": 0})
+        session = create_session(storage, document_retention_ms=0)
+        try:
+            await save(session, definition)
+            await session.snapshot(definition)
+            address_id, _address, _next = resolve_address(definition, [])
+            first = session._document_cache.get(address_id)
+            assert first is not None
+            # Retention 0 drops every cached document on the next access.
+            assert await session.snapshot(definition) == {"n": 0}
+            assert session._document_cache.get(address_id) is not first
+        finally:
+            await session.close()
+
     asyncio.run(scenario())

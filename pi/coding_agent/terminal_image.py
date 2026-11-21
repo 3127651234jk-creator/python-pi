@@ -142,10 +142,10 @@ def detect_capabilities(env: Optional[Dict[str, str]] = None,
     elif term.startswith("screen"):
         detected = TerminalCapabilities(None, has_true_color_hint, False)
     elif term_program == "herdr":
-        # Herdr forwards OSC 8 hyperlinks. It runs inside another terminal whose
-        # variables, such as KITTY_WINDOW_ID, may leak into its panes, so check
-        # it before those and leave image protocols off.
-        detected = TerminalCapabilities(None, has_true_color_hint, True)
+        # Herdr forwards OSC 8 hyperlinks and supports the Kitty graphics
+        # protocol. Check it before outer-terminal detection because variables
+        # like KITTY_WINDOW_ID can leak into its panes.
+        detected = TerminalCapabilities("kitty", has_true_color_hint, True)
     elif env.get("KITTY_WINDOW_ID") or term_program == "kitty":
         detected = TerminalCapabilities("kitty", True, True)
     elif term_program == "ghostty" or "ghostty" in term or env.get("GHOSTTY_RESOURCES_DIR"):

@@ -159,7 +159,8 @@ def test_structured_content_preferred_over_text():
                 content=[TextContent(text="ignored text")],
                 structured_content={"data": args}))
 
-        tool = create_codemode_tool([leaf("echo")], execute_tool=execute_tool)
+        tool = create_codemode_tool([leaf("echo", output_schema={"type": "object"})],
+                                    execute_tool=execute_tool)
         result = await tool.execute("c", {"code": "result = tools.echo({'x': 1})"}, None, None)
         assert result.is_error is False
         assert result.structured_content is None  # conversion stays script-side
@@ -219,6 +220,50 @@ def test_error_outcome_without_text_uses_tool_name():
         )
         result = await tool.execute("c", {"code": code}, None, None)
         assert texts_of(result)[1] == 'tool "echo" failed'
+
+    asyncio.run(scenario())
+
+
+def test_schema_tool_error_outcome_resolves_structured_content():
+    # A tool that declares an output schema resolves to its structured content
+    # also on failure, e.g. a non-zero bash exit returns is_error with
+    # structured content; only schema-less tools reject with the error text.
+    async def scenario():
+        async def execute_tool(name, args, signal):
+            return outcome(AgentToolResult(
+                content=[TextContent(text="Command exited with code 2")],
+                structured_content={"output": "boom", "exit_code": 2},
+                is_error=True), is_error=True)
+
+        schema_tool = leaf("shell", output_schema={"type": "object"})
+        tool = create_codemode_tool([schema_tool], execute_tool=execute_tool)
+        result = await tool.execute("c", {"code": "result = tools.shell({})"}, None, None)
+        assert result.is_error is False
+        assert json.loads(texts_of(result)[1]) == {"output": "boom", "exit_code": 2}
+
+    asyncio.run(scenario())
+
+
+def test_schemaless_tool_error_still_rejects():
+    async def scenario():
+        async def execute_tool(name, args, signal):
+            return outcome(AgentToolResult(
+                content=[TextContent(text="Command exited with code 2")],
+                structured_content={"output": "boom", "exit_code": 2},
+                is_error=True), is_error=True)
+
+        tool = create_codemode_tool([leaf("echo")], execute_tool=execute_tool)
+        code = (
+            "try:\n"
+            "    tools.echo({})\n"
+            "    failed = None\n"
+            "except RuntimeError as exc:\n"
+            "    failed = str(exc)\n"
+            "result = failed\n"
+        )
+        result = await tool.execute("c", {"code": code}, None, None)
+        assert result.is_error is False
+        assert texts_of(result)[1] == "Command exited with code 2"
 
     asyncio.run(scenario())
 
@@ -562,8 +607,8 @@ def test_settings_timeout_applies_and_options_override_it():
             return outcome(AgentToolResult(content=[TextContent(text="quick")],
                                            structured_content={"quick": True}))
 
-        overrider = create_codemode_tool([leaf("echo")], settings={"timeout_ms": 200},
-                                         execute_tool=quick)
+        overrider = create_codemode_tool([leaf("echo", output_schema={"type": "object"})],
+                                         settings={"timeout_ms": 200}, execute_tool=quick)
         result = await overrider.execute("c", {
             "code": '# @options: {"timeout_ms": 30000}\nresult = tools.echo({})'}, None, None)
         assert result.is_error is False  # the @options timeout wins over settings

@@ -142,8 +142,20 @@ def to_codemode_file_stem(call_id: str) -> str:
 
 
 def parse_codemode_source(code: str) -> tuple:
-    """Split the optional ``# @options:`` first line from the script source."""
+    """Split the optional ``# @options:`` first line from the script source.
 
+    An options line that is not the first line would otherwise be ignored
+    without notice, so raise before the script runs.
+    """
+
+    for index, line in enumerate(code.splitlines()):
+        if index == 0:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#@options:") or stripped.startswith("# @options:"):
+            raise ValueError(
+                f"codemode @options line must be the first line of the input; found one on line {index + 1}"
+            )
     stripped = code.lstrip()
     if not stripped.startswith("#@options:") and not stripped.startswith("# @options:"):
         return {}, code

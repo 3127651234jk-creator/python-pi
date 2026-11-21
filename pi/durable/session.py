@@ -41,7 +41,13 @@ class SessionHost:
 class Session:
     """Owner of one mutation line, its records, and its tracked documents."""
 
-    def __init__(self, storage, now: Optional[Callable[[], int]] = None) -> None:
+    # Documents untouched for longer than this are evicted from the read cache
+    # and reload from Storage on the next access (TS documentRetentionMs; 0
+    # evicts after each use).
+    DEFAULT_DOCUMENT_RETENTION_MS = 600_000
+
+    def __init__(self, storage, now: Optional[Callable[[], int]] = None,
+                 document_retention_ms: Optional[int] = None) -> None:
         self.storage = storage
         # Wall-clock ms source for task lifecycle stamps (TS createSession {now}).
         self._now = now
@@ -59,6 +65,12 @@ class Session:
         self._close_task: Optional[asyncio.Task] = None
         self._poison: Optional[BaseException] = None
         self._document_cache: Dict[str, Optional[Any]] = {}
+        # Last read/write time per cached address id, for retention sweeps.
+        self._document_touched: Dict[str, int] = {}
+        if document_retention_ms is None or document_retention_ms < 0:
+            self._document_retention_ms = self.DEFAULT_DOCUMENT_RETENTION_MS
+        else:
+            self._document_retention_ms = int(document_retention_ms)
         self.host = SessionHost(self)
 
     @property
@@ -74,8 +86,14 @@ class Session:
         return self.__scheduler_lock
 
     def now(self) -> int:
-        source = self._now
-        return int(source()) if source is not None else int(time.time() * 1000)
+        # A broken host clock must not stop commits: cache bookkeeping reads it
+        # on every task change, so fall back to the wall clock (TS Session
+        # #clock wrap).
+        try:
+            source = self._now
+            return int(source()) if source is not None else int(time.time() * 1000)
+        except Exception:
+            return int(time.time() * 1000)
 
     # -- hooks for subclasses (Harness stages built-in documents) --------------
 
@@ -130,6 +148,7 @@ class Session:
             # Committed document changes invalidate loaded trackers.
             if documents:
                 self._document_cache.clear()
+                self._document_touched.clear()
             self._publish(seq, writes, documents)
             return result
 
@@ -148,13 +167,7 @@ class Session:
                 # Storage already committed. Report the listener failure to the
                 # event loop instead of making the caller retry a commit that
                 # already happened.
-                try:
-                    asyncio.get_running_loop().call_exception_handler({
-                        "message": "durable commit listener failed",
-                        "exception": exc,
-                    })
-                except RuntimeError:
-                    pass
+                _report_background_error("durable commit listener failed", exc)
 
     def subscribe_commits(self, listener: Callable[[CommitPublication], None]) -> Callable[[], None]:
         self._assert_usable()
@@ -172,6 +185,17 @@ class Session:
         from .transaction import _LoadedDocument
 
         address_id = _address_key_id(address)
+        # Lazy retention sweep: documents untouched past the retention window
+        # are evicted and reload from Storage on this access (TS
+        # #sweepDocuments; Python has no watch layer, so every cached document
+        # is unobserved).
+        now_ms = self.now()
+        retention = self._document_retention_ms
+        stale = [key for key, touched in self._document_touched.items() if now_ms - touched >= retention]
+        for key in stale:
+            self._document_cache.pop(key, None)
+            self._document_touched.pop(key, None)
+        self._document_touched[address_id] = now_ms
         record = await self.storage.find_document(address, "current")
         if record is None:
             self._document_cache[address_id] = None
@@ -238,22 +262,29 @@ class Session:
     async def _finish_close(self) -> None:
         listeners = list(self._close_listeners)
         self._close_listeners.clear()
-        listener_error: Optional[BaseException] = None
+        # Close listeners must not fail the close: each one that throws is
+        # reported and dropped, like commit listeners (TS contained()).
         for listener in listeners:
             try:
                 listener()
-            except BaseException as exc:
-                if listener_error is None:
-                    listener_error = exc
-        try:
-            async with self._line_lock:
-                self._commit_listeners.clear()
-                self._document_cache.clear()
-                await self.storage.close()
-        finally:
-            self._closed = True
-        if listener_error is not None:
-            raise listener_error
+            except Exception as exc:  # noqa: BLE001 - listeners must not break close
+                _report_background_error("durable close listener failed", exc)
+        async with self._line_lock:
+            self._commit_listeners.clear()
+            self._document_cache.clear()
+            self._document_touched.clear()
+            await self.storage.close()
+        self._closed = True
+
+    def fail(self, error: BaseException) -> None:
+        """Fail the Session: every later commit is rejected (TS Session.fail).
+
+        Used when the scheduler cannot guarantee a task's durable state, for
+        example a fault write that cannot commit; otherwise the task would stay
+        running and be reserved and run again in the same process.
+        """
+        if self._poison is None:
+            self._poison = error
 
     def _assert_usable(self) -> None:
         if self._closing or self._closed:
@@ -267,12 +298,29 @@ class Session:
             return await read()
 
 
+def _report_background_error(message: str, exc: BaseException) -> None:
+    """Report a listener failure to the running event loop, like TS contained()."""
+    try:
+        asyncio.get_running_loop().call_exception_handler({
+            "message": message,
+            "exception": exc,
+        })
+    except RuntimeError:
+        pass
+
+
 def _address_key_id(address: Dict[str, Any]) -> str:
     from .documents import _address_id
 
     return _address_id(address)
 
 
-def create_session(storage, now: Optional[Callable[[], int]] = None) -> Session:
-    """Open a Session kernel over one storage backend."""
-    return Session(storage, now=now)
+def create_session(storage, now: Optional[Callable[[], int]] = None,
+                   document_retention_ms: Optional[int] = None) -> Session:
+    """Open a Session kernel over one storage backend.
+
+    ``document_retention_ms`` bounds the read cache: documents untouched for
+    longer than the window are evicted and reload from Storage (default 10
+    minutes, ``0`` evicts after each use).
+    """
+    return Session(storage, now=now, document_retention_ms=document_retention_ms)

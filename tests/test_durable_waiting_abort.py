@@ -7,7 +7,7 @@ from pi.durable.entries import TOOL_RESULT_ENTRY
 from pi.durable.harness import Harness, TaskRuntime
 from pi.durable.session import create_session
 from pi.durable.storage import JsonlStorage
-from pi.durable.types import TaskState
+from pi.durable.types import TaskOutcome, TaskState, define_task
 from pi.durable.worker import SessionEndpoint, SessionServices
 
 
@@ -91,6 +91,119 @@ def test_worker_abort_settles_waiting_generation_and_its_tools(tmp_path, explici
         reply = await endpoint.invoke_service(
             {"member": "abort", "args": [{"taskId": generation_id}]}, None, None)
         assert reply == {"aborted": False}
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def _flat_definition(name):
+    async def finish(task, runtime, harness):
+        await runtime.commit(lambda tx, current: TaskState(status="terminal",
+            outcome=TaskOutcome(status="completed", result={})))
+    return define_task(name=name, version=1, initial=lambda value: {"phase": "run"},
+                       phases={"run": finish})
+
+
+def _create_custom(session, harness, definition, cid):
+    from pi.durable.transaction import TransactionScope
+
+    async def create(tx):
+        task = await tx.create_task(definition, {"x": 1},
+            {"ownership": {"kind": "conversation"}, "conversation_id": cid})
+        return task.id
+
+    return session.commit(create, TransactionScope(conversation_id=cid))
+
+
+def test_rejects_the_wait_that_closes_a_cycle(tmp_path):
+    # A -> B and B -> A would deadlock both tasks forever.
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, Model("faux", "Faux", "faux", "faux", ""))
+        cid = await harness.create_conversation()
+        definition = _flat_definition("pi.custom")
+        harness.register_definition(definition)
+        a_id, b_id = await _create_custom(session, harness, definition, cid), \
+            await _create_custom(session, harness, definition, cid)
+        for task_id in (a_id, b_id):
+            task = await harness._get_task(task_id)
+            await harness._reserve(task_id, definition, task)
+
+        runtime_a = TaskRuntime(harness, a_id, asyncio.Event())
+        await runtime_a.commit(lambda tx, current: TaskState(
+            status="waiting", checkpoint={"phase": "run"}, on=[b_id], policy="allSettled"))
+
+        runtime_b = TaskRuntime(harness, b_id, asyncio.Event())
+        with pytest.raises(ValueError, match="wait cycle"):
+            await runtime_b.commit(lambda tx, current: TaskState(
+                status="waiting", checkpoint={"phase": "run"}, on=[a_id], policy="allSettled"))
+        # The rejecting task keeps its prior state; the drain cannot stall on it.
+        assert (await harness._get_task(b_id)).state.status == "running"
+        assert (await harness._get_task(a_id)).state.status == "waiting"
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_rejects_a_longer_cycle_of_waits(tmp_path):
+    # C -> A closes A -> B -> C.
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, Model("faux", "Faux", "faux", "faux", ""))
+        cid = await harness.create_conversation()
+        definition = _flat_definition("pi.custom")
+        harness.register_definition(definition)
+        ids = [await _create_custom(session, harness, definition, cid) for _ in range(3)]
+        for task_id in ids:
+            task = await harness._get_task(task_id)
+            await harness._reserve(task_id, definition, task)
+
+        for waiter, target in zip(ids, ids[1:]):  # A->B, B->C
+            runtime = TaskRuntime(harness, waiter, asyncio.Event())
+            await runtime.commit(lambda tx, current, target=target: TaskState(
+                status="waiting", checkpoint={"phase": "run"}, on=[target], policy="allSettled"))
+
+        runtime_c = TaskRuntime(harness, ids[2], asyncio.Event())
+        with pytest.raises(ValueError, match="wait cycle.*-> "):
+            await runtime_c.commit(lambda tx, current: TaskState(
+                status="waiting", checkpoint={"phase": "run"}, on=[ids[0]], policy="allSettled"))
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_rejects_waiting_on_self_and_on_the_owner(tmp_path):
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        harness = Harness(session, Model("faux", "Faux", "faux", "faux", ""))
+        cid = await harness.create_conversation()
+        definition = _flat_definition("pi.custom")
+        harness.register_definition(definition)
+        a_id = await _create_custom(session, harness, definition, cid)
+        task = await harness._get_task(a_id)
+        await harness._reserve(a_id, definition, task)
+
+        runtime = TaskRuntime(harness, a_id, asyncio.Event())
+        with pytest.raises(ValueError, match="cannot wait on itself"):
+            await runtime.commit(lambda tx, current: TaskState(
+                status="waiting", checkpoint={"phase": "run"}, on=[a_id], policy="allSettled"))
+
+        # A live owned child blocks its owner's finalization, so a child waiting
+        # back on its owner would deadlock (TS allows this only for background).
+        child_id = await _create_custom(session, harness, definition, cid)
+        async def adopt(tx):
+            from pi.durable.types import write_task
+            import dataclasses
+            child = await tx.task(child_id)
+            replaced = dataclasses.replace(child, owner=a_id)
+            tx._writes.append(write_task(replaced))
+            tx._mark_table_write()
+        await session.commit(adopt)
+
+        child_runtime = TaskRuntime(harness, child_id, asyncio.Event())
+        with pytest.raises(ValueError, match="wait cycle"):
+            await child_runtime.commit(lambda tx, current: TaskState(
+                status="waiting", checkpoint={"phase": "run"}, on=[a_id], policy="allSettled"))
         await session.close()
 
     asyncio.run(scenario())

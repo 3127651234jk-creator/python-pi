@@ -108,6 +108,9 @@ class TaskRuntime:
                 raise RuntimeError(f"Task {self.task_id} vanished")
             if current.state.status in ("completing", "terminal"):
                 return None
+            # Reads must precede writes: snapshot the wait-for graph before the
+            # callback runs, so a returned waiting state can be validated.
+            graph = await _wait_graph(tx)
             next_state = change(tx, current)
             if hasattr(next_state, "__await__"):
                 next_state = await next_state
@@ -115,6 +118,8 @@ class TaskRuntime:
                 return None
             if next_state.status in ("terminal", "completing") and next_state.outcome is None:
                 raise ValueError(f"Task state {next_state.status!r} requires an outcome")
+            if next_state.status == "waiting":
+                _reject_wait_cycles(graph, current.id, list(next_state.on or []))
             if next_state.status == "terminal":
                 # Terminal outcomes stage as completing; the scheduler finalizes
                 # them once no ordinary owned work below is live (spec 5.5).
@@ -146,6 +151,63 @@ async def _scan_all(scan, query):
         cursor = page.next
 
 
+async def _wait_graph(tx):
+    """Snapshot of the wait-for graph: (records by id, owner -> live children).
+
+    Read before the caller's transaction writes; tasks created afterwards have
+    no outgoing edges, so the snapshot stays exact for cycle detection.
+    """
+    records = await _scan_all(tx.scan_tasks, {})
+    by_id = {record.id: record for record in records}
+    owned: Dict[int, List[int]] = {}
+    for record in records:
+        if record.owner is not None and record.state.status != "terminal" and record.id != record.owner:
+            owned.setdefault(record.owner, []).append(record.id)
+    return by_id, owned
+
+
+def _reject_wait_cycles(graph, task_id: int, on_ids: List[int]) -> None:
+    """Reject a wait that closes a cycle in the wait-for graph (TS #validateWait).
+
+    Edges are wait joins (``state.on`` of waiting tasks) plus live owned work
+    (non-terminal tasks owned by the node). Waiting on a task that can reach
+    back would deadlock every task on the cycle forever, since a waiting task
+    only resumes once its joins settle.
+    """
+
+    by_id, owned = graph
+    if task_id in on_ids:
+        raise ValueError(f"Task {task_id} cannot wait on itself")
+
+    def edges(node: int) -> List[int]:
+        record = by_id.get(node)
+        out = []
+        if record is not None and record.state.status == "waiting":
+            out.extend(record.state.on or [])
+        out.extend(owned.get(node, []))
+        return out
+
+    # BFS from the join targets over wait and owned-work edges; reaching the
+    # waiting task again closes a cycle, and the error prints the whole loop.
+    parent: Dict[int, int] = {target: task_id for target in on_ids}
+    queue = list(on_ids)
+    while queue:
+        node = queue.pop(0)
+        for nxt in edges(node):
+            if nxt == task_id:
+                path = [task_id]
+                walk = node
+                while walk != task_id:
+                    path.append(walk)
+                    walk = parent[walk]
+                path.append(task_id)
+                chain = " -> ".join(str(step) for step in path)
+                raise ValueError(f"Waiting on {on_ids} would close a wait cycle: {chain}")
+            if nxt not in parent:
+                parent[nxt] = node
+                queue.append(nxt)
+
+
 def _scope_for(harness: "Harness", task_id: int):
     from .transaction import TransactionScope
 
@@ -156,6 +218,32 @@ def _scope_for_conversation(conversation_id: int):
     from .transaction import TransactionScope
 
     return TransactionScope(conversation_id=conversation_id)
+
+
+def _safe_now(now: Callable[[], int], on_report: Callable[[BaseException], None]) -> Callable[[], int]:
+    """The host clock, falling back to the wall clock when it throws.
+
+    A broken clock must not stop commits: the clock is read on every task
+    change, so the first throw is reported once and later ones are not
+    (port of TS safeNow).
+    """
+    reported = {"value": False}
+
+    def read() -> int:
+        try:
+            return int(now())
+        except Exception as exc:  # noqa: BLE001 - the clock must not fail its caller
+            if not reported["value"]:
+                # Set first: a report handler that reads the clock again must
+                # not report again.
+                reported["value"] = True
+                try:
+                    on_report(exc)
+                except Exception:  # noqa: BLE001 - onReport is the last place an error goes
+                    pass
+            return int(time.time() * 1000)
+
+    return read
 
 
 class Harness:
@@ -173,8 +261,11 @@ class Harness:
         self.model = model
         self.retry = retry
         # Wall-clock ms source for timers (TS HarnessOptions.now); the Session
-        # keeps its own injection for task lifecycle stamps.
-        self.now = now or (lambda: int(time.time() * 1000))
+        # keeps its own injection for task lifecycle stamps. A broken clock
+        # must not stop commits: the first throw is reported, later reads fall
+        # back to the wall clock silently (TS safeNow).
+        self.now = _safe_now(now or (lambda: int(time.time() * 1000)),
+                             on_report or self._report_progress_error)
         # Per-conversation context cache retention (TS settings.contextRetentionMs).
         self.context_retention_ms = resolve_context_retention_ms(context_retention_ms)
         # Accepts a ProgressPolicy or the settings mapping (validated field by field).
@@ -894,7 +985,16 @@ class Harness:
             await _cleanup_live_for_terminal(tx, current)
             await _stage_terminal(tx, current, outcome)
 
-        await self.session.commit(change, _scope_for(self, task.id))
+        try:
+            await self.session.commit(change, _scope_for(self, task.id))
+        except Exception as commit_exc:  # noqa: BLE001
+            # A fault write that cannot commit leaves the task running, to be
+            # reserved and run again in this process. End the invocation and
+            # fail the Session instead, so later work is rejected
+            # (TS #step catch → #failSession).
+            self.session.fail(commit_exc)
+            self.settle_progress_waiters(task.id, RuntimeError(detail))
+            return
         self.settle_progress_waiters(task.id, RuntimeError(detail))
 
 

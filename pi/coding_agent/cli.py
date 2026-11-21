@@ -2043,6 +2043,14 @@ async def _async_main(argv: Optional[List[str]] = None) -> int:
                 print("error: --print requires a prompt argument or piped stdin", file=sys.stderr)
                 return 2
             await run_prompt(agent, text, renderer, session, resources, extensions, mcp, images=prompt_images)
+            # A response truncated by the model's output limit used to exit 0
+            # silently; scripts and CI would miss the cut-off text (#10799).
+            # The partial text is already printed; warn on stderr and fail.
+            final = agent.messages[-1] if agent.messages else None
+            if final is not None and getattr(final, "role", None) == "assistant" \
+                    and getattr(final, "stop_reason", None) == "length":
+                print("Response was truncated: the model reached its output token limit.", file=sys.stderr)
+                return 1
             return 0
         if message_args:
             await run_prompt(agent, prompt_text, renderer, session, resources, extensions, mcp, images=prompt_images)

@@ -834,7 +834,13 @@ class McpManager:
         for client, _task in self._opening.values():
             states[client.name] = "connecting"
         for name, client in self.clients.items():
-            states[name] = "lazy" if name in self.lazy_servers else f"connected, {len(client.tools)} tools"
+            if name in self.lazy_servers:
+                states[name] = "lazy"
+                continue
+            # Resources are not listed at connect; the capability marker says
+            # the server offers them without counting every one.
+            suffix = " · resources" if client.resources_supported else ""
+            states[name] = f"connected, {len(client.tools)} tools{suffix}"
         for name in self.login_servers:
             states[name] = "requires sign-in (run /mcp login <server>)"
         for name, error in self.errors.items():
@@ -1495,9 +1501,12 @@ class McpManager:
         discovery = record.get("discovery") or {}
         metadata = discovery.get("authorization_server_metadata")
         iss = params.get("iss")
-        # RFC 9207: never send a code from another authorization server to this one.
-        if metadata and (iss is not None or metadata.get("authorization_response_iss_parameter_supported")):
-            expected = metadata["issuer"].rstrip("/")
+        # RFC 9207: never send a code from another authorization server to this
+        # one. Without discovered metadata there is no issuer to compare with,
+        # so a callback that names any issuer is rejected, not skipped.
+        if iss is not None or (metadata and metadata.get("authorization_response_iss_parameter_supported")):
+            issuer = metadata.get("issuer") if metadata else None
+            expected = issuer.rstrip("/") if isinstance(issuer, str) else None
             if (iss or "").rstrip("/") != expected:
                 raise OAuthIssuerMismatchError(expected, iss)
         oauth = settings.get("oauth") or {}

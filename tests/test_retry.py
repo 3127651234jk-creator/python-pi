@@ -376,6 +376,15 @@ def test_retries_mistral_finish_reason_error():
     ) is False
 
 
+def test_retries_aggregated_upstream_provider_error():
+    # Regression for #10842: aggregating gateways surface a busy upstream pool
+    # as "The upstream provider returned an error"; the pattern between
+    # "returned" and "error" must allow more than a single word.
+    assert is_retryable_assistant_error(error_message("The upstream provider returned an error")) is True
+    # Shorter variants keep working.
+    assert is_retryable_assistant_error(error_message("Provider returned error")) is True
+
+
 def test_keeps_provider_limit_errors_non_retryable():
     assert is_retryable_assistant_error(error_message("429 quota exceeded")) is False
 

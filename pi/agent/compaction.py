@@ -7,6 +7,7 @@ import json
 from typing import Any, Callable, List, Optional, Tuple
 
 from ..ai.estimate import CHARS_PER_TOKEN, estimate_message_tokens
+from ..ai.json_io import omit_thinking
 from ..ai.models import Model
 from ..ai.providers import SimpleStreamOptions
 from ..ai.retry import RetryCallbacks, RetryPolicy, retry_assistant_call
@@ -273,8 +274,12 @@ class ContextCompactor:
         """
         summary = previous_summary
         total_usage = Usage.empty()
+        # Thinking is omitted: replayed thinking is often not part of the
+        # model's live context, and including it can make the summary request
+        # larger than the conversation it summarizes.
+        visible = [m for m in (omit_thinking(m) for m in messages) if m is not None]
         current = "".join(
-            m.role + ": " + json.dumps(asdict(m), ensure_ascii=False) + "\n" for m in messages
+            m.role + ": " + json.dumps(asdict(m), ensure_ascii=False) + "\n" for m in visible
         )
         while current:
             chunk, current = current[:chunk_budget], current[chunk_budget:]

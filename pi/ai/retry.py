@@ -65,8 +65,9 @@ RETRYABLE_PROVIDER_ERROR_PATTERN = _build_provider_error_pattern([
     # "Provider error: RuntimeError: Provider finish_reason: error" (#10487).
     "finish_reason: error",
     # Wrapper/provider text for transient upstream failures, including OpenRouter
-    # "Provider returned error" responses (#2264).
-    "provider.?returned.?error",
+    # "Provider returned error" responses (#2264) and aggregating gateways'
+    # "The upstream provider returned an error" (#10842).
+    "provider.?returned.?(?:an.?)?error",
     "exceeded request buffer limit while retrying upstream",
     # Network, proxy, and fetch transport failures. This includes OpenAI Codex
     # raw-fetch failures such as "upstream connect", "connection refused", and

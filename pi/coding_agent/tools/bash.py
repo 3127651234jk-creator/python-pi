@@ -46,6 +46,22 @@ BASH_SCHEMA = {
     "required": ["command"],
 }
 
+# Result for programmatic callers such as codemode scripts. A non-zero exit
+# code is an error result for the model, but scripts still resolve to this
+# value. `output` is not limited like the model-facing output: callers decide
+# how much of it reaches the model.
+BASH_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "output": {"type": "string", "description": "Combined stdout and stderr, possibly truncated"},
+        "truncated": {"type": "boolean"},
+        "full_output_path": {"type": "string", "description": "Full output, when truncated"},
+        "exit_code": {"type": "number"},
+        "wall_time_seconds": {"type": "number"},
+    },
+    "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
+}
+
 _WINDOWS_BASH: Optional[str] = None
 
 
@@ -408,5 +424,6 @@ def create_bash_tool(
         label="bash",
         description=BASH_DESCRIPTION,
         parameters=BASH_SCHEMA,
+        output_schema=BASH_OUTPUT_SCHEMA,
         execute=execute,
     )

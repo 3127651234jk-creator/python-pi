@@ -7,15 +7,18 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pi.ai.json_io import to_json
 from pi.ai.models import Model
 from pi.ai.providers import faux
 from pi.ai.retry import RetryPolicy
-from pi.ai.types import AssistantMessage, TextContent, Usage, UserMessage
+from pi.ai.types import AssistantMessage, TextContent, ThinkingContent, Usage, UserMessage
 from pi.agent.types import AgentTool, AgentToolResult
 from pi.durable.entries import ASSISTANT_ENTRY, COMPACTION_ENTRY, SYSTEM_ENTRY, TOOL_RESULT_ENTRY, USER_ENTRY
+from pi.durable.errors import StorageRejected
 from pi.durable.extensions import Extension
 from pi.durable.harness import Harness, TaskRuntime
 from pi.durable.session import create_session
@@ -749,5 +752,114 @@ def test_standalone_tool_task_leaves_no_live_slot(tmp_path):
         assert [entry.kind for entry in transcript] == [TOOL_RESULT_ENTRY.kind]
         assert await harness.live(cid) == {}
         await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_compaction_digest_omits_thinking(tmp_path, monkeypatch):
+    # The summarizer input must not carry thinking blocks: replayed thinking is
+    # often not in the live context and can exceed the summarized window.
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        try:
+            model = make_model()
+            model.context_window = 8192
+            harness = Harness(session, model)
+            harness.register_definition(compact_definition(keep_recent_tokens=1, reserve_tokens=1))
+            cid = await harness.create_conversation()
+
+            captured = {}
+
+            async def stream_once(model, messages, harness, **kwargs):
+                captured["prompt"] = messages
+                return AssistantMessage(content=[TextContent(text="summary")], api="faux",
+                                        provider="faux", model="faux", usage=Usage(),
+                                        stop_reason="stop", timestamp=0)
+
+            monkeypatch.setattr("pi.durable.harness._stream_once", stream_once)
+
+            async def change(tx):
+                await tx.append_entry(cid, {
+                    "kind": USER_ENTRY.kind,
+                    "model": [to_json(UserMessage(content="hi there", timestamp=0))],
+                })
+                await tx.append_entry(cid, {
+                    "kind": ASSISTANT_ENTRY.kind,
+                    "model": [to_json(AssistantMessage(
+                        content=[ThinkingContent(thinking="SECRET-THINKING"),
+                                 TextContent(text="VISIBLE-WORK")],
+                        api="faux", provider="faux", model="faux",
+                        usage=Usage(), stop_reason="stop", timestamp=1))],
+                })
+                await tx.append_entry(cid, {
+                    "kind": ASSISTANT_ENTRY.kind,
+                    "model": [to_json(AssistantMessage(
+                        content=[ThinkingContent(thinking="ONLY-THINKING")],
+                        api="faux", provider="faux", model="faux",
+                        usage=Usage(), stop_reason="stop", timestamp=2))],
+                })
+                await tx.append_entry(cid, {
+                    "kind": USER_ENTRY.kind,
+                    "model": [to_json(UserMessage(content="recent" + "x" * 40000, timestamp=3))],
+                })
+
+            await session.commit(change)
+            await harness.submit_compact_task(cid)
+            await harness.run_pending_tasks()
+
+            digest = captured["prompt"][1].content
+            assert "VISIBLE-WORK" in digest
+            assert "SECRET-THINKING" not in digest
+            assert "ONLY-THINKING" not in digest
+            await session.close()
+        finally:
+            faux.reset_script_index()
+
+    asyncio.run(scenario())
+
+
+def test_fault_commit_failure_fails_the_session_instead_of_rerunning(tmp_path, monkeypatch):
+    # A fault write that cannot commit would leave the task running, to be
+    # reserved and run again in this process; the invocation ends and the
+    # Session fails instead (TS #step catch → #failSession).
+    async def scenario():
+        session = create_session(JsonlStorage(str(tmp_path / "session.jsonl")))
+        try:
+            harness = Harness(session, make_model())
+            cid = await harness.create_conversation()
+            runs = []
+
+            async def prepare(task, runtime, harness):
+                runs.append(task.id)
+                raise RuntimeError("phase exploded")
+
+            definition = define_task(name="pi.custom", version=1,
+                                     initial=lambda value: {"phase": "prepare"},
+                                     phases={"prepare": prepare})
+            harness.register_definition(definition)
+
+            async def create(tx):
+                task = await tx.create_task(definition, {"x": 1},
+                    {"ownership": {"kind": "conversation"}, "conversation_id": cid})
+                return task.id
+
+            task_id = await session.commit(create, TransactionScope(conversation_id=cid))
+
+            attempts = {"n": 0}
+
+            async def failing_stage(tx, current, outcome):
+                attempts["n"] += 1
+                raise StorageRejected("injected fault write rejection")
+
+            monkeypatch.setattr("pi.durable.harness._stage_terminal", failing_stage)
+            # The drain rejects after the Session failed, and the phase never re-ran.
+            with pytest.raises(RuntimeError, match="poisoned"):
+                await harness.run_pending_tasks()
+            assert attempts["n"] == 1
+            assert len(runs) == 1
+            with pytest.raises(RuntimeError, match="poisoned"):
+                await harness._get_task(task_id)
+        finally:
+            await session.close()
 
     asyncio.run(scenario())

@@ -241,6 +241,17 @@ def test_print_flag_without_prompt_fails(agent_env, monkeypatch, capsys):
     assert "--print requires a prompt" in capsys.readouterr().err
 
 
+def test_print_flag_warns_and_fails_on_truncated_response(agent_env, monkeypatch, capsys):
+    # Regression for #10799: a response truncated by the model's output limit
+    # used to exit 0 silently; print mode warns on stderr and exits non-zero.
+    monkeypatch.setattr(sys, "stdin", io.StringIO("piped prompt\n"))
+    monkeypatch.setenv("FAUX_SCRIPT", json.dumps([{"text": "partial answer", "stopReason": "length"}]))
+    assert run_cli("--provider", "faux", "--no-mcp", "--no-session", "--print") == 1
+    captured = capsys.readouterr()
+    assert "partial answer" in captured.out
+    assert "Response was truncated" in captured.err
+
+
 # -- runtime switches -------------------------------------------------------
 
 def test_offline_and_verbose_flags(agent_env, monkeypatch, capsys):

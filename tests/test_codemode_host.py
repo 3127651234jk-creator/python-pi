@@ -45,7 +45,20 @@ async def _echo_call(name, args, signal, record):
 
 def test_parse_codemode_source_without_options():
     assert host.parse_codemode_source("x = 1") == ({}, "x = 1")
-    assert host.parse_codemode_source("# a comment\n#@options: {}\n") == ({}, "# a comment\n#@options: {}\n")
+    assert host.parse_codemode_source("# a comment\nmore code\n") == ({}, "# a comment\nmore code\n")
+
+
+def test_parse_codemode_source_rejects_misplaced_options_line():
+    # Regression for #10631: an options line that is not the first line would
+    # be ignored without notice; reject it before the script runs.
+    with pytest.raises(ValueError) as excinfo:
+        host.parse_codemode_source("# a comment\n# @options: {\"timeout_ms\": 5}\ncode = 1")
+    message = str(excinfo.value)
+    assert "must be the first line" in message
+    assert "line 2" in message
+
+    with pytest.raises(ValueError):
+        host.parse_codemode_source("code = 1\n   #@options: {}\n")
 
 
 def test_parse_codemode_source_reads_first_line():

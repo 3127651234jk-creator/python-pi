@@ -13,7 +13,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
-from ..ai.json_io import message_from_json, to_json as ai_to_json
+from ..ai.json_io import message_from_json, omit_thinking, to_json as ai_to_json
 from ..ai.retry import is_retryable_assistant_error, retry_delay_ms
 from ..ai.types import ImageContent, SystemMessage, TextContent, ToolResultMessage, Usage, UserMessage
 from ..agent.types import AgentToolResult
@@ -313,7 +313,10 @@ def compact_definition(keep_recent_tokens: int = 20000, reserve_tokens: int = 16
         for entry in entries[:index]:
             for item in entry_messages(entry, edits.get(entry.id)):
                 messages.append(item if not isinstance(item, dict) else message_from_json(item))
-        digest = "\n".join(f"{getattr(m, 'role', 'message')}: {ai_to_json(m)}" for m in messages)
+        # Thinking is omitted so the summary request never exceeds the context
+        # it summarizes (replayed thinking is often not in the live context).
+        visible = [m for m in (omit_thinking(m) for m in messages) if m is not None]
+        digest = "\n".join(f"{getattr(m, 'role', 'message')}: {ai_to_json(m)}" for m in visible)
         # Bound the summarizer input so the call itself fits the window.
         chunk_budget = max(1, (harness.model.context_window - reserve_tokens - 4096))
         digest = digest[: chunk_budget * 4]

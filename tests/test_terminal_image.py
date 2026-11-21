@@ -40,10 +40,11 @@ def test_detect_capabilities_for_known_terminals():
 
 
 def test_detect_capabilities_herdr_supports_hyperlinks():
-    # B-TUI-01: Herdr forwards OSC 8 hyperlinks. It runs inside another terminal
-    # whose leaked variables (e.g. KITTY_WINDOW_ID) must not enable image protocols.
+    # B-TUI-01: Herdr forwards OSC 8 hyperlinks. It runs inside another terminal,
+    # so it is checked before outer-terminal detection: leaked variables (e.g.
+    # KITTY_WINDOW_ID) must not change its capabilities.
     herdr = ti.detect_capabilities({"TERM_PROGRAM": "herdr", "KITTY_WINDOW_ID": "1"})
-    assert herdr.images is None and herdr.hyperlinks is True
+    assert herdr.images == "kitty" and herdr.hyperlinks is True
     assert ti.detect_capabilities({"TERM_PROGRAM": "Herdr"}).hyperlinks is True
 
 

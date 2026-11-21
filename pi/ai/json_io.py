@@ -7,8 +7,8 @@ discriminators.
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List
+from dataclasses import asdict, is_dataclass, replace
+from typing import Any, Dict, List, Optional
 
 from .types import (
     AssistantMessage,
@@ -40,6 +40,27 @@ def to_json(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: to_json(v) for k, v in value.items()}
     return value
+
+
+def omit_thinking(message: Any) -> Optional[Any]:
+    """The message with its ThinkingContent blocks dropped, for summarization inputs.
+
+    Providers return summaries of the real reasoning, and replayed thinking is
+    often not part of the model's live context; including it can make the
+    summary request larger than the conversation it summarizes. Visible text,
+    tool calls, and tool results record what happened. A message whose content
+    is only thinking (or whose content is not a block list) summarizes to
+    nothing and returns None.
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return message
+    visible = [block for block in content if not isinstance(block, ThinkingContent)]
+    if len(visible) == len(content):
+        return message
+    if not visible:
+        return None
+    return replace(message, content=visible)
 
 
 def message_from_json(data: Dict[str, Any]) -> Any:

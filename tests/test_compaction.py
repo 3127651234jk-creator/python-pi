@@ -20,8 +20,8 @@ from pi.ai.providers import STREAM_FNS
 from pi.ai.providers import SimpleStreamOptions
 from pi.ai.retry import RetryPolicy
 from pi.ai.types import (
-    AssistantMessage, DoneEvent, StreamErrorEvent, TextContent, ToolResultMessage,
-    TranscriptContext, Usage, UserMessage,
+    AssistantMessage, DoneEvent, StreamErrorEvent, TextContent, ThinkingContent,
+    ToolResultMessage, TranscriptContext, Usage, UserMessage,
 )
 from pi.coding_agent.session import SessionManager
 from pi.coding_agent.usage import session_stats, summary_usage_extra
@@ -503,4 +503,39 @@ def test_compact_agent_without_compaction_reports_no_usage(monkeypatch):
         agent.messages = [UserMessage(content="tiny", timestamp=0)]
         result = await compact_agent(agent, session=None)
         assert result["usage"] is None
+    asyncio.run(check())
+
+
+def test_summary_input_omits_thinking():
+    # Summarization inputs drop thinking blocks: replayed thinking is often not
+    # part of the model's live context and can exceed the summarized window.
+    async def check():
+        compactor = ContextCompactor(CompactionSettings(keep_recent_tokens=50, summary_tokens=512))
+        model = resolve_model("faux")
+        model.context_window = 3000
+        messages = [
+            UserMessage(content="hi there", timestamp=0),
+            AssistantMessage(content=[ThinkingContent(thinking="SECRET-THINKING"),
+                                      TextContent(text="VISIBLE-WORK")], api="faux", provider="faux",
+                             model="faux", usage=Usage(), stop_reason="stop", timestamp=1),
+            AssistantMessage(content=[ThinkingContent(thinking="ONLY-THINKING")], api="faux",
+                             provider="faux", model="faux", usage=Usage(),
+                             stop_reason="stop", timestamp=2),
+            UserMessage(content="latest" + "old" * 4000, timestamp=3),
+        ]
+        calls = []
+
+        async def stream(model, context, options):
+            calls.append(context)
+            yield DoneEvent(reason="stop", message=response())
+
+        await compactor.project(messages, model, SimpleStreamOptions(), stream, force=True)
+        payloads = "".join(m.content for call in calls for m in call.messages
+                           if isinstance(m, UserMessage))
+        assert "VISIBLE-WORK" in payloads
+        assert "SECRET-THINKING" not in payloads
+        assert "ONLY-THINKING" not in payloads
+        # The original transcript keeps its thinking.
+        assert messages[1].content[0].thinking == "SECRET-THINKING"
+
     asyncio.run(check())

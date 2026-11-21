@@ -12,7 +12,7 @@ import pytest
 
 from pi.coding_agent.config import Configuration, write_json
 from pi.coding_agent.mcp import McpManager, oauth_key
-from pi.coding_agent.mcp_oauth import McpLoginRequired
+from pi.coding_agent.mcp_oauth import McpLoginRequired, OAuthIssuerMismatchError
 from pi.util import AbortError, AbortSignal
 
 
@@ -626,6 +626,78 @@ def test_o11_logout_is_not_undone_by_a_late_refresh(tmp_path, monkeypatch):
             await asyncio.wait_for(call, 5)
         assert manager.oauth_store.get(key) == {}
         assert "remote" not in manager.clients
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_complete_login_rejects_iss_without_metadata(tmp_path):
+    # Regression: without authorization server metadata there is no issuer to
+    # compare with, so a callback that names any issuer must be rejected
+    # instead of exchanged (RFC 9207).
+    manager = McpManager(oauth_config(tmp_path))
+    record = {
+        "client": {"client_id": "issued-client", "redirect_uris": ["http://127.0.0.1/callback"]},
+        "code_verifier": "verifier",
+        "redirect_uri": "http://127.0.0.1/callback",
+        "discovery": {},
+    }
+    with pytest.raises(OAuthIssuerMismatchError) as excinfo:
+        asyncio.run(manager._complete_login(
+            "remote", {"url": "https://example.test/mcp"}, record,
+            {"code": "auth-code", "iss": "https://evil.test"}, None))
+    assert excinfo.value.expected is None
+    assert excinfo.value.actual == "https://evil.test"
+
+
+def test_complete_login_accepts_matching_iss_with_metadata(tmp_path, monkeypatch):
+    fake = FakeOAuthMcp()
+    install(monkeypatch, fake)
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path))
+        record = {
+            "client": {"client_id": "issued-client", "redirect_uris": ["http://127.0.0.1/callback"]},
+            "code_verifier": "verifier",
+            "redirect_uri": "http://127.0.0.1/callback",
+            "discovery": {
+                "authorization_server_url": "https://auth.test",
+                "authorization_server_metadata": AUTH_METADATA,
+            },
+        }
+        async with httpx.AsyncClient() as http:
+            updated = await manager._complete_login(
+                "remote", {"url": "https://example.test/mcp"}, record,
+                {"code": "auth-code", "iss": "https://auth.test"}, http)
+        assert updated["access"] == "access-code"
+        assert fake.token_requests[-1]["code"] == "auth-code"
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_complete_login_rejects_missing_iss_when_server_promises_it(tmp_path, monkeypatch):
+    fake = FakeOAuthMcp()
+    install(monkeypatch, fake)
+    metadata = {**AUTH_METADATA, "authorization_response_iss_parameter_supported": True}
+
+    async def scenario():
+        manager = McpManager(oauth_config(tmp_path))
+        record = {
+            "client": {"client_id": "issued-client", "redirect_uris": ["http://127.0.0.1/callback"]},
+            "code_verifier": "verifier",
+            "redirect_uri": "http://127.0.0.1/callback",
+            "discovery": {
+                "authorization_server_url": "https://auth.test",
+                "authorization_server_metadata": metadata,
+            },
+        }
+        async with httpx.AsyncClient() as http:
+            with pytest.raises(OAuthIssuerMismatchError):
+                await manager._complete_login(
+                    "remote", {"url": "https://example.test/mcp"}, record,
+                    {"code": "auth-code"}, http)
+        assert fake.token_requests == []
         await manager.close()
 
     asyncio.run(scenario())

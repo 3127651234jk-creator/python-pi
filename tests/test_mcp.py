@@ -602,8 +602,11 @@ def test_mcp_cli_list_and_login_routing(tmp_path, monkeypatch, capsys):
     }})
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PI_PY_AGENT_DIR", str(tmp_path / "user"))
-    assert mcp_cli.main(["list"]) == 0
-    assert "remote: http" in capsys.readouterr().out
+    # Neither server is reachable here, so the listing reports them failed.
+    assert mcp_cli.main(["list", "--json"]) == 1
+    parsed = json.loads(capsys.readouterr().out)
+    states = {server["name"]: server["state"] for server in parsed["servers"]}
+    assert states["remote"] == "failed" and states["local"] == "failed"
 
     # Unknown server names fail with a clear error before any browser opens.
     assert mcp_cli.main(["login", "ghost", "--timeout", "1"]) == 1
