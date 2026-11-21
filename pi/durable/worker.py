@@ -39,7 +39,9 @@ SESSION_SERVICE_ID = "pi.agent-controller"
 SCHEDULER_TICK_SECONDS = 1.0
 
 GENERATION_TASK = "pi.generation"
-ACTIVE_STATUSES = ("pending", "running")
+# A generation blocked on its tool round sits in "waiting"; abort must find it
+# just like a pending or streaming turn.
+ACTIVE_STATUSES = ("pending", "running", "waiting")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,9 +124,18 @@ class SessionServices:
         self.stop = stop
 
     async def abortable_task(self, task_id: Optional[int]) -> Optional[int]:
-        if task_id is not None:
-            return task_id
+        """The task an abort request targets, or None when nothing is live.
+
+        Without an id, the newest active generation is reported; one waiting on
+        its tool round counts as active. An explicit id must name a non-terminal
+        task of this conversation.
+        """
         records = await self.harness.list_tasks(self.conversation_id)
+        if task_id is not None:
+            record = next((record for record in records if record.id == task_id), None)
+            if record is None or record.state.status in ("completing", "terminal"):
+                return None
+            return record.id
         for record in reversed(records):
             if record.kind == GENERATION_TASK and record.state.status in ACTIVE_STATUSES:
                 return record.id
@@ -151,7 +162,13 @@ class SessionEndpoint:
             task_id = await self.services.abortable_task(requested)
             if task_id is None:
                 return {"aborted": False}
-            await harness.abort_task(task_id)
+            # Abort the whole conversation rather than just the reported task:
+            # a generation waiting on its tool round never observes the mark on
+            # its own, and child pi.tool tasks would keep running and commit
+            # tool results for a turn that is already superseded.
+            # abort_conversation withdraws queued input and terminates every
+            # non-terminal task, children included.
+            await harness.abort_conversation(self.services.conversation_id)
             return {"aborted": True, "taskId": task_id}
         if member == "transcript":
             entries = await harness.transcript(self.services.conversation_id)
