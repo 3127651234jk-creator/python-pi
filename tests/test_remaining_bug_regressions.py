@@ -196,6 +196,15 @@ def test_edit_normalizes_width_and_reports_actual_changed_line():
     assert first == 4
 
 
+def test_edit_rejects_whitespace_only_old_text():
+    from pi.coding_agent.tools import edit_diff as coding_edit_diff
+    from pi.durable.tools import edit_diff as durable_edit_diff
+
+    for module in (coding_edit_diff, durable_edit_diff):
+        with pytest.raises(ValueError, match="must not be empty or whitespace-only"):
+            module.apply_edits_to_normalized_content("alpha\nbeta\n", [module.Edit(" ", "X")], "x")
+
+
 def test_nested_ids_do_not_collide_with_model_ids():
     async def scenario():
         messages = await run_once([outer_tool("leaf"), leaf_tool()], [

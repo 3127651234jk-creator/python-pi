@@ -246,8 +246,8 @@ def _get_duplicate_error(path: str, edit_index: int, total_edits: int, occurrenc
 
 def _get_empty_old_text_error(path: str, edit_index: int, total_edits: int) -> Exception:
     if total_edits == 1:
-        return ValueError(f"oldText must not be empty in {path}.")
-    return ValueError(f"edits[{edit_index}].oldText must not be empty in {path}.")
+        return ValueError(f"oldText must not be empty or whitespace-only in {path}.")
+    return ValueError(f"edits[{edit_index}].oldText must not be empty or whitespace-only in {path}.")
 
 
 def _get_no_change_error(path: str, total_edits: int) -> Exception:
@@ -264,7 +264,9 @@ def apply_edits_to_normalized_content(normalized_content: str, edits: List[Edit]
     normalized_edits = [Edit(normalize_to_lf(edit.old_text), normalize_to_lf(edit.new_text)) for edit in edits]
 
     for i, edit in enumerate(normalized_edits):
-        if len(edit.old_text) == 0:
+        # Whitespace-only oldText normalizes to "" for fuzzy matching, and find("") would
+        # "match" at offset 0, silently inserting newText at the start of the file.
+        if not normalize_for_fuzzy_match(edit.old_text):
             raise _get_empty_old_text_error(path, i, len(normalized_edits))
 
     initial_matches = [fuzzy_find_text(normalized_content, edit.old_text) for edit in normalized_edits]
