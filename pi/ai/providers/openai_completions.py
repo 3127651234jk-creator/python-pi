@@ -267,10 +267,6 @@ def _assistant_message(message: AssistantMessage, model: Optional[Model] = None)
     return result
 
 
-def _tool_call_blocks(partial: AssistantMessage) -> List[ToolCall]:
-    return [b for b in partial.content if isinstance(b, ToolCall)]
-
-
 async def _convert_events(event_name: Optional[str], data: Any, state: ProviderState) -> AsyncIterator[Any]:
     partial = state.partial
 
@@ -351,19 +347,20 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         yield TextDeltaEvent(content_index=index, delta=content_text, partial=state.snapshot())
 
     for entry in delta.get("tool_calls") or []:
+        # ``index`` is the provider's tool-call slot, which may be sparse or
+        # arrive out of order; map it to the block instead of assuming it is a
+        # position in the filtered ToolCall list.
         index = entry.get("index", 0)
-        calls = _tool_call_blocks(partial)
-        if index >= len(calls):
+        block = state.block_at(index)
+        if not isinstance(block, ToolCall):
             function = entry.get("function") or {}
-            tool_call = ToolCall(
-                id=entry.get("id", f"call_{index}"),
+            block = ToolCall(
+                id=entry.get("id") or f"call_{index}",
                 name=function.get("name", ""),
                 arguments={"__raw__": ""},
             )
-            state.add_tool_call(len(partial.content), tool_call)
-            yield ToolCallStartEvent(content_index=len(partial.content) - 1, partial=state.snapshot())
-            calls = _tool_call_blocks(partial)
-        block = calls[index]
+            state.add_tool_call(index, block)
+            yield ToolCallStartEvent(content_index=state.position_of(index), partial=state.snapshot())
         function = entry.get("function") or {}
         if entry.get("id"):
             block.id = entry["id"]
@@ -373,7 +370,7 @@ async def _convert_events(event_name: Optional[str], data: Any, state: ProviderS
         if args_delta:
             block.arguments["__raw__"] = block.arguments.get("__raw__", "") + args_delta
             yield ToolCallDeltaEvent(
-                content_index=partial.content.index(block), delta=args_delta, partial=state.snapshot()
+                content_index=state.position_of(index), delta=args_delta, partial=state.snapshot()
             )
 
     finish_reason = choice.get("finish_reason")

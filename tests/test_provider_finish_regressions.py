@@ -5,6 +5,7 @@ import pytest
 from pi.ai.models import Model
 from pi.ai.providers import anthropic, openai_completions
 from pi.ai.providers.base import ProviderState
+from pi.ai.types import ToolCall, ToolCallDeltaEvent, ToolCallStartEvent
 
 
 def state():
@@ -62,6 +63,56 @@ def test_duplicate_finish_preserves_tool_arguments():
             _ = [event async for event in openai_completions._convert_events(None, {"choices": [chunk]}, current)]
         assert current.partial.content[0].arguments == {"path": "file"}
     asyncio.run(check())
+
+async def _drive_completions(current, chunks):
+    events = []
+    for chunk in chunks:
+        async for event in openai_completions._convert_events(None, {"choices": [chunk]}, current):
+            events.append(event)
+    return events
+
+
+def test_completions_sparse_tool_call_index_maps_by_stream_slot():
+    async def check():
+        current = state()
+        await _drive_completions(current, [
+            {"delta": {"tool_calls": [{"index": 3, "id": "call_b", "function": {
+                "name": "read", "arguments": '{"path":'}}]}},
+            {"delta": {"tool_calls": [{"index": 3, "function": {"arguments": '"b"}'}}]}},
+            {"finish_reason": "tool_calls"},
+        ])
+        calls = [block for block in current.partial.content if isinstance(block, ToolCall)]
+        assert len(calls) == 1
+        assert calls[0].id == "call_b"
+        assert calls[0].arguments == {"path": "b"}
+    asyncio.run(check())
+
+
+def test_completions_out_of_order_tool_call_indices_keep_arguments_apart():
+    async def check():
+        current = state()
+        events = await _drive_completions(current, [
+            {"delta": {"tool_calls": [{"index": 1, "id": "call_1", "function": {
+                "name": "read", "arguments": '{"path":"one"}'}}]}},
+            {"delta": {"tool_calls": [{"index": 0, "id": "call_0", "function": {
+                "name": "read", "arguments": '{"path":"'}}]}},
+            {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'zero"}'}}]}},
+            {"finish_reason": "tool_calls"},
+        ])
+        calls = [block for block in current.partial.content if isinstance(block, ToolCall)]
+        assert [(call.id, call.arguments) for call in calls] == [
+            ("call_1", {"path": "one"}),
+            ("call_0", {"path": "zero"}),
+        ]
+        # Event content indexes must point at the block's real position, not
+        # the provider's sparse tool-call slot.
+        starts = {event.partial.content[event.content_index].id: event.content_index for event in events
+                  if isinstance(event, ToolCallStartEvent)}
+        assert starts == {"call_1": 0, "call_0": 1}
+        deltas = [event.content_index for event in events if isinstance(event, ToolCallDeltaEvent)]
+        assert deltas == [0, 1, 1]
+    asyncio.run(check())
+
 
 @pytest.mark.parametrize("reason,expected", [("content_filter", "error"), ("unknown", "error"),
                                              (None, "error"), ("max_output_tokens", "length")])
